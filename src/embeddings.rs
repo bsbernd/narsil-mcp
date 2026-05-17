@@ -44,7 +44,9 @@ impl TfIdfEmbedding {
         }
     }
 
-    /// Add a document to update the IDF statistics
+    /// Add a document to update the IDF statistics.
+    /// Does not rebuild the vocabulary — call `rebuild_vocabulary` once after
+    /// all documents have been added.
     pub fn add_document(&mut self, text: &str) {
         let tokens = tokenize_code(text);
         let unique_tokens: std::collections::HashSet<_> = tokens.into_iter().collect();
@@ -54,7 +56,6 @@ impl TfIdfEmbedding {
         }
 
         self.total_docs += 1;
-        self.rebuild_vocabulary();
     }
 
     /// Rebuild vocabulary from most frequent terms
@@ -92,6 +93,12 @@ impl TfIdfEmbedding {
             return 0.0;
         }
         term_count as f32 / total_terms as f32
+    }
+
+    /// Finalize: build the vocabulary from accumulated document frequencies.
+    /// Must be called once after all `add_document` calls and before `embed`.
+    pub fn finalize(&mut self) {
+        self.rebuild_vocabulary();
     }
 
     /// Get statistics about the embedding model
@@ -307,6 +314,15 @@ impl ConcurrentVectorStore {
     pub fn clear(&self) {
         self.inner.write().clear();
     }
+
+    /// Re-compute every stored document's embedding using `embed_fn`.
+    /// Used after vocabulary finalization to apply correct IDF values.
+    pub fn reembed_all(&self, embed_fn: impl Fn(&str) -> Vec<f32>) {
+        let mut store = self.inner.write();
+        for doc in &mut store.documents {
+            doc.embedding = embed_fn(&doc.content);
+        }
+    }
 }
 
 impl Default for ConcurrentVectorStore {
@@ -329,7 +345,10 @@ impl EmbeddingEngine {
         }
     }
 
-    /// Index a code snippet
+    /// Index a code snippet.
+    /// Accumulates IDF statistics and stores the document with a placeholder
+    /// embedding.  Call `finalize` after all snippets have been indexed to
+    /// build the vocabulary and compute correct embeddings.
     pub fn index_snippet(
         &self,
         id: String,
@@ -338,21 +357,24 @@ impl EmbeddingEngine {
         start_line: usize,
         end_line: usize,
     ) {
-        // Update IDF statistics
         self.provider.write().add_document(&content);
-
-        // Generate embedding
-        let embedding = self.provider.read().embed(&content);
-
-        // Store the embedded document
         self.store.add(EmbeddedDocument {
             id,
             file_path,
             content,
             start_line,
             end_line,
-            embedding,
+            embedding: Vec::new(),
         });
+    }
+
+    /// Finalize the embedding model after all documents have been indexed.
+    /// Builds the vocabulary from accumulated frequencies (O(V log V) once),
+    /// then re-embeds every stored document with the correct IDF values.
+    pub fn finalize(&self) {
+        self.provider.write().rebuild_vocabulary();
+        let provider = self.provider.read();
+        self.store.reembed_all(|content| provider.embed(content));
     }
 
     /// Find similar code to a query string
@@ -399,6 +421,7 @@ mod tests {
         tfidf.add_document("fn hello_world() { println!(\"Hello\"); }");
         tfidf.add_document("fn goodbye_world() { println!(\"Goodbye\"); }");
         tfidf.add_document("fn main() { hello_world(); }");
+        tfidf.finalize();
 
         assert_eq!(tfidf.total_docs, 3);
         assert!(!tfidf.vocabulary.is_empty());
@@ -497,6 +520,7 @@ mod tests {
             5,
             5,
         );
+        engine.finalize();
 
         // Find similar to a math function
         let results = engine.find_similar_code("fn add_numbers(a: i32, b: i32)", 3);
@@ -546,6 +570,7 @@ mod tests {
             13,
             15,
         );
+        engine.finalize();
 
         // Find similar to fibonacci
         let results = engine.find_similar_to_doc("doc1", 3);
@@ -579,6 +604,7 @@ mod tests {
         tfidf.add_document("getUserById");
         tfidf.add_document("get_user_by_id");
         tfidf.add_document("GetUserById");
+        tfidf.finalize();
 
         let emb1 = tfidf.embed("getUserById");
         let emb2 = tfidf.embed("get_user_by_id");

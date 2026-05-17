@@ -672,6 +672,11 @@ impl CodeIntelEngine {
             }
         }
 
+        // Build vocabulary and re-embed all snippets with final IDF values.
+        // Must happen after the per-file loop so all document frequencies are
+        // accumulated before the single O(V log V) sort.
+        self.embedding_engine.finalize();
+
         let metadata = RepoMetadata {
             name: repo_name.clone(),
             path: path.to_path_buf(),
