@@ -21,8 +21,16 @@ impl ToolHandler for FindSymbolsHandler {
         let pattern = args.get_str("pattern");
         let file_pattern = args.get_str("file_pattern");
         let exclude_tests = args.get_bool("exclude_tests");
+        let limit = args.get_u64_or("limit", 500) as usize;
         engine
-            .find_symbols(repo, symbol_type, pattern, file_pattern, exclude_tests)
+            .find_symbols(
+                repo,
+                symbol_type,
+                pattern,
+                file_pattern,
+                exclude_tests,
+                limit,
+            )
             .await
     }
 }

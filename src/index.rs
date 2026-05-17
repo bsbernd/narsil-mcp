@@ -1106,6 +1106,7 @@ impl CodeIntelEngine {
         pattern: Option<&str>,
         file_pattern: Option<&str>,
         exclude_tests: Option<bool>,
+        limit: usize,
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
@@ -1113,7 +1114,7 @@ impl CodeIntelEngine {
         let cache_key = {
             let options = SearchOptions {
                 file_pattern: file_pattern.map(String::from),
-                max_results: None,
+                max_results: Some(limit),
                 exclude_tests,
             };
             let query = format!(
@@ -1136,7 +1137,7 @@ impl CodeIntelEngine {
             .get(repo)
             .ok_or_else(|| self.repo_not_found_error(repo))?;
 
-        let exclude_tests = exclude_tests.unwrap_or(false); // Default false for symbol search
+        let exclude_tests = exclude_tests.unwrap_or(false);
 
         let type_filter: Option<SymbolKind> = symbol_type.and_then(|t| match t {
             "struct" => Some(SymbolKind::Struct),
@@ -1150,29 +1151,40 @@ impl CodeIntelEngine {
             _ => None,
         });
 
-        let glob_pattern = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
+        // Compile name pattern: glob when wildcards present, substring otherwise.
+        let name_glob: Option<glob::Pattern> = pattern
+            .filter(|p| p.contains('*') || p.contains('?'))
+            .and_then(|p| glob::Pattern::new(p).ok());
+        let glob_opts = glob::MatchOptions {
+            case_sensitive: false,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+
+        let file_glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
 
         let filtered: Vec<_> = symbols
             .iter()
             .filter(|s| {
-                // Test file filter
                 if exclude_tests && is_test_file(&s.file_path) {
                     return false;
                 }
-                // Type filter
                 if let Some(ref kind) = type_filter {
                     if &s.kind != kind {
                         return false;
                     }
                 }
-                // Name pattern filter
-                if let Some(pat) = pattern {
+                // Glob match when wildcards present, substring match otherwise.
+                if let Some(ref glob) = name_glob {
+                    if !glob.matches_with(&s.name, glob_opts) {
+                        return false;
+                    }
+                } else if let Some(pat) = pattern {
                     if !s.name.to_lowercase().contains(&pat.to_lowercase()) {
                         return false;
                     }
                 }
-                // File pattern filter
-                if let Some(ref glob) = glob_pattern {
+                if let Some(ref glob) = file_glob {
                     if !glob.matches(&s.file_path) {
                         return false;
                     }
@@ -1181,16 +1193,29 @@ impl CodeIntelEngine {
             })
             .collect();
 
-        // Collect dependent files for smart invalidation
-        let dependent_files: Vec<String> = filtered.iter().map(|s| s.file_path.clone()).collect();
+        let total = filtered.len();
+
+        // Collect dependent files for smart invalidation (from displayed results only).
+        let dependent_files: Vec<String> = filtered
+            .iter()
+            .take(limit)
+            .map(|s| s.file_path.clone())
+            .collect();
 
         let mut output = String::new();
         output.push_str(&format!("# Symbols in {}\n\n", repo));
-        output.push_str(&format!("Found {} symbols\n\n", filtered.len()));
+        if total > limit {
+            output.push_str(&format!(
+                "Found {} symbols (showing first {}; increase `limit` to see more)\n\n",
+                total, limit
+            ));
+        } else {
+            output.push_str(&format!("Found {} symbols\n\n", total));
+        }
 
-        // Group by kind
+        // Group displayed results by kind.
         let mut by_kind: HashMap<SymbolKind, Vec<&Symbol>> = HashMap::new();
-        for symbol in &filtered {
+        for symbol in filtered.iter().copied().take(limit) {
             by_kind.entry(symbol.kind.clone()).or_default().push(symbol);
         }
 
@@ -1208,7 +1233,7 @@ impl CodeIntelEngine {
             output.push('\n');
         }
 
-        // Cache the result with file dependencies for smart invalidation
+        // Cache the result with file dependencies for smart invalidation.
         if self.options.cache_enabled {
             self.query_cache
                 .insert_with_files(cache_key, output.clone(), dependent_files);
