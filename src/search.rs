@@ -4,7 +4,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Validate regex pattern to prevent ReDoS attacks
 fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
@@ -33,8 +33,8 @@ pub struct SearchDocument {
     pub doc_type: DocType,
     pub start_line: usize,
     pub end_line: usize,
-    /// Pre-computed tokens
-    pub tokens: Vec<String>,
+    /// Number of tokens in the document (for BM25 length normalization)
+    pub doc_len: usize,
     /// Token frequencies
     pub term_freq: HashMap<String, usize>,
 }
@@ -166,21 +166,20 @@ impl SearchIndex {
     pub fn add_document(&mut self, doc: SearchDocument) {
         let doc_idx = self.documents.len();
 
-        // Update inverted index
-        for token in &doc.tokens {
-            self.inverted_index
-                .entry(token.clone())
-                .or_default()
-                .push(doc_idx);
+        // Build inverted index from term_freq, preserving per-occurrence multiplicity
+        for (token, &count) in &doc.term_freq {
+            let entries = self.inverted_index.entry(token.clone()).or_default();
+            for _ in 0..count {
+                entries.push(doc_idx);
+            }
         }
 
-        // Update document frequencies
-        let unique_tokens: HashSet<_> = doc.tokens.iter().collect();
-        for token in unique_tokens {
+        // Update document frequencies (one per unique term per document)
+        for token in doc.term_freq.keys() {
             *self.doc_freq.entry(token.clone()).or_default() += 1;
         }
 
-        self.total_tokens += doc.tokens.len();
+        self.total_tokens += doc.doc_len;
         self.documents.push(doc);
         self.avg_doc_len = self.total_tokens as f64 / self.documents.len() as f64;
     }
@@ -201,6 +200,7 @@ impl SearchIndex {
         end_line: usize,
     ) {
         let tokens = tokenize_code(content);
+        let doc_len = tokens.len();
         let term_freq = count_terms(&tokens);
 
         self.add_document(SearchDocument {
@@ -210,7 +210,7 @@ impl SearchIndex {
             doc_type,
             start_line,
             end_line,
-            tokens,
+            doc_len,
             term_freq,
         });
     }
@@ -237,7 +237,7 @@ impl SearchIndex {
                 for &doc_idx in doc_indices {
                     let doc = &self.documents[doc_idx];
                     let tf = doc.term_freq.get(token).copied().unwrap_or(0) as f64;
-                    let doc_len = doc.tokens.len() as f64;
+                    let doc_len = doc.doc_len as f64;
 
                     let bm25_score = self.bm25_score(tf, doc_len, idf);
 
@@ -462,6 +462,7 @@ fn split_identifier(ident: &str) -> Vec<String> {
 /// Pure function — safe to call from rayon parallel iterators.
 pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
     let tokens = tokenize_code(content);
+    let doc_len = tokens.len();
     let term_freq = count_terms(&tokens);
     SearchDocument {
         id: file_path.to_string(),
@@ -470,7 +471,7 @@ pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
         doc_type: DocType::File,
         start_line: 1,
         end_line: content.lines().count(),
-        tokens,
+        doc_len,
         term_freq,
     }
 }

@@ -126,7 +126,7 @@ impl WasmCodeIntel {
                     doc_type: DocType::File,
                     start_line: 1,
                     end_line: content.lines().count(),
-                    tokens: Vec::new(),
+                    doc_len: 0,
                     term_freq: HashMap::new(),
                 };
                 self.search_index.add_document(doc);
