@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Node, Tree};
@@ -98,21 +99,24 @@ impl CallGraph {
 
     /// Build call graph from parsed files
     pub fn build_from_files(&self, files: &[(String, String, Tree)]) -> Result<()> {
-        // First pass: collect all function definitions
-        for (path, content, tree) in files {
-            self.extract_functions(path, content, tree)?;
-        }
+        // Pass 1: collect all function definitions — fully independent per file
+        files
+            .par_iter()
+            .try_for_each(|(path, content, tree)| self.extract_functions(path, content, tree))?;
 
         // Sort each name_index entry once so resolve_callee gets a pre-sorted
-        // candidate list and never needs to sort again.
-        for mut entry in self.name_index.iter_mut() {
+        // candidate list and never needs to sort again.  Serial is fine here —
+        // O(E log E) total over all entries, negligible versus the two AST walks.
+        self.name_index.iter_mut().for_each(|mut entry| {
             entry.value_mut().sort();
-        }
+        });
 
-        // Second pass: find all call sites
-        for (path, content, tree) in files {
-            self.extract_calls(path, content, tree)?;
-        }
+        // Pass 2: find all call sites — per-file caller keys are distinct;
+        // hot callees (e.g. printk) serialize called_by pushes across shards
+        // but DashMap handles it correctly and this is still far faster than serial.
+        files
+            .par_iter()
+            .try_for_each(|(path, content, tree)| self.extract_calls(path, content, tree))?;
 
         Ok(())
     }
