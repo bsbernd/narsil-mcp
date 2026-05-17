@@ -26,7 +26,7 @@ use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
-use crate::search::ConcurrentSearchIndex;
+use crate::search::{build_file_doc, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
@@ -606,6 +606,21 @@ impl CodeIntelEngine {
             })
             .collect();
 
+        // Tokenize all files in parallel and build SearchDocuments.
+        // tokenize_code is the dominant cost of the old serial index_file loop;
+        // doing it here with par_iter avoids one write-lock acquisition per file.
+        let search_docs: Vec<SearchDocument> = parsed_results
+            .par_iter()
+            .map(|(file_path, content, _)| {
+                let relative_path = file_path
+                    .strip_prefix(path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                build_file_doc(&relative_path, content)
+            })
+            .collect();
+
         // Collect parsed trees for call graph construction
         let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
@@ -661,9 +676,6 @@ impl CodeIntelEngine {
             self.file_cache
                 .insert(file_path.clone(), Arc::new(content.clone()));
 
-            // Index file for semantic search
-            self.search_index.index_file(&relative_path, &content);
-
             // Collect tree for call graph if enabled and tree exists
             if self.options.call_graph_enabled {
                 if let Some(tree) = parsed.tree {
@@ -671,6 +683,9 @@ impl CodeIntelEngine {
                 }
             }
         }
+
+        // Batch-insert all pre-tokenized search documents under a single write lock.
+        self.search_index.batch_add_documents(search_docs);
 
         // Build vocabulary and re-embed all snippets with final IDF values.
         // Must happen after the per-file loop so all document frequencies are

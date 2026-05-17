@@ -187,19 +187,7 @@ impl SearchIndex {
 
     /// Index content from a file
     pub fn index_file(&mut self, file_path: &str, content: &str) {
-        let tokens = tokenize_code(content);
-        let term_freq = count_terms(&tokens);
-
-        self.add_document(SearchDocument {
-            id: file_path.to_string(),
-            file_path: file_path.to_string(),
-            content: content.to_string(),
-            doc_type: DocType::File,
-            start_line: 1,
-            end_line: content.lines().count(),
-            tokens,
-            term_freq,
-        });
+        self.add_document(build_file_doc(file_path, content));
     }
 
     /// Index a symbol (function, class, etc.)
@@ -470,6 +458,23 @@ fn split_identifier(ident: &str) -> Vec<String> {
     parts
 }
 
+/// Build a SearchDocument for a file without touching any shared state.
+/// Pure function — safe to call from rayon parallel iterators.
+pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
+    let tokens = tokenize_code(content);
+    let term_freq = count_terms(&tokens);
+    SearchDocument {
+        id: file_path.to_string(),
+        file_path: file_path.to_string(),
+        content: content.to_string(),
+        doc_type: DocType::File,
+        start_line: 1,
+        end_line: content.lines().count(),
+        tokens,
+        term_freq,
+    }
+}
+
 /// Count term frequencies
 fn count_terms(tokens: &[String]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
@@ -513,6 +518,15 @@ impl ConcurrentSearchIndex {
     /// Used by WASM interface for incremental indexing.
     pub fn add_document(&self, doc: SearchDocument) {
         self.inner.write().add_document(doc);
+    }
+
+    /// Batch-insert pre-built documents under a single write-lock acquisition.
+    /// Use this after parallel tokenization to avoid one lock per file.
+    pub fn batch_add_documents(&self, docs: Vec<SearchDocument>) {
+        let mut inner = self.inner.write();
+        for doc in docs {
+            inner.add_document(doc);
+        }
     }
 
     pub fn index_file(&self, file_path: &str, content: &str) {
