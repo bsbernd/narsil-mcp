@@ -77,6 +77,8 @@ pub struct CallGraph {
     nodes: DashMap<String, CallNode>,
     /// File -> Functions defined in that file
     file_functions: DashMap<String, Vec<String>>,
+    /// bare_name -> Vec<qualified_key>  (built during first pass, O(1) lookup in resolve_callee)
+    name_index: DashMap<String, Vec<String>>,
 }
 
 impl Default for CallGraph {
@@ -90,6 +92,7 @@ impl CallGraph {
         Self {
             nodes: DashMap::new(),
             file_functions: DashMap::new(),
+            name_index: DashMap::new(),
         }
     }
 
@@ -98,6 +101,12 @@ impl CallGraph {
         // First pass: collect all function definitions
         for (path, content, tree) in files {
             self.extract_functions(path, content, tree)?;
+        }
+
+        // Sort each name_index entry once so resolve_callee gets a pre-sorted
+        // candidate list and never needs to sort again.
+        for mut entry in self.name_index.iter_mut() {
+            entry.value_mut().sort();
         }
 
         // Second pass: find all call sites
@@ -122,6 +131,10 @@ impl CallGraph {
 
         for func in &functions {
             let key = Self::qualified_key(path, &func.name);
+            self.name_index
+                .entry(func.name.clone())
+                .or_insert_with(Vec::new)
+                .push(key.clone());
             self.nodes.insert(key, func.clone());
         }
 
@@ -404,14 +417,12 @@ impl CallGraph {
             return same_file_key;
         }
 
-        // 2. Collect ALL candidates matching ::bare_name
-        let suffix = format!("::{}", bare_name);
+        // 2. Collect ALL candidates matching bare_name via O(1) index lookup
         let mut candidates: Vec<String> = self
-            .nodes
-            .iter()
-            .filter(|entry| entry.key().ends_with(&suffix))
-            .map(|entry| entry.key().clone())
-            .collect();
+            .name_index
+            .get(bare_name)
+            .map(|v| v.clone())
+            .unwrap_or_default();
 
         match candidates.len() {
             0 => bare_name.to_string(),
@@ -2185,6 +2196,59 @@ mod tests {
         }
     }
 
+    /// Verify that resolve_callee stays fast when the graph is large.
+    ///
+    /// Simulates the Linux kernel scenario: ~10k distinct functions, each with a
+    /// unique name so every lookup returns exactly one candidate in O(1).  The old
+    /// O(N) scan would touch all 10k nodes on every call; the name_index skips
+    /// straight to the match.
+    #[test]
+    fn test_resolve_callee_scales() {
+        let graph = CallGraph::new();
+
+        // 100 files × 100 unique functions each = 10_000 nodes.
+        // Every (file, func) combination produces a distinct qualified key AND a
+        // distinct bare name, so each name_index entry has exactly one candidate.
+        for file_idx in 0..100usize {
+            let file = format!("src/module_{}/mod.rs", file_idx);
+            for fn_idx in 0..100usize {
+                let name = format!("func_{}_{}", file_idx, fn_idx);
+                insert_test_node(
+                    &graph,
+                    &file,
+                    CallNode {
+                        name: name.clone(),
+                        file_path: file.clone(),
+                        line: fn_idx + 1,
+                        calls: Vec::new(),
+                        called_by: Vec::new(),
+                        metrics: FunctionMetrics::default(),
+                    },
+                );
+            }
+        }
+
+        // 100_000 resolve calls from a file not in the graph — forces the full
+        // lookup path through name_index every time.
+        let start = std::time::Instant::now();
+        for call_idx in 0..100_000usize {
+            let file_idx = call_idx % 100;
+            let fn_idx = call_idx % 100;
+            let name = format!("func_{}_{}", file_idx, fn_idx);
+            let _ = graph.resolve_callee(&name, "src/other/mod.rs", None);
+        }
+        let elapsed = start.elapsed();
+
+        // Under the old O(N) scan: 100k calls × 10k nodes = 1 billion iterations.
+        // With the name_index: 100k O(1) DashMap lookups — must finish in < 5 s
+        // even in unoptimised debug builds under heavy CI load.
+        assert!(
+            elapsed.as_secs() < 5,
+            "resolve_callee took {:?} for 100k calls over 10k functions — O(N) scan not fixed?",
+            elapsed
+        );
+    }
+
     #[test]
     fn test_scope_matches_file_path() {
         // "App" should match src/app/mod.rs
@@ -2223,34 +2287,44 @@ mod tests {
         ));
     }
 
+    fn insert_test_node(graph: &CallGraph, file: &str, node: CallNode) {
+        let key = CallGraph::qualified_key(file, &node.name);
+        graph
+            .name_index
+            .entry(node.name.clone())
+            .or_insert_with(Vec::new)
+            .push(key.clone());
+        graph.nodes.insert(key, node);
+    }
+
     #[test]
     fn test_resolve_callee_deterministic() {
         let graph = CallGraph::new();
 
-        // Two different files each have a "run" function
-        let node_a = CallNode {
-            name: "run".to_string(),
-            file_path: "src/agents/mod.rs".to_string(),
-            line: 10,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-        let node_b = CallNode {
-            name: "run".to_string(),
-            file_path: "src/app/mod.rs".to_string(),
-            line: 20,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+        insert_test_node(
+            &graph,
+            "src/agents/mod.rs",
+            CallNode {
+                name: "run".to_string(),
+                file_path: "src/agents/mod.rs".to_string(),
+                line: 10,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
+        insert_test_node(
+            &graph,
+            "src/app/mod.rs",
+            CallNode {
+                name: "run".to_string(),
+                file_path: "src/app/mod.rs".to_string(),
+                line: 20,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
 
         // Without scope hint, from a third file, should get deterministic result
         // (alphabetically first: "src/agents/mod.rs::run" < "src/app/mod.rs::run")
@@ -2264,30 +2338,30 @@ mod tests {
     fn test_resolve_callee_with_scope_hint() {
         let graph = CallGraph::new();
 
-        // Two different files each have a "run" function
-        let node_a = CallNode {
-            name: "run".to_string(),
-            file_path: "src/agents/mod.rs".to_string(),
-            line: 10,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-        let node_b = CallNode {
-            name: "run".to_string(),
-            file_path: "src/app/mod.rs".to_string(),
-            line: 20,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/agents/mod.rs", "run"), node_a);
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/app/mod.rs", "run"), node_b);
+        insert_test_node(
+            &graph,
+            "src/agents/mod.rs",
+            CallNode {
+                name: "run".to_string(),
+                file_path: "src/agents/mod.rs".to_string(),
+                line: 10,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
+        insert_test_node(
+            &graph,
+            "src/app/mod.rs",
+            CallNode {
+                name: "run".to_string(),
+                file_path: "src/app/mod.rs".to_string(),
+                line: 20,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
 
         // With scope hint "App", should pick app/mod.rs::run
         let result = graph.resolve_callee("run", "src/main.rs", Some("App"));
@@ -2308,29 +2382,30 @@ mod tests {
     fn test_resolve_callee_same_file_preferred() {
         let graph = CallGraph::new();
 
-        let node_a = CallNode {
-            name: "helper".to_string(),
-            file_path: "src/main.rs".to_string(),
-            line: 5,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-        let node_b = CallNode {
-            name: "helper".to_string(),
-            file_path: "src/utils.rs".to_string(),
-            line: 10,
-            calls: Vec::new(),
-            called_by: Vec::new(),
-            metrics: FunctionMetrics::default(),
-        };
-
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/main.rs", "helper"), node_a);
-        graph
-            .nodes
-            .insert(CallGraph::qualified_key("src/utils.rs", "helper"), node_b);
+        insert_test_node(
+            &graph,
+            "src/main.rs",
+            CallNode {
+                name: "helper".to_string(),
+                file_path: "src/main.rs".to_string(),
+                line: 5,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
+        insert_test_node(
+            &graph,
+            "src/utils.rs",
+            CallNode {
+                name: "helper".to_string(),
+                file_path: "src/utils.rs".to_string(),
+                line: 10,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
 
         // Same-file match should always win, even with a scope hint pointing elsewhere
         let result = graph.resolve_callee("helper", "src/main.rs", Some("utils"));
