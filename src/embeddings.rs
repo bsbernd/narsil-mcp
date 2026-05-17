@@ -323,6 +323,14 @@ impl ConcurrentVectorStore {
             doc.embedding = embed_fn(&doc.content);
         }
     }
+
+    /// Release all content strings; call after reembed_all() when content is no longer needed.
+    pub fn clear_content(&self) {
+        let mut store = self.inner.write();
+        for doc in &mut store.documents {
+            doc.content = String::new();
+        }
+    }
 }
 
 impl Default for ConcurrentVectorStore {
@@ -371,10 +379,13 @@ impl EmbeddingEngine {
     /// Finalize the embedding model after all documents have been indexed.
     /// Builds the vocabulary from accumulated frequencies (O(V log V) once),
     /// then re-embeds every stored document with the correct IDF values.
+    /// Content strings are cleared afterwards — they are no longer needed.
     pub fn finalize(&self) {
         self.provider.write().rebuild_vocabulary();
         let provider = self.provider.read();
         self.store.reembed_all(|content| provider.embed(content));
+        drop(provider);
+        self.store.clear_content();
     }
 
     /// Find similar code to a query string
