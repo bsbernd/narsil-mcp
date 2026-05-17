@@ -909,6 +909,37 @@ impl CodeIntelEngine {
         })
     }
 
+    /// Resolve a user-supplied repo argument to the canonical short name used as
+    /// DashMap keys throughout the engine.  Accepts either the short name (e.g.
+    /// "linux.git") or a full path (e.g. "/home/user/src/linux/linux.git").
+    fn resolve_repo_name(&self, repo: &str) -> Result<String> {
+        if repo.is_empty() {
+            return Err(self.repo_not_found_error(repo));
+        }
+        // Fast path: already the canonical key.
+        if self.repos.contains_key(repo) {
+            return Ok(repo.to_string());
+        }
+        // Path lookup: find the repo whose stored path matches.
+        if repo.contains('/') || repo.contains('\\') {
+            let as_path = PathBuf::from(repo);
+            for entry in self.repos.iter() {
+                let repo_path = &entry.value().path;
+                if as_path == *repo_path || as_path.starts_with(repo_path) {
+                    return Ok(entry.key().clone());
+                }
+                if let (Ok(canonical), Ok(repo_canonical)) =
+                    (as_path.canonicalize(), repo_path.canonicalize())
+                {
+                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
+                        return Ok(entry.key().clone());
+                    }
+                }
+            }
+        }
+        Err(self.repo_not_found_error(repo))
+    }
+
     /// Get a reference to the engine options
     pub fn options(&self) -> &EngineOptions {
         &self.options
@@ -1110,6 +1141,8 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
+        let repo = self.resolve_repo_name(repo)?;
+
         // Build cache key from query parameters
         let cache_key = {
             let options = SearchOptions {
@@ -1122,7 +1155,7 @@ impl CodeIntelEngine {
                 pattern.unwrap_or("*"),
                 symbol_type.unwrap_or("all")
             );
-            QueryCacheKey::code_search_with_options(Some(repo), query, &options)
+            QueryCacheKey::code_search_with_options(Some(repo.as_str()), query, &options)
         };
 
         // Check cache first
@@ -1134,8 +1167,8 @@ impl CodeIntelEngine {
 
         let symbols = self
             .symbols
-            .get(repo)
-            .ok_or_else(|| self.repo_not_found_error(repo))?;
+            .get(&repo)
+            .ok_or_else(|| self.repo_not_found_error(&repo))?;
 
         let exclude_tests = exclude_tests.unwrap_or(false);
 
@@ -2690,11 +2723,13 @@ impl CodeIntelEngine {
         // Note: exclude_tests filtering would require call graph regeneration
         // For now, the parameter is accepted but filtering happens at source
 
+        let repo = self.resolve_repo_name(repo)?;
+
         // Build cache key with function as discriminator
-        let cache_key = AnalysisCacheKey::with_discriminator(repo, "call_graph", function);
+        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "call_graph", function);
 
         // Compute repo hash for invalidation
-        let repo_hash = self.compute_repo_hash(repo);
+        let repo_hash = self.compute_repo_hash(&repo);
 
         // Check cache first
         if self.options.cache_enabled {
@@ -2706,9 +2741,9 @@ impl CodeIntelEngine {
             }
         }
 
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
@@ -2740,9 +2775,10 @@ impl CodeIntelEngine {
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
         // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo = self.resolve_repo_name(repo)?;
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
@@ -2790,9 +2826,10 @@ impl CodeIntelEngine {
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
         // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo = self.resolve_repo_name(repo)?;
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
@@ -2832,9 +2869,10 @@ impl CodeIntelEngine {
 
     /// Find the call path between two functions
     pub async fn find_call_path(&self, repo: &str, from: &str, to: &str) -> Result<String> {
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo = self.resolve_repo_name(repo)?;
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
@@ -2862,9 +2900,10 @@ impl CodeIntelEngine {
 
     /// Get complexity metrics for a function
     pub async fn get_complexity(&self, repo: &str, function: &str) -> Result<String> {
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo = self.resolve_repo_name(repo)?;
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
@@ -2919,9 +2958,10 @@ impl CodeIntelEngine {
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
         // Note: exclude_tests filtering would require call graph regeneration
-        let call_graph = self.call_graphs.get(repo).ok_or_else(|| {
+        let repo = self.resolve_repo_name(repo)?;
+        let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
-                "Call graph not available for {}. Enable with --call-graph flag.",
+                "Call graph not found for '{}'. Is --call-graph enabled?",
                 repo
             )
         })?;
