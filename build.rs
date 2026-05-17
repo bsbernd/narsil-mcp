@@ -11,14 +11,14 @@
 use std::path::Path;
 
 fn main() {
-    // Re-run only when the markers we care about change.
-    println!("cargo:rerun-if-changed=frontend/dist/index.html");
-    println!("cargo:rerun-if-changed=frontend/package.json");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FRONTEND");
 
     if std::env::var_os("CARGO_FEATURE_FRONTEND").is_none() {
         return;
     }
+
+    println!("cargo:rerun-if-changed=frontend/dist/index.html");
+    println!("cargo:rerun-if-changed=frontend/package.json");
 
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by cargo");
