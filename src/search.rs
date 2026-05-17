@@ -81,6 +81,8 @@ pub struct SearchIndex {
     inverted_index: HashMap<String, Vec<usize>>,
     /// Document frequency per term
     doc_freq: HashMap<String, usize>,
+    /// Running total of token counts across all documents (for BM25 avg_doc_len)
+    total_tokens: usize,
     /// Average document length
     avg_doc_len: f64,
     /// BM25 parameters
@@ -101,6 +103,7 @@ impl SearchIndex {
             documents: Vec::new(),
             inverted_index: HashMap::new(),
             doc_freq: HashMap::new(),
+            total_tokens: 0,
             avg_doc_len: 0.0,
             params: BM25Params::default(),
             synonyms: Self::build_code_synonyms(),
@@ -177,11 +180,9 @@ impl SearchIndex {
             *self.doc_freq.entry(token.clone()).or_default() += 1;
         }
 
+        self.total_tokens += doc.tokens.len();
         self.documents.push(doc);
-
-        // Recalculate average document length
-        let total_len: usize = self.documents.iter().map(|d| d.tokens.len()).sum();
-        self.avg_doc_len = total_len as f64 / self.documents.len() as f64;
+        self.avg_doc_len = self.total_tokens as f64 / self.documents.len() as f64;
     }
 
     /// Index content from a file
@@ -384,6 +385,7 @@ impl SearchIndex {
         self.documents.clear();
         self.inverted_index.clear();
         self.doc_freq.clear();
+        self.total_tokens = 0;
         self.avg_doc_len = 0.0;
     }
 }
