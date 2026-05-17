@@ -121,6 +121,11 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_PRESET")]
     preset: Option<String>,
 
+    /// TF-IDF embedding dimension (default: 512).
+    /// Lower values reduce memory usage; higher values improve find_similar_code accuracy.
+    #[arg(long, env = "NARSIL_EMBEDDING_DIM")]
+    embedding_dim: Option<usize>,
+
     /// Disable analysis caching (caching is enabled by default)
     #[arg(long, env = "NARSIL_NO_CACHE")]
     no_cache: bool,
@@ -265,6 +270,7 @@ async fn main() -> Result<()> {
         neural_config,
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
+        embedding_dim: server_args.embedding_dim.unwrap_or(1000),
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -381,6 +387,9 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     apply_bool_default(&mut server_args.remote, profile.remote);
     apply_bool_default(&mut server_args.neural, profile.neural);
     apply_bool_default(&mut server_args.graph, profile.graph);
+    if server_args.embedding_dim.is_none() {
+        server_args.embedding_dim = profile.embedding_dim;
+    }
 
     info!("Applied repository profile '{}'", profile_name);
     Ok(())

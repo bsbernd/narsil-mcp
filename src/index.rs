@@ -105,6 +105,8 @@ pub struct EngineOptions {
     pub cache_enabled: bool,
     /// Cache TTL in seconds (default: 1800 = 30 minutes)
     pub cache_ttl_seconds: u64,
+    /// TF-IDF embedding vocabulary size / vector dimension (default: 1000)
+    pub embedding_dim: usize,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -126,6 +128,7 @@ impl Default for EngineOptions {
             neural_config: NeuralConfig::default(),
             cache_enabled: true,
             cache_ttl_seconds: 1800,
+            embedding_dim: 1000,
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -327,7 +330,7 @@ impl CodeIntelEngine {
             git_repos: DashMap::new(),
             call_graphs: DashMap::new(),
             search_index: Arc::new(ConcurrentSearchIndex::new()),
-            embedding_engine: Arc::new(EmbeddingEngine::new(1000)), // 1000-dim TF-IDF vectors
+            embedding_engine: Arc::new(EmbeddingEngine::new(options.embedding_dim)),
             neural_engine,
             options: options.clone(),
             index_store,
@@ -3817,7 +3820,7 @@ impl CodeIntelEngine {
 
         // Create search engines
         let bm25_index = Arc::new(ConcurrentSearchIndex::new());
-        let tfidf_engine = Arc::new(EmbeddingEngine::new(1000));
+        let tfidf_engine = Arc::new(EmbeddingEngine::new(self.options.embedding_dim));
         let hybrid_engine = create_hybrid_engine(bm25_index.clone(), tfidf_engine.clone());
         let chunker = AstChunker::new();
 

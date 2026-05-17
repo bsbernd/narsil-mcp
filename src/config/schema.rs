@@ -104,6 +104,11 @@ pub struct RepoProfile {
     /// Enable graph/SPARQL/CCG tools for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<bool>,
+
+    /// TF-IDF embedding dimension (default: 512). Lower values reduce memory;
+    /// higher values improve find_similar_code accuracy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<usize>,
 }
 
 /// Tools configuration (categories and overrides)
