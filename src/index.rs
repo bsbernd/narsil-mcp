@@ -458,7 +458,12 @@ impl CodeIntelEngine {
 
         info!("Starting background initialization");
 
-        // Index repos that weren't loaded from persistence
+        // For repos loaded from persistence: index_repo still runs to rebuild the
+        // BM25 search index and call graph (which are not persisted), but it
+        // skips the expensive embedding indexing since symbols are already cached.
+        // For repos not in the cache: do a full fresh index and save afterwards.
+        let mut any_freshly_indexed = false;
+
         for repo_path in &self.repo_paths {
             let repo_name = repo_path
                 .file_name()
@@ -466,22 +471,35 @@ impl CodeIntelEngine {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // Check if already loaded from persistence
-            if self.repos.contains_key(&repo_name) {
-                info!("Repository {} already loaded from cache", repo_name);
-                self.indexed_repos_count.fetch_add(1, Ordering::Release);
-                continue;
+            let from_cache = self.repos.contains_key(&repo_name);
+            if from_cache {
+                info!(
+                    "Repository {} loaded from cache; rebuilding search index and call graph",
+                    repo_name
+                );
+            } else {
+                info!("Indexing repository: {:?}", repo_path);
             }
 
             if repo_path.exists() {
-                info!("Indexing repository: {:?}", repo_path);
                 if let Err(e) = self.index_repo(repo_path).await {
                     warn!("Failed to index {:?}: {}", repo_path, e);
                 } else {
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
+                    if !from_cache {
+                        any_freshly_indexed = true;
+                    }
                 }
             } else {
                 warn!("Repository path does not exist: {:?}", repo_path);
+            }
+        }
+
+        // Persist the freshly-built index so subsequent startups skip embedding
+        // re-indexing (the expensive serial part).
+        if self.options.persist_enabled && any_freshly_indexed {
+            if let Err(e) = self.save_index().await {
+                warn!("Failed to save index to disk: {}", e);
             }
         }
 
@@ -572,6 +590,11 @@ impl CodeIntelEngine {
             .unwrap_or("unknown")
             .to_string();
 
+        // If symbols are already loaded from the persistence cache, skip the
+        // expensive per-symbol embedding indexing — BM25 and call graph still
+        // get rebuilt from the parsed files below.
+        let symbols_cached = self.symbols.contains_key(&repo_name);
+
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
         let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
@@ -642,34 +665,36 @@ impl CodeIntelEngine {
                 .to_string_lossy()
                 .to_string();
 
-            for mut symbol in parsed.symbols {
-                symbol.file_path = relative_path.clone();
+            if !symbols_cached {
+                for mut symbol in parsed.symbols {
+                    symbol.file_path = relative_path.clone();
 
-                // Index symbol into embedding engine for similarity search
-                if let Some(ref sig) = symbol.signature {
-                    let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                    self.embedding_engine.index_snippet(
-                        symbol_id.clone(),
-                        relative_path.clone(),
-                        sig.clone(),
-                        symbol.start_line,
-                        symbol.end_line,
-                    );
+                    // Index symbol into embedding engine for similarity search
+                    if let Some(ref sig) = symbol.signature {
+                        let symbol_id = format!("{}::{}", relative_path, symbol.name);
+                        self.embedding_engine.index_snippet(
+                            symbol_id.clone(),
+                            relative_path.clone(),
+                            sig.clone(),
+                            symbol.start_line,
+                            symbol.end_line,
+                        );
 
-                    // Collect for neural batch indexing if enabled
-                    if self.neural_engine.is_some() {
-                        neural_docs.push(crate::neural::NeuralDocument {
-                            id: symbol_id,
-                            file_path: relative_path.clone(),
-                            content: sig.clone(),
-                            start_line: symbol.start_line,
-                            end_line: symbol.end_line,
-                            symbol_name: Some(symbol.name.clone()),
-                        });
+                        // Collect for neural batch indexing if enabled
+                        if self.neural_engine.is_some() {
+                            neural_docs.push(crate::neural::NeuralDocument {
+                                id: symbol_id,
+                                file_path: relative_path.clone(),
+                                content: sig.clone(),
+                                start_line: symbol.start_line,
+                                end_line: symbol.end_line,
+                                symbol_name: Some(symbol.name.clone()),
+                            });
+                        }
                     }
-                }
 
-                symbols_vec.push(symbol);
+                    symbols_vec.push(symbol);
+                }
             }
 
             // Cache file content
@@ -687,10 +712,20 @@ impl CodeIntelEngine {
         // Batch-insert all pre-tokenized search documents under a single write lock.
         self.search_index.batch_add_documents(search_docs);
 
-        // Build vocabulary and re-embed all snippets with final IDF values.
-        // Must happen after the per-file loop so all document frequencies are
-        // accumulated before the single O(V log V) sort.
-        self.embedding_engine.finalize();
+        // TF-IDF vocabulary finalisation — skip when symbols came from the
+        // persistence cache (embedding_engine was not populated this run).
+        if !symbols_cached {
+            // Build vocabulary and re-embed all snippets with final IDF values.
+            // Must happen after the per-file loop so all document frequencies are
+            // accumulated before the single O(V log V) sort.
+            self.embedding_engine.finalize();
+        }
+
+        let symbol_count = if symbols_cached {
+            self.symbols.get(&repo_name).map(|s| s.len()).unwrap_or(0)
+        } else {
+            symbols_vec.len()
+        };
 
         let metadata = RepoMetadata {
             name: repo_name.clone(),
@@ -703,24 +738,24 @@ impl CodeIntelEngine {
 
         info!(
             "Indexed {} files, {} symbols in {}",
-            file_count,
-            symbols_vec.len(),
-            repo_name
+            file_count, symbol_count, repo_name
         );
 
-        // Batch index neural embeddings if enabled
-        if let Some(ref neural) = self.neural_engine {
-            if !neural_docs.is_empty() {
-                info!(
-                    "Generating neural embeddings for {} symbols...",
-                    neural_docs.len()
-                );
-                let items: Vec<(crate::neural::NeuralDocument,)> =
-                    neural_docs.into_iter().map(|d| (d,)).collect();
-                if let Err(e) = neural.index_batch(&items) {
-                    warn!("Failed to batch index neural embeddings: {}", e);
-                } else {
-                    info!("Neural embeddings indexed successfully");
+        // Batch index neural embeddings if enabled (skipped for cached repos)
+        if !symbols_cached {
+            if let Some(ref neural) = self.neural_engine {
+                if !neural_docs.is_empty() {
+                    info!(
+                        "Generating neural embeddings for {} symbols...",
+                        neural_docs.len()
+                    );
+                    let items: Vec<(crate::neural::NeuralDocument,)> =
+                        neural_docs.into_iter().map(|d| (d,)).collect();
+                    if let Err(e) = neural.index_batch(&items) {
+                        warn!("Failed to batch index neural embeddings: {}", e);
+                    } else {
+                        info!("Neural embeddings indexed successfully");
+                    }
                 }
             }
         }
@@ -728,10 +763,12 @@ impl CodeIntelEngine {
         // Record indexing metrics
         let elapsed = start_time.elapsed();
         self.metrics
-            .record_repo_index(repo_name.clone(), elapsed, file_count, symbols_vec.len());
+            .record_repo_index(repo_name.clone(), elapsed, file_count, symbol_count);
 
-        self.repos.insert(repo_name.clone(), metadata);
-        self.symbols.insert(repo_name.clone(), symbols_vec);
+        if !symbols_cached {
+            self.repos.insert(repo_name.clone(), metadata);
+            self.symbols.insert(repo_name.clone(), symbols_vec);
+        }
 
         // Build call graph if enabled
         if self.options.call_graph_enabled && !trees_for_callgraph.is_empty() {
