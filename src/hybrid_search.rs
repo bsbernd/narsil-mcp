@@ -298,7 +298,7 @@ impl HybridSearchEngine {
         let search_doc = SearchDocument {
             id: chunk.id.clone(),
             file_path: chunk.file_path.clone(),
-            content: chunk.content.clone(),
+            content: Some(chunk.content.clone()),
             doc_type,
             start_line: chunk.start_line,
             end_line: chunk.end_line,

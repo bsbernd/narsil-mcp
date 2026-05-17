@@ -26,7 +26,7 @@ use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
-use crate::search::{build_file_doc, ConcurrentSearchIndex, SearchDocument};
+use crate::search::{build_file_doc, generate_snippet, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
@@ -2554,8 +2554,22 @@ impl CodeIntelEngine {
                 "Lines {}-{}\n\n",
                 result.document.start_line, result.document.end_line
             ));
+            // snippet is empty for the persistent index (content is None there);
+            // regenerate from file_cache — O(num_repos) lookup per top-N result
+            let snippet = if result.snippet.is_empty() {
+                self.repo_paths
+                    .iter()
+                    .find_map(|rp| {
+                        self.file_cache
+                            .get(&rp.join(&result.document.file_path))
+                            .map(|entry| generate_snippet(entry.value(), &result.matched_terms))
+                    })
+                    .unwrap_or_default()
+            } else {
+                result.snippet.clone()
+            };
             output.push_str("```\n");
-            output.push_str(&result.snippet);
+            output.push_str(&snippet);
             output.push_str("\n```\n\n");
         }
 

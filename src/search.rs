@@ -29,7 +29,8 @@ fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
 pub struct SearchDocument {
     pub id: String,
     pub file_path: String,
-    pub content: String,
+    /// Document content; None for the persistent file index (content lives in file_cache)
+    pub content: Option<String>,
     pub doc_type: DocType,
     pub start_line: usize,
     pub end_line: usize,
@@ -206,7 +207,7 @@ impl SearchIndex {
         self.add_document(SearchDocument {
             id: format!("{}::{}", file_path, name),
             file_path: file_path.to_string(),
-            content: content.to_string(),
+            content: Some(content.to_string()),
             doc_type,
             start_line,
             end_line,
@@ -320,36 +321,11 @@ impl SearchIndex {
         expanded
     }
 
-    /// Generate a snippet highlighting matched terms
     fn generate_snippet(&self, doc: &SearchDocument, matched_terms: &[String]) -> String {
-        let lines: Vec<&str> = doc.content.lines().collect();
-        let mut best_line_idx = 0;
-        let mut best_score = 0;
-
-        // Find the line with the most matches
-        for (idx, line) in lines.iter().enumerate() {
-            let line_lower = line.to_lowercase();
-            let score: usize = matched_terms
-                .iter()
-                .filter(|term| line_lower.contains(&term.to_lowercase()))
-                .count();
-
-            if score > best_score {
-                best_score = score;
-                best_line_idx = idx;
-            }
+        match doc.content.as_deref() {
+            Some(content) => generate_snippet(content, matched_terms),
+            None => String::new(),
         }
-
-        // Extract context around the best line
-        let start = best_line_idx.saturating_sub(2);
-        let end = (best_line_idx + 3).min(lines.len());
-
-        lines[start..end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// Get statistics about the index
@@ -385,6 +361,36 @@ pub struct IndexStats {
     pub total_terms: usize,
     pub avg_doc_length: f64,
     pub doc_types: HashMap<DocType, usize>,
+}
+
+/// Generate a snippet from raw content, highlighting matched terms.
+/// Returns a 5-line window centred on the line with the most matches.
+pub(crate) fn generate_snippet(content: &str, matched_terms: &[String]) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut best_line_idx = 0;
+    let mut best_score = 0;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let line_lower = line.to_lowercase();
+        let score: usize = matched_terms
+            .iter()
+            .filter(|term| line_lower.contains(&term.to_lowercase()))
+            .count();
+        if score > best_score {
+            best_score = score;
+            best_line_idx = idx;
+        }
+    }
+
+    let start = best_line_idx.saturating_sub(2);
+    let end = (best_line_idx + 3).min(lines.len());
+
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Code-aware tokenization
@@ -460,6 +466,7 @@ fn split_identifier(ident: &str) -> Vec<String> {
 
 /// Build a SearchDocument for a file without touching any shared state.
 /// Pure function — safe to call from rayon parallel iterators.
+/// content is set to None; snippets are generated from file_cache at query time.
 pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
     let tokens = tokenize_code(content);
     let doc_len = tokens.len();
@@ -467,7 +474,7 @@ pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
     SearchDocument {
         id: file_path.to_string(),
         file_path: file_path.to_string(),
-        content: content.to_string(),
+        content: None,
         doc_type: DocType::File,
         start_line: 1,
         end_line: content.lines().count(),

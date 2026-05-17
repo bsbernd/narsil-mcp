@@ -122,7 +122,7 @@ impl WasmCodeIntel {
                 let doc = SearchDocument {
                     id: path.to_string(),
                     file_path: path.to_string(),
-                    content: content.to_string(),
+                    content: Some(content.to_string()),
                     doc_type: DocType::File,
                     start_line: 1,
                     end_line: content.lines().count(),
