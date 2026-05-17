@@ -109,6 +109,21 @@ pub struct RepoProfile {
     /// higher values improve find_similar_code accuracy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_dim: Option<usize>,
+
+    /// When true, use compile_commands.json to restrict which C/C++ source files
+    /// are indexed. Headers are always indexed regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_compile_commands: Option<bool>,
+
+    /// Path to compile_commands.json, relative to the repo root.
+    /// Defaults to "compile_commands.json".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_commands_path: Option<PathBuf>,
+
+    /// Glob patterns (relative to repo root) for files to always index,
+    /// regardless of compile_commands filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
 }
 
 /// Tools configuration (categories and overrides)

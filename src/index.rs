@@ -107,6 +107,12 @@ pub struct EngineOptions {
     pub cache_ttl_seconds: u64,
     /// TF-IDF embedding vocabulary size / vector dimension (default: 1000)
     pub embedding_dim: usize,
+    /// When true, restrict C/C++ source indexing to files in compile_commands.json
+    pub use_compile_commands: bool,
+    /// Path to compile_commands.json, relative to the repo root (default: "compile_commands.json")
+    pub compile_commands_path: Option<PathBuf>,
+    /// Glob patterns (relative to repo root) for files to always index
+    pub include: Vec<String>,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -129,6 +135,9 @@ impl Default for EngineOptions {
             cache_enabled: true,
             cache_ttl_seconds: 1800,
             embedding_dim: 1000,
+            use_compile_commands: false,
+            compile_commands_path: None,
+            include: Vec::new(),
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -613,11 +622,48 @@ impl CodeIntelEngine {
             .require_git(false)
             .build();
 
-        let files: Vec<PathBuf> = walker
+        let mut files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .map(|e| e.path().to_path_buf())
             .collect();
+
+        if self.options.use_compile_commands {
+            let explicit: Option<&Path> = self.options.compile_commands_path.as_deref();
+            let compiled = if let Some(p) = explicit {
+                load_compile_commands_filter(path, &[p])
+            } else {
+                load_compile_commands_filter(
+                    path,
+                    &[
+                        Path::new("compile_commands.json"),
+                        Path::new("build/compile_commands.json"),
+                    ],
+                )
+            };
+            let patterns = compile_include_patterns(&self.options.include);
+            let before = files.len();
+            files.retain(|abs_path| {
+                let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if is_c_header_ext(ext) {
+                    return true;
+                }
+                if !is_c_source_ext(ext) {
+                    return true;
+                }
+                if compiled.contains(abs_path.as_path()) {
+                    return true;
+                }
+                let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
+                patterns.iter().any(|p| p.matches_path(rel))
+            });
+            info!(
+                "compile_commands filter: {} → {} files ({} filtered out)",
+                before,
+                files.len(),
+                before - files.len()
+            );
+        }
 
         // Parse files in parallel
         let metrics = Arc::clone(&self.metrics);
@@ -7883,6 +7929,94 @@ impl CodeIntelEngine {
             security_findings,
         })
     }
+}
+
+fn is_c_source_ext(ext: &str) -> bool {
+    matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")
+}
+
+fn is_c_header_ext(ext: &str) -> bool {
+    matches!(ext, "h" | "hpp" | "hh" | "hxx" | "h++")
+}
+
+fn load_compile_commands_filter(
+    repo_root: &Path,
+    json_paths: &[&Path],
+) -> std::collections::HashSet<PathBuf> {
+    let mut result = std::collections::HashSet::new();
+    let mut any_loaded = false;
+
+    for json_path in json_paths {
+        let full_path = if json_path.is_absolute() {
+            json_path.to_path_buf()
+        } else {
+            repo_root.join(json_path)
+        };
+
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let entries: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Failed to parse compile_commands.json at {:?}: {}",
+                    full_path, e
+                );
+                continue;
+            }
+        };
+
+        let arr = match entries.as_array() {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "compile_commands.json at {:?} is not a JSON array",
+                    full_path
+                );
+                continue;
+            }
+        };
+
+        let count_before = result.len();
+        result.extend(arr.iter().filter_map(|entry| {
+            entry
+                .get("file")
+                .and_then(|f| f.as_str())
+                .map(PathBuf::from)
+                .and_then(|p| p.canonicalize().ok())
+        }));
+        info!(
+            "Loaded {} compiled files from {:?}",
+            result.len() - count_before,
+            full_path
+        );
+        any_loaded = true;
+    }
+
+    if !any_loaded {
+        warn!(
+            "No compile_commands.json found in {:?} (tried: {:?})",
+            repo_root, json_paths
+        );
+    }
+
+    result
+}
+
+fn compile_include_patterns(patterns: &[String]) -> Vec<glob::Pattern> {
+    patterns
+        .iter()
+        .filter_map(|p| match glob::Pattern::new(p) {
+            Ok(pattern) => Some(pattern),
+            Err(e) => {
+                warn!("Invalid include pattern '{}': {}", p, e);
+                None
+            }
+        })
+        .collect()
 }
 
 /// Parse imports from file content

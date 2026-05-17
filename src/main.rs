@@ -144,6 +144,20 @@ struct ServerArgs {
     /// Only used when --graph is enabled and the graph feature is compiled in.
     #[arg(long, env = "NARSIL_GRAPH_PATH")]
     graph_path: Option<PathBuf>,
+
+    /// Use compile_commands.json to restrict which C/C++ source files are indexed.
+    /// Headers are always indexed regardless.
+    #[arg(long, env = "NARSIL_USE_COMPILE_COMMANDS")]
+    use_compile_commands: bool,
+
+    /// Path to compile_commands.json, relative to the repo root (default: compile_commands.json).
+    #[arg(long, env = "NARSIL_COMPILE_COMMANDS_PATH")]
+    compile_commands_path: Option<PathBuf>,
+
+    /// Glob patterns (relative to repo root) for files to always index.
+    /// Comma-separated (e.g. "tools/perf/**/*.c,scripts/**/*.py").
+    #[arg(long, env = "NARSIL_INCLUDE", value_delimiter = ',')]
+    include: Vec<String>,
 }
 
 #[tokio::main]
@@ -271,6 +285,9 @@ async fn main() -> Result<()> {
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
         embedding_dim: server_args.embedding_dim.unwrap_or(1000),
+        use_compile_commands: server_args.use_compile_commands,
+        compile_commands_path: server_args.compile_commands_path,
+        include: server_args.include,
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -389,6 +406,16 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     apply_bool_default(&mut server_args.graph, profile.graph);
     if server_args.embedding_dim.is_none() {
         server_args.embedding_dim = profile.embedding_dim;
+    }
+    apply_bool_default(
+        &mut server_args.use_compile_commands,
+        profile.use_compile_commands,
+    );
+    if server_args.compile_commands_path.is_none() {
+        server_args.compile_commands_path = profile.compile_commands_path.clone();
+    }
+    if server_args.include.is_empty() {
+        server_args.include = profile.include.clone();
     }
 
     info!("Applied repository profile '{}'", profile_name);
