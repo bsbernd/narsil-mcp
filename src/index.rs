@@ -21,7 +21,7 @@ use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
 use crate::git::GitRepo;
 use crate::lsp::{LspConfig, LspManager};
-use crate::metrics::Metrics;
+use crate::metrics::{spawn_flush_task, Metrics, DEFAULT_FLUSH_INTERVAL};
 use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
@@ -195,6 +195,9 @@ pub struct CodeIntelEngine {
     /// RDF knowledge graph for persistent code intelligence data (when graph is enabled)
     #[cfg(feature = "graph")]
     knowledge_graph: Option<Arc<crate::persistence::KnowledgeGraph>>,
+    /// Background task that periodically flushes lifetime metrics to disk.
+    /// Aborted on shutdown after a final synchronous flush.
+    metrics_flush_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl CodeIntelEngine {
@@ -329,6 +332,14 @@ impl CodeIntelEngine {
 
         let total_repos = expanded_repos.len();
 
+        // Lifetime metrics are persisted in `<index_path>/metrics.bin`. The
+        // directory was just created above so this is always a valid path.
+        // Metrics persistence is independent of `--persist`: the file is small
+        // and the user wants ccache-style accumulation regardless.
+        let metrics_path = expanded_index.join("metrics.bin");
+        let metrics = Arc::new(Metrics::with_persistence(metrics_path));
+        let flush_task = spawn_flush_task(Arc::clone(&metrics), DEFAULT_FLUSH_INTERVAL);
+
         let engine = Self {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
@@ -343,7 +354,7 @@ impl CodeIntelEngine {
             neural_engine,
             options: options.clone(),
             index_store,
-            metrics: Arc::new(Metrics::new()),
+            metrics,
             lsp_manager,
             remote_manager: None,
             security_engine,
@@ -354,6 +365,7 @@ impl CodeIntelEngine {
             total_repos_count: AtomicUsize::new(total_repos),
             #[cfg(feature = "graph")]
             knowledge_graph,
+            metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -457,6 +469,30 @@ impl CodeIntelEngine {
         );
 
         Ok(engine)
+    }
+
+    /// Gracefully stop the metrics flush task and write a final snapshot.
+    ///
+    /// Should be called before the process exits so the last few minutes of
+    /// metrics activity aren't lost. The background flush task is signalled,
+    /// performs a final write, then exits; this function awaits it.
+    pub async fn shutdown(&self) {
+        // Wake the flush task so it writes immediately rather than waiting for
+        // the next tick.
+        self.metrics.notify_shutdown();
+        let handle = self.metrics_flush_task.lock().take();
+        if let Some(handle) = handle {
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    warn!("Metrics flush task ended abnormally: {}", e);
+                }
+            }
+        }
+        // Belt-and-braces: also do an explicit flush in case the task already
+        // exited or never started.
+        if let Err(e) = self.metrics.flush() {
+            warn!("Final metrics flush failed: {}", e);
+        }
     }
 
     /// Complete the deferred initialization by indexing all repositories

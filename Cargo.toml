@@ -116,6 +116,7 @@ directories = "5.0"
 sha2 = "0.10"
 lazy_static = "1.5"
 parking_lot = "0.12"
+hdrhistogram = { version = "7", default-features = false, features = ["serialization"] }  # Latency percentiles persisted across restarts
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens

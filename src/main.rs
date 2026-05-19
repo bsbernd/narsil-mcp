@@ -353,11 +353,55 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Always start the MCP server on stdio (for editor communication)
+    // Always start the MCP server on stdio (for editor communication).
+    //
+    // The server is raced against Ctrl-C (and SIGTERM on Unix) so that, when
+    // the user terminates the process, we get a chance to flush accumulated
+    // metrics to disk before exiting. Without this, the periodic flush could
+    // miss the last few minutes of activity.
+    let shutdown_engine = Arc::clone(&engine);
     let server = mcp::McpServer::from_arc(engine, server_args.preset);
-    server.run().await?;
 
+    let server_result = run_with_shutdown(server).await;
+
+    shutdown_engine.shutdown().await;
+
+    server_result?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_terminate_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            term.recv().await;
+        }
+        Err(e) => {
+            warn!("Failed to install SIGTERM handler: {}", e);
+            // Park forever so the tokio::select! below doesn't pick this arm.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminate_signal() {
+    std::future::pending::<()>().await;
+}
+
+async fn run_with_shutdown(server: mcp::McpServer) -> Result<()> {
+    tokio::select! {
+        result = server.run() => result,
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl-C, shutting down");
+            Ok(())
+        }
+        _ = wait_for_terminate_signal() => {
+            info!("Received SIGTERM, shutting down");
+            Ok(())
+        }
+    }
 }
 
 /// Apply a named repository profile from the loaded configuration.
