@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand};
-use narsil_mcp::{config, http_server, index, lsp, mcp, neural, persist, repo, streaming};
+use narsil_mcp::{
+    config, http_server, index, lsp, mcp, neural, persist, repo, stats_cli, streaming,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn, Level};
@@ -29,6 +31,9 @@ enum Commands {
     /// Tool listing and information commands
     #[command(subcommand)]
     Tools(config::ToolsCommand),
+
+    /// Show accumulated performance stats (without starting the server).
+    Stats(stats_cli::StatsArgs),
 }
 
 #[derive(ClapParser, Debug)]
@@ -170,6 +175,7 @@ async fn main() -> Result<()> {
         return match command {
             Commands::Config(config_cmd) => config::handle_config_command(config_cmd).await,
             Commands::Tools(tools_cmd) => config::handle_tools_command(tools_cmd),
+            Commands::Stats(stats_args) => stats_cli::handle_stats_command(stats_args),
         };
     }
 

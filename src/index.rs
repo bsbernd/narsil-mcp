@@ -332,12 +332,12 @@ impl CodeIntelEngine {
 
         let total_repos = expanded_repos.len();
 
-        // Lifetime metrics are persisted in `<index_path>/metrics.bin`. The
-        // directory was just created above so this is always a valid path.
-        // Metrics persistence is independent of `--persist`: the file is small
-        // and the user wants ccache-style accumulation regardless.
-        let metrics_path = expanded_index.join("metrics.bin");
-        let metrics = Arc::new(Metrics::with_persistence(metrics_path));
+        // Lifetime metrics are persisted globally under the user's cache
+        // directory, keyed by the canonical index_path so multiple invocations
+        // for the same index share a single stats file (ccache-style). This is
+        // independent of `--persist`: the file is tiny and the user wants
+        // accumulation regardless.
+        let metrics = Arc::new(Metrics::with_persistence(expanded_index.clone()));
         let flush_task = spawn_flush_task(Arc::clone(&metrics), DEFAULT_FLUSH_INTERVAL);
 
         let engine = Self {

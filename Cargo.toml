@@ -117,6 +117,7 @@ sha2 = "0.10"
 lazy_static = "1.5"
 parking_lot = "0.12"
 hdrhistogram = { version = "7", default-features = false, features = ["serialization"] }  # Latency percentiles persisted across restarts
+fs4 = "0.13"  # Cross-platform advisory file locking for the global stats file
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens
@@ -168,8 +169,7 @@ name = "token_usage"
 harness = false
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 panic = "abort"
 strip = true
 
