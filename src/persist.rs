@@ -4,7 +4,15 @@
 
 use anyhow::{Context, Result};
 #[cfg(feature = "native")]
-use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, RecursiveMode, Watcher};
+
+// On Linux use the kernel's inotify backend (event-driven, ~0% idle CPU).
+// On other platforms fall back to PollWatcher at compile time; pruning
+// build/.git noise from the watched tree is left as a follow-up.
+#[cfg(all(feature = "native", target_os = "linux"))]
+use notify::INotifyWatcher as PlatformWatcher;
+#[cfg(all(feature = "native", not(target_os = "linux")))]
+use notify::PollWatcher as PlatformWatcher;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -229,10 +237,12 @@ impl IndexStore {
     }
 }
 
-/// File watcher for incremental updates (legacy, sync-based polling)
+/// File watcher for incremental updates (legacy, sync-based drain).
+///
+/// Backed by inotify on Linux and PollWatcher elsewhere — see `PlatformWatcher`.
 #[cfg(feature = "native")]
 pub struct FileWatcher {
-    watcher: PollWatcher,
+    watcher: PlatformWatcher,
     rx: std::sync::mpsc::Receiver<Result<Event, notify::Error>>,
     watched_paths: Vec<PathBuf>,
 }
@@ -242,7 +252,7 @@ impl FileWatcher {
     pub fn new() -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let watcher = PollWatcher::new(
+        let watcher = PlatformWatcher::new(
             move |res| {
                 let _ = tx.send(res);
             },
@@ -321,10 +331,12 @@ impl FileWatcher {
     }
 }
 
-/// Async file watcher for event-driven incremental updates
+/// Async file watcher for event-driven incremental updates.
+///
+/// Backed by inotify on Linux and PollWatcher elsewhere — see `PlatformWatcher`.
 #[cfg(feature = "native")]
 pub struct AsyncFileWatcher {
-    _watcher: PollWatcher,
+    _watcher: PlatformWatcher,
     watched_paths: Vec<PathBuf>,
 }
 
@@ -337,7 +349,7 @@ impl AsyncFileWatcher {
         // Create a channel for the notify watcher
         let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
 
-        let watcher = PollWatcher::new(
+        let watcher = PlatformWatcher::new(
             move |res| {
                 let _ = notify_tx.send(res);
             },
