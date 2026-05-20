@@ -264,7 +264,7 @@ fn test_list_repos() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool("list_repos", json!({}))?;
@@ -288,7 +288,7 @@ fn test_get_project_structure() -> Result<()> {
     repo.add_rust_file("src/utils/mod.rs", "pub mod helpers;")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -353,7 +353,7 @@ fn test_find_symbols_rust() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Find all symbols
@@ -412,7 +412,7 @@ def multiply(x, y):
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -461,7 +461,7 @@ class UserService {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -512,7 +512,7 @@ enum Color { RED, GREEN, BLUE; }
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -572,7 +572,7 @@ fn test_get_symbol_definition() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -614,7 +614,7 @@ fn test_search_code() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -646,7 +646,7 @@ fn test_get_file() -> Result<()> {
     repo.add_rust_file("src/main.rs", file_content)?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
     let response = server.call_tool(
         "get_file",
@@ -678,7 +678,7 @@ fn fourth() {}
     repo.add_rust_file("src/functions.rs", file_content)?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -725,7 +725,7 @@ fn test_find_references() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -762,7 +762,7 @@ fn test_get_dependencies() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -791,7 +791,7 @@ fn test_reindex() -> Result<()> {
     repo.add_rust_file("src/lib.rs", "pub fn hello() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
 
     // Wait for initial indexing to complete instead of fixed sleep
     // This is more robust on slower CI systems (especially Windows)
@@ -856,7 +856,7 @@ fn test_error_missing_required_param() -> Result<()> {
     repo.add_rust_file("src/main.rs", "fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Call get_file without required 'path' parameter
@@ -879,7 +879,7 @@ fn test_error_nonexistent_repo() -> Result<()> {
     repo.add_rust_file("src/main.rs", "fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -902,7 +902,7 @@ fn test_error_nonexistent_file() -> Result<()> {
     repo.add_rust_file("src/main.rs", "fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
     let response = server.call_tool(
         "get_file",
@@ -923,7 +923,7 @@ fn test_empty_repository() -> Result<()> {
     // Don't add any files - empty repo
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool("list_repos", json!({}))?;
@@ -951,7 +951,7 @@ fn test_large_file() -> Result<()> {
     repo.add_rust_file("src/large.rs", &content)?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -991,7 +991,7 @@ fn test_file_with_syntax_errors() -> Result<()> {
     repo.add_rust_file("src/valid.rs", "pub fn valid() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
     let response = server.call_tool(
         "find_symbols",
@@ -1028,7 +1028,7 @@ fn test_gitignore_respected() -> Result<()> {
     repo.add_rust_file("src/main.rs", "pub fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -1084,7 +1084,7 @@ interface TypeScriptInterface {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool("list_repos", json!({}))?;
@@ -1116,7 +1116,7 @@ fn test_symbol_filtering_by_pattern() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Find symbols matching pattern "create"
@@ -1150,7 +1150,7 @@ fn test_symbol_filtering_by_file_pattern() -> Result<()> {
     repo.add_rust_file("src/handlers/api.rs", "pub fn handle() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Find symbols only in models directory
@@ -1361,7 +1361,7 @@ fn test_concurrent_requests() -> Result<()> {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
 
     // Wait for initial indexing to complete instead of fixed sleep
     // This is more robust on slower CI systems (especially Windows)
@@ -1394,7 +1394,7 @@ fn test_search_with_file_pattern() -> Result<()> {
     repo.add_rust_file("tests/test.rs", "// search target in test")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -1444,7 +1444,7 @@ fn test_discover_repos() -> Result<()> {
     let test_repo = TestRepo::new()?;
     test_repo.add_rust_file("src/main.rs", "fn main() {}")?;
     let server = TestMcpServer::start_with_repo(test_repo.path())?;
-    let test_repo_name = test_repo.path().file_name().unwrap().to_str().unwrap();
+    let test_repo_name = test_repo.path().to_str().unwrap();
     server.wait_for_repo(test_repo_name, Duration::from_secs(30))?;
 
     // Test discover_repos
@@ -1474,7 +1474,7 @@ fn test_validate_repo() -> Result<()> {
     repo.add_rust_file("src/main.rs", "fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Test validate_repo with the test repo path
@@ -1514,7 +1514,7 @@ pub fn example_function() {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -1560,7 +1560,7 @@ pub fn validate_user(user: &User) -> bool {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Request line 7 which is inside create_user function
@@ -1606,7 +1606,7 @@ pub fn function_three() {
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Request multiple lines across different functions
@@ -1643,7 +1643,7 @@ fn test_get_excerpt_with_max_lines() -> Result<()> {
     repo.add_rust_file("src/large.rs", &content)?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Request excerpt around line 50 with max_lines constraint
@@ -1690,7 +1690,7 @@ def standalone_function():
     )?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     // Request line inside add method
@@ -1721,7 +1721,7 @@ fn test_get_excerpt_error_invalid_path() -> Result<()> {
     repo.add_rust_file("src/lib.rs", "fn main() {}")?;
 
     let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
     let response = server.call_tool(
@@ -1753,7 +1753,7 @@ mod security_tests {
         std::fs::write(&outside_file, "SECRET CONTENT")?;
 
         let server = TestMcpServer::start_with_repo(repo.path())?;
-        let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+        let repo_name = repo.path().to_str().unwrap();
         server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
         // Try various path traversal attacks
@@ -1801,7 +1801,7 @@ mod security_tests {
         repo.add_rust_file("src/main.rs", "fn main() {}")?;
 
         let server = TestMcpServer::start_with_repo(repo.path())?;
-        let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+        let repo_name = repo.path().to_str().unwrap();
         server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
         // Try to access absolute path

@@ -124,10 +124,10 @@ async fn test_read_resource_relative_uri() {
     assert_eq!(result.unwrap(), "test content");
 }
 
-/// Test that get_repo_path rejects arbitrary filesystem paths not in indexed repos.
-/// Uses get_project_structure which calls get_repo_path internally.
+/// Test that resolve_repo rejects arbitrary filesystem paths not in indexed repos.
+/// Uses get_project_structure, which routes through resolve_repo internally.
 #[tokio::test]
-async fn test_get_repo_path_rejects_arbitrary_paths() {
+async fn test_resolve_repo_rejects_arbitrary_paths() {
     let temp_dir = TempDir::new().unwrap();
     let repo_path = temp_dir.path().join("test-repo");
     fs::create_dir(&repo_path).unwrap();
@@ -139,26 +139,27 @@ async fn test_get_repo_path_rejects_arbitrary_paths() {
         .unwrap();
     engine.complete_initialization().await.unwrap();
 
-    // Arbitrary filesystem paths should NOT resolve as repos via get_project_structure
+    // Arbitrary filesystem paths should NOT resolve as repos.
     let result = engine.get_project_structure("/etc", 3).await;
     assert!(result.is_err(), "Should not allow /etc as a repo path");
 
     let result = engine.get_project_structure("/tmp", 3).await;
     assert!(result.is_err(), "Should not allow /tmp as a repo path");
 
-    // But the indexed repo name should work
-    let repo_name = repo_path.file_name().unwrap().to_str().unwrap();
-    let result = engine.get_project_structure(repo_name, 3).await;
+    // The full indexed repo path must work.
+    let result = engine
+        .get_project_structure(repo_path.to_str().unwrap(), 3)
+        .await;
     assert!(
         result.is_ok(),
-        "Indexed repo name should work: {:?}",
+        "Indexed repo path should work: {:?}",
         result.err()
     );
 }
 
-/// Test that get_repo_path allows the actual indexed repo path
+/// Test that resolve_repo accepts the actual indexed repo path.
 #[tokio::test]
-async fn test_get_repo_path_allows_indexed_repo_path() {
+async fn test_resolve_repo_accepts_indexed_repo_path() {
     let temp_dir = TempDir::new().unwrap();
     let repo_path = temp_dir.path().join("my-project");
     fs::create_dir(&repo_path).unwrap();
@@ -170,7 +171,7 @@ async fn test_get_repo_path_allows_indexed_repo_path() {
         .unwrap();
     engine.complete_initialization().await.unwrap();
 
-    // The actual indexed path should still work when passed directly
+    // The actual indexed path should work when passed directly.
     let result = engine
         .get_project_structure(repo_path.to_str().unwrap(), 3)
         .await;
@@ -178,6 +179,105 @@ async fn test_get_repo_path_allows_indexed_repo_path() {
         result.is_ok(),
         "Indexed repo path should work: {:?}",
         result.err()
+    );
+}
+
+/// Test that resolve_repo rejects bare short names like "linux.git".
+///
+/// Short names cannot disambiguate between two indexed repos that share the
+/// same basename (the original collision bug), so they are no longer accepted.
+#[tokio::test]
+async fn test_resolve_repo_rejects_bare_short_name() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("test-repo");
+    fs::create_dir(&repo_path).unwrap();
+    fs::write(repo_path.join("main.rs"), "fn main() {}").unwrap();
+
+    let index_path = temp_dir.path().join("index");
+    let engine = CodeIntelEngine::new(index_path, vec![repo_path.clone()])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    let result = engine.get_project_structure("test-repo", 3).await;
+    let err = result.expect_err("bare short name must be rejected");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("list_repos"),
+        "Error should point at list_repos, got: {}",
+        msg
+    );
+}
+
+/// Test that two indexed repos sharing the same basename do not collide.
+///
+/// Before this refactor the basename was the map key, so the second clone
+/// silently overwrote the first. With canonical absolute paths as keys, each
+/// repo resolves independently by full path.
+#[tokio::test]
+async fn test_resolve_repo_two_repos_same_basename() {
+    let temp_dir = TempDir::new().unwrap();
+    let clone_a = temp_dir.path().join("a").join("linux.git");
+    let clone_b = temp_dir.path().join("b").join("linux.git");
+    fs::create_dir_all(&clone_a).unwrap();
+    fs::create_dir_all(&clone_b).unwrap();
+    fs::write(clone_a.join("a.rs"), "fn a() {}").unwrap();
+    fs::write(clone_b.join("b.rs"), "fn b() {}").unwrap();
+
+    let index_path = temp_dir.path().join("index");
+    let engine = CodeIntelEngine::new(index_path, vec![clone_a.clone(), clone_b.clone()])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    // Each path resolves to its own repo without collision.
+    let result_a = engine
+        .get_project_structure(clone_a.to_str().unwrap(), 3)
+        .await
+        .expect("clone A must resolve");
+    let result_b = engine
+        .get_project_structure(clone_b.to_str().unwrap(), 3)
+        .await
+        .expect("clone B must resolve");
+
+    assert!(
+        result_a.contains("a.rs"),
+        "clone A's structure should contain its own file, got: {}",
+        result_a
+    );
+    assert!(
+        result_b.contains("b.rs"),
+        "clone B's structure should contain its own file, got: {}",
+        result_b
+    );
+}
+
+/// Test that a subdirectory of an indexed repo resolves to that repo's root.
+#[tokio::test]
+async fn test_resolve_repo_subdirectory_resolves_to_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("my-project");
+    let sub_path = repo_path.join("src").join("nested");
+    fs::create_dir_all(&sub_path).unwrap();
+    fs::write(repo_path.join("root.rs"), "fn root() {}").unwrap();
+    fs::write(sub_path.join("inner.rs"), "fn inner() {}").unwrap();
+
+    let index_path = temp_dir.path().join("index");
+    let engine = CodeIntelEngine::new(index_path, vec![repo_path.clone()])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    // Passing the subdirectory must resolve to the repo root, so the project
+    // structure includes files outside the subdirectory.
+    let result = engine
+        .get_project_structure(sub_path.to_str().unwrap(), 3)
+        .await
+        .expect("subdirectory must resolve to repo root");
+    assert!(
+        result.contains("root.rs"),
+        "subdirectory resolution must yield repo root, got: {}",
+        result
     );
 }
 
@@ -195,13 +295,13 @@ async fn test_check_type_errors_accepts_directory_path() {
     fs::write(src_path.join("lib.rs"), "pub fn rust_file() {}\n").unwrap();
 
     let index_path = temp_dir.path().join("index");
-    let engine = CodeIntelEngine::new(index_path, vec![repo_path])
+    let engine = CodeIntelEngine::new(index_path, vec![repo_path.clone()])
         .await
         .unwrap();
     engine.complete_initialization().await.unwrap();
 
     let result = engine
-        .check_type_errors("typed-project", "src", Some(true))
+        .check_type_errors(repo_path.to_str().unwrap(), "src", Some(true))
         .await
         .unwrap();
 
