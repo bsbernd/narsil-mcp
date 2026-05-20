@@ -1366,11 +1366,12 @@ impl CodeIntelEngine {
         symbol_name: &str,
         context_lines: usize,
     ) -> Result<String> {
-        let repo_path = self.get_repo_path(repo)?;
+        let repo = self.resolve_repo_name(repo)?;
+        let repo_path = self.get_repo_path(&repo)?;
         let symbols = self
             .symbols
-            .get(repo)
-            .ok_or_else(|| self.repo_not_found_error(repo))?;
+            .get(&repo)
+            .ok_or_else(|| self.repo_not_found_error(&repo))?;
 
         // Find matching symbol
         let symbol = symbols
