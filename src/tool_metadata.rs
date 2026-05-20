@@ -153,7 +153,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name or path"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "max_depth": {"type": "integer", "description": "Maximum directory depth (default: 4)"}
                 },
                 "required": ["repo"]
@@ -259,7 +259,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to reindex (optional, reindexes all if omitted)"}
+                    "repo": {"type": "string", "description": "Repository to reindex (optional, reindexes all if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."}
                 },
                 "required": []
             }),
@@ -278,7 +278,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name (optional, shows all if omitted)"}
+                    "repo": {"type": "string", "description": "Repository to query (optional, shows all if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."}
                 },
                 "required": []
             }),
@@ -297,7 +297,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"}
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."}
                 },
                 "required": ["repo"]
             }),
@@ -491,7 +491,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query - can be natural language or code pattern"},
-                    "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
+                    "repo": {"type": "string", "description": "Repository to search (optional, searches all if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -514,7 +514,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Repository name (optional, searches all if omitted)"},
+                    "repo": {"type": "string", "description": "Repository to search (optional, searches all if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "doc_type": {"type": "string", "enum": ["file", "function", "class", "struct", "method"], "description": "Filter by document type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -537,7 +537,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Optional: limit to specific repository"},
+                    "repo": {"type": "string", "description": "Repository to limit to (optional, all repositories if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "mode": {"type": "string", "enum": ["hybrid", "bm25", "tfidf"], "description": "Search mode: hybrid (default), bm25 only, or tfidf only"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -560,7 +560,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query"},
-                    "repo": {"type": "string", "description": "Optional: limit to specific repository"},
+                    "repo": {"type": "string", "description": "Repository to limit to (optional, all repositories if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
                 },
                 "required": ["query"]
@@ -581,7 +581,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Optional: limit to specific repository"},
+                    "repo": {"type": "string", "description": "Repository to limit to (optional, all repositories if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "chunk_type": {"type": "string", "enum": ["function", "method", "class", "trait", "module", "all"], "description": "Filter by chunk type"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
@@ -604,7 +604,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Code snippet to find similar code for"},
-                    "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted)"},
+                    "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted). Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
                 },
@@ -1699,7 +1699,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "exclude_entry_points": {"type": "boolean", "description": "Exclude entry point files like lib.rs, main.rs, index.js (default: true)"},
                     "exclude_patterns": {
                         "type": "array",
@@ -1810,7 +1810,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "include_security": {"type": "boolean", "description": "Include security summary in manifest (default: true)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs (optional)"}
                 },
@@ -1831,7 +1831,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "include_security": {"type": "boolean", "description": "Include security summary (default: true)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs"},
                     "output": {"type": "string", "description": "Output file path (optional)"}
@@ -1853,7 +1853,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1873,7 +1873,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1893,7 +1893,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1913,7 +1913,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "output_dir": {"type": "string", "description": "Output directory path (optional)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs"},
                     "include_security": {"type": "boolean", "description": "Include security summary (default: true)"}
@@ -1935,7 +1935,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"}
@@ -1957,7 +1957,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "tier": {"type": "string", "description": "Access tier: 'public' or 'triple-heart' (default)"},
                     "agent": {"type": "string", "description": "Specific agent URI to grant private access to (optional)"}
                 },
@@ -2020,7 +2020,7 @@ lazy_static! {
                 "properties": {
                     "host": {"type": "string", "description": "Git host (default: github.com)"},
                     "owner": {"type": "string", "description": "Repository owner"},
-                    "repo": {"type": "string", "description": "Repository name"},
+                    "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
                     "commit": {"type": "string", "description": "Commit SHA or 'latest' (default: latest)"}
                 },
                 "required": ["owner", "repo"]
