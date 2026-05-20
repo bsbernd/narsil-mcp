@@ -1892,8 +1892,10 @@ impl CodeIntelEngine {
                 }
             };
 
-            // Create a persisted index from current state
-            let mut persisted = PersistedIndex::new(repo_path.clone());
+            // Create a persisted index from current state. The repo_root field
+            // is stored as the canonical absolute path so future loads route
+            // through the canonical-keyed index file.
+            let mut persisted = PersistedIndex::new(PathBuf::from(&repo_name));
 
             // Populate with current symbols
             if let Some(symbols) = self.symbols.get(&repo_name) {

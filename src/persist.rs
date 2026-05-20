@@ -180,19 +180,36 @@ impl IndexStore {
         Ok(Self { index_dir })
     }
 
-    /// Get the index file path for a repository
+    /// Get the index file path for a repository.
+    ///
+    /// The on-disk filename is derived from the canonical absolute path of the
+    /// repository, so the same repo reached via a symlink or relative form
+    /// resolves to the same .idx file. Falls back to the input path string when
+    /// canonicalize fails (e.g. the path no longer exists on disk).
     pub fn index_path(&self, repo_root: &Path) -> PathBuf {
+        let canonical = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
         let hash = {
             let mut hasher = Sha256::new();
-            hasher.update(repo_root.to_string_lossy().as_bytes());
+            hasher.update(canonical.to_string_lossy().as_bytes());
             format!("{:x}", hasher.finalize())
         };
         self.index_dir.join(format!("{}.idx", &hash[..16]))
     }
 
-    /// Load or create index for a repository
+    /// Load or create index for a repository.
+    ///
+    /// Looks up by canonical-path hash. If no canonical-keyed .idx exists, scans
+    /// the index dir for a legacy .idx whose stored repo_root canonicalizes to
+    /// the same target — and if found, migrates it to the canonical filename
+    /// and updates its repo_root field. The legacy file is removed after a
+    /// successful migration.
     pub fn load_or_create(&self, repo_root: &Path) -> Result<PersistedIndex> {
-        let index_path = self.index_path(repo_root);
+        let canonical_root = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let index_path = self.index_path(&canonical_root);
 
         if index_path.exists() {
             match PersistedIndex::load(&index_path) {
@@ -206,8 +223,58 @@ impl IndexStore {
             }
         }
 
-        info!("Creating new index for {:?}", repo_root);
-        Ok(PersistedIndex::new(repo_root.to_path_buf()))
+        if let Some(legacy_path) = self.find_legacy_index_for(&canonical_root) {
+            match self.migrate_legacy_index(&legacy_path, &index_path, &canonical_root) {
+                Ok(index) => return Ok(index),
+                Err(e) => warn!(
+                    "Failed to migrate legacy index {:?}: {}; creating new",
+                    legacy_path, e
+                ),
+            }
+        }
+
+        info!("Creating new index for {:?}", canonical_root);
+        Ok(PersistedIndex::new(canonical_root))
+    }
+
+    /// Find an existing .idx whose stored repo_root canonicalizes to the
+    /// target. Used to migrate indexes saved before path canonicalization.
+    fn find_legacy_index_for(&self, canonical_root: &Path) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(&self.index_dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+                continue;
+            }
+            let Ok(index) = PersistedIndex::load(&path) else {
+                continue;
+            };
+            let Ok(stored_canonical) = index.repo_root.canonicalize() else {
+                continue;
+            };
+            if stored_canonical == canonical_root {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    fn migrate_legacy_index(
+        &self,
+        legacy_path: &Path,
+        canonical_path: &Path,
+        canonical_root: &Path,
+    ) -> Result<PersistedIndex> {
+        let mut index = PersistedIndex::load(legacy_path)?;
+        index.repo_root = canonical_root.to_path_buf();
+        index.save(canonical_path)?;
+        std::fs::remove_file(legacy_path)
+            .with_context(|| format!("Failed to remove legacy index {:?}", legacy_path))?;
+        info!(
+            "Migrated legacy index {:?} -> {:?}",
+            legacy_path, canonical_path
+        );
+        Ok(index)
     }
 
     /// Save index for a repository

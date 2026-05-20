@@ -708,3 +708,65 @@ async fn test_run_watch_mode_exits_when_sender_dropped() -> Result<()> {
 
     Ok(())
 }
+
+/// A persisted index saved with a non-canonical path (e.g. via a symlink, as
+/// would have happened before the path-canonicalization refactor) must be
+/// migrated to the canonical-path filename on next load, not silently orphaned.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_persistence_migrates_legacy_non_canonical_index() -> Result<()> {
+    use narsil_mcp::persist::{IndexStore, PersistedIndex};
+    use sha2::{Digest, Sha256};
+
+    let temp = TempDir::new()?;
+    let real_dir = temp.path().join("real");
+    std::fs::create_dir(&real_dir)?;
+    let link_dir = temp.path().join("link");
+    std::os::unix::fs::symlink(&real_dir, &link_dir)?;
+
+    let index_dir = temp.path().join("index");
+    let store = IndexStore::new(index_dir.clone())?;
+
+    // Simulate a pre-refactor save: write a PersistedIndex whose repo_root is
+    // the symlink path, into a .idx file whose name hash is keyed by that same
+    // non-canonical string. Bypass IndexStore::save because today it
+    // canonicalizes — we need the orphaned filename a legacy binary would have
+    // produced.
+    let legacy_filename = {
+        let mut hasher = Sha256::new();
+        hasher.update(link_dir.to_string_lossy().as_bytes());
+        let hex = format!("{:x}", hasher.finalize());
+        index_dir.join(format!("{}.idx", &hex[..16]))
+    };
+    PersistedIndex::new(link_dir.clone()).save(&legacy_filename)?;
+    assert!(
+        legacy_filename.exists(),
+        "legacy .idx must exist before migration"
+    );
+
+    let canonical = real_dir.canonicalize()?;
+    let canonical_filename = store.index_path(&canonical);
+    assert_ne!(
+        legacy_filename, canonical_filename,
+        "legacy and canonical .idx filenames must differ for this test to be meaningful"
+    );
+
+    // Loading by the canonical path must discover the legacy file and migrate
+    // it — not silently create a fresh empty index.
+    let loaded = store.load_or_create(&canonical)?;
+
+    assert!(
+        !legacy_filename.exists(),
+        "legacy .idx must be removed after migration"
+    );
+    assert!(
+        canonical_filename.exists(),
+        "canonical .idx must exist after migration"
+    );
+    assert_eq!(
+        loaded.repo_root, canonical,
+        "migrated index must have the canonical repo_root"
+    );
+
+    Ok(())
+}
