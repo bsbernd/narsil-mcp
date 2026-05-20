@@ -56,13 +56,6 @@
         ]
       }
     ],
-    "SessionStart": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {"type": "command", "command": ".claude/hooks/session-init.sh", "once": true}
-        ]
-      }
-    ]
+    "SessionStart": []
   }
 }

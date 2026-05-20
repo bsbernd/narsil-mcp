@@ -169,6 +169,9 @@ impl LanguageParser {
                 extensions: vec!["cpp", "cc", "cxx", "hpp", "hxx", "hh"],
                 symbol_query: r#"
                     (function_definition declarator: (function_declarator declarator: (identifier) @function.name)) @function.def
+                    (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name)) @function.def
+                    (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @function.name))) @function.def
+                    (template_declaration (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name))) @function.def
                     (class_specifier name: (type_identifier) @class.name) @class.def
                     (struct_specifier name: (type_identifier) @struct.name) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name) @enum.def

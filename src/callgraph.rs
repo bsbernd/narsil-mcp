@@ -191,14 +191,41 @@ impl CallGraph {
                 | "arrow_function"
                 | "lambda"
                 | "closure_expression"
+                | "lambda_expression"   // C++ lambda
+                | "template_declaration" // C++ template — wraps a function_definition
         );
 
         if !is_function {
             return None;
         }
 
-        // Try to find the function name
-        let name = extract_function_name(node, source)?;
+        // For C++ template_declaration, descend into the wrapped function rather than
+        // treating the template node itself as a callable.
+        if kind == "template_declaration" {
+            let mut cursor = node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    if matches!(
+                        child.kind(),
+                        "function_definition" | "function_declaration" | "method_declaration"
+                    ) {
+                        return self.try_extract_function(child, source, path);
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            return None;
+        }
+
+        // C++ lambda_expression has no identifier child; synthesise a name from position.
+        let name = if kind == "lambda_expression" {
+            format!("lambda@{}", node.start_position().row + 1)
+        } else {
+            extract_function_name(node, source)?
+        };
         let metrics = self.compute_metrics(node, source);
 
         Some(CallNode {
@@ -241,8 +268,15 @@ impl CallGraph {
                     | "function_declaration"
                     | "method_definition"
                     | "method_declaration"
+                    | "lambda_expression"
+                    | "template_declaration"
             ) {
-                if let Some(name) = extract_function_name(node, source) {
+                let name = if kind == "lambda_expression" {
+                    Some(format!("lambda@{}", node.start_position().row + 1))
+                } else {
+                    extract_function_name(node, source)
+                };
+                if let Some(name) = name {
                     *current_function = Some(Self::qualified_key(path, &name));
                 }
             }
@@ -1223,6 +1257,21 @@ fn extract_function_name(node: Node, source: &[u8]) -> Option<String> {
             || kind == "field_identifier"
             || kind == "property_identifier"
         {
+            return child.utf8_text(source).ok().map(|s| s.to_string());
+        }
+
+        // C++: out-of-class member function — return fully-qualified name e.g. "Foo::bar"
+        if kind == "qualified_identifier" {
+            return child.utf8_text(source).ok().map(|s| s.to_string());
+        }
+
+        // C++: destructor — return "~ClassName"
+        if kind == "destructor_name" {
+            return child.utf8_text(source).ok().map(|s| s.to_string());
+        }
+
+        // C++: operator overload — return "operator=="
+        if kind == "operator_name" {
             return child.utf8_text(source).ok().map(|s| s.to_string());
         }
 

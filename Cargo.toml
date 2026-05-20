@@ -170,6 +170,7 @@ harness = false
 
 [profile.release]
 lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
 
