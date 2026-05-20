@@ -994,6 +994,73 @@ impl CodeIntelEngine {
         })
     }
 
+    /// Resolve a user-supplied repo argument to the canonical absolute path of
+    /// an indexed repository.
+    ///
+    /// Accepts `"."`, a relative path, or an absolute path. The input is
+    /// canonicalized (resolving `..`, symlinks, and the current directory) and
+    /// then matched against indexed repositories: an exact match returns the
+    /// repo root, and any subdirectory of an indexed repo also resolves to
+    /// that repo's root (so `"."` from inside a repo subdirectory works).
+    ///
+    /// Bare short names (e.g. `"linux.git"`) are rejected with an error that
+    /// points the caller at `list_repos`: short names cannot disambiguate
+    /// between multiple indexed repos that share the same basename, so the
+    /// caller must pass a path.
+    ///
+    /// The returned string is the canonical absolute path as stored in the
+    /// engine's repository maps — use it directly as the lookup key.
+    #[allow(dead_code)] // Wired up in a follow-up patch that rekeys the maps.
+    fn resolve_repo(&self, input: &str) -> Result<String> {
+        if input.is_empty() {
+            return Err(self.repo_not_found_error(input));
+        }
+
+        // Reject anything that isn't a path-like input. Bare short names are
+        // ambiguous (two repos can share a basename), so require an explicit
+        // path or ".".
+        let looks_like_path = input == "." || input.contains('/') || input.contains('\\');
+        if !looks_like_path {
+            let repo_paths: Vec<_> = self
+                .repos
+                .iter()
+                .map(|r| r.value().path.display().to_string())
+                .collect();
+            return Err(anyhow!(
+                "Repository '{}' must be passed as an absolute path, relative path, or '.'. \
+                 Indexed repositories: {}. \
+                 Use list_repos to see all indexed repositories.",
+                input,
+                repo_paths.join(", ")
+            ));
+        }
+
+        // Resolve the input to an absolute canonical path on disk.
+        let as_path = if input == "." {
+            std::env::current_dir().context("Failed to read current directory")?
+        } else {
+            PathBuf::from(input)
+        };
+        let canonical_input = as_path
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize repo path '{}'", input))?;
+
+        // Match against indexed repos: exact, or a subdirectory of one.
+        for entry in self.repos.iter() {
+            let stored = &entry.value().path;
+            let stored_canonical = match stored.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if canonical_input == stored_canonical || canonical_input.starts_with(&stored_canonical)
+            {
+                return Ok(stored_canonical.to_string_lossy().into_owned());
+            }
+        }
+
+        Err(self.repo_not_found_error(input))
+    }
+
     /// Resolve a user-supplied repo argument to the canonical short name used as
     /// DashMap keys throughout the engine.  Accepts either the short name (e.g.
     /// "linux.git") or a full path (e.g. "/home/user/src/linux/linux.git").
