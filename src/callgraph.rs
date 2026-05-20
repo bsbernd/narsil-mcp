@@ -26,6 +26,18 @@ pub struct CallNode {
     pub metrics: FunctionMetrics,
 }
 
+/// Which analysis source produced a call edge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum EdgeSource {
+    /// Extracted from the tree-sitter AST (always available).
+    #[default]
+    Ast,
+    /// Resolved by the LSP server (clangd/rust-analyzer/…).
+    Lsp,
+    /// Confirmed by both AST and LSP — highest confidence.
+    Both,
+}
+
 /// An edge in the call graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEdge {
@@ -42,6 +54,9 @@ pub struct CallEdge {
     /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
     #[serde(default)]
     pub scope_hint: Option<String>,
+    /// Which analysis source produced this edge.
+    #[serde(default)]
+    pub source: EdgeSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -308,6 +323,7 @@ impl CallGraph {
                                 column: edge.column,
                                 call_type: edge.call_type,
                                 scope_hint: None,
+                                source: EdgeSource::Ast,
                             });
                         }
                     }
@@ -414,6 +430,7 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
+                            source: EdgeSource::Ast,
                         });
                     }
                 }
@@ -432,6 +449,7 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
+                            source: EdgeSource::Ast,
                         });
                     }
                 }
@@ -573,6 +591,7 @@ impl CallGraph {
             column: node.start_position().column + 1,
             call_type,
             scope_hint,
+            source: EdgeSource::Ast,
         })
     }
 
@@ -1380,6 +1399,7 @@ mod tests {
             column: 5,
             call_type: CallType::Direct,
             scope_hint: None,
+            source: EdgeSource::Ast,
         };
 
         graph
@@ -1396,6 +1416,7 @@ mod tests {
             column: edge.column,
             call_type: edge.call_type.clone(),
             scope_hint: None,
+            source: EdgeSource::Ast,
         };
 
         graph
@@ -1433,6 +1454,7 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -1441,6 +1463,7 @@ mod tests {
                     column: 8,
                     call_type: CallType::Method,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -1500,6 +1523,7 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
                 CallEdge {
                     target: "callee2".to_string(),
@@ -1508,6 +1532,7 @@ mod tests {
                     column: 10,
                     call_type: CallType::StaticMethod,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
             ],
             called_by: Vec::new(),
@@ -1610,6 +1635,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1626,6 +1652,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1634,6 +1661,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1649,6 +1677,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1657,6 +1686,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1673,6 +1703,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1713,6 +1744,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1721,6 +1753,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1737,6 +1770,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1769,6 +1803,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1785,6 +1820,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1793,6 +1829,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1808,6 +1845,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1816,6 +1854,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1832,6 +1871,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1872,6 +1912,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1888,6 +1929,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1959,6 +2001,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
                 CallEdge {
                     target: "f2".to_string(),
@@ -1967,6 +2010,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
             ],
             called_by: vec![
@@ -1977,6 +2021,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -1985,6 +2030,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
                 CallEdge {
                     target: "caller3".to_string(),
@@ -1993,6 +2039,7 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
+                    source: EdgeSource::Ast,
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -2010,6 +2057,7 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -2069,6 +2117,7 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: vec![CallEdge {
                 target: "main".to_string(),
@@ -2077,6 +2126,7 @@ mod tests {
                 column: 3,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             metrics: FunctionMetrics {
                 loc: 10,
@@ -2154,6 +2204,7 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
+                source: EdgeSource::Ast,
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics {
@@ -2186,6 +2237,7 @@ mod tests {
             column: 10,
             call_type: CallType::Method,
             scope_hint: None,
+            source: EdgeSource::Ast,
         };
 
         assert_eq!(edge.target, "target_func");
