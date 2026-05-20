@@ -949,57 +949,6 @@ impl CodeIntelEngine {
         }
     }
 
-    #[allow(dead_code)] // Replaced by resolve_repo; deleted in the next patch.
-    fn get_repo_path(&self, name: &str) -> Result<PathBuf> {
-        // Check for empty/missing repo parameter
-        if name.is_empty() {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            if repo_names.is_empty() {
-                return Err(anyhow!(
-                    "Missing required 'repo' parameter. No repositories are indexed yet. \
-                     Use --repos flag when starting the server."
-                ));
-            }
-            return Err(anyhow!(
-                "Missing required 'repo' parameter. Available repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                repo_names.join(", ")
-            ));
-        }
-
-        // If input looks like a path, validate it against indexed repos
-        if name.contains('/') || name.contains('\\') {
-            let as_path = PathBuf::from(name);
-            for entry in self.repos.iter() {
-                let repo_path = &entry.value().path;
-                // Compare non-canonical paths first (fast path)
-                if as_path == *repo_path || as_path.starts_with(repo_path) {
-                    return Ok(as_path);
-                }
-                // Compare canonical forms (handles symlinks like /var -> /private/var on macOS)
-                if let (Ok(canonical), Ok(repo_canonical)) =
-                    (as_path.canonicalize(), repo_path.canonicalize())
-                {
-                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
-                        return Ok(canonical);
-                    }
-                }
-            }
-            // Path didn't match any indexed repo — fall through to name lookup
-        }
-
-        // Look up by name
-        self.repos.get(name).map(|r| r.path.clone()).ok_or_else(|| {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            anyhow!(
-                "Repository '{}' not found. Available repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                name,
-                repo_names.join(", ")
-            )
-        })
-    }
-
     /// Resolve a user-supplied repo argument to the canonical absolute path of
     /// an indexed repository.
     ///
@@ -1064,38 +1013,6 @@ impl CodeIntelEngine {
         }
 
         Err(self.repo_not_found_error(input))
-    }
-
-    /// Resolve a user-supplied repo argument to the canonical short name used as
-    /// DashMap keys throughout the engine.  Accepts either the short name (e.g.
-    /// "linux.git") or a full path (e.g. "/home/user/src/linux/linux.git").
-    #[allow(dead_code)] // Replaced by resolve_repo; deleted in the next patch.
-    fn resolve_repo_name(&self, repo: &str) -> Result<String> {
-        if repo.is_empty() {
-            return Err(self.repo_not_found_error(repo));
-        }
-        // Fast path: already the canonical key.
-        if self.repos.contains_key(repo) {
-            return Ok(repo.to_string());
-        }
-        // Path lookup: find the repo whose stored path matches.
-        if repo.contains('/') || repo.contains('\\') {
-            let as_path = PathBuf::from(repo);
-            for entry in self.repos.iter() {
-                let repo_path = &entry.value().path;
-                if as_path == *repo_path || as_path.starts_with(repo_path) {
-                    return Ok(entry.key().clone());
-                }
-                if let (Ok(canonical), Ok(repo_canonical)) =
-                    (as_path.canonicalize(), repo_path.canonicalize())
-                {
-                    if canonical == repo_canonical || canonical.starts_with(&repo_canonical) {
-                        return Ok(entry.key().clone());
-                    }
-                }
-            }
-        }
-        Err(self.repo_not_found_error(repo))
     }
 
     /// Get a reference to the engine options
@@ -1205,11 +1122,18 @@ impl CodeIntelEngine {
     pub async fn list_repos(&self) -> Result<String> {
         let mut output = String::new();
         output.push_str("# Indexed Repositories\n\n");
+        output.push_str(
+            "Pass the **Repo** value below as the `repo` argument to any tool.\n\
+             It is the canonical absolute path of the repository on disk; \
+             relative paths and `.` (current directory) are also accepted.\n\n",
+        );
 
         for entry in self.repos.iter() {
             let repo = entry.value();
+            // The map key is the canonical absolute path string; the basename
+            // is shown as a friendly label only.
             output.push_str(&format!("## {}\n", repo.name));
-            output.push_str(&format!("- **Path**: {}\n", repo.path.display()));
+            output.push_str(&format!("- **Repo**: `{}`\n", entry.key()));
             output.push_str(&format!("- **Files**: {}\n", repo.file_count));
             output.push_str(&format!("- **Total Lines**: {}\n", repo.total_lines));
             output.push_str("- **Languages**:\n");
@@ -2551,6 +2475,14 @@ impl CodeIntelEngine {
 
     /// Get status of the search index
     pub async fn get_index_status(&self, repo: Option<&str>) -> Result<String> {
+        // Resolve the optional repo filter to a canonical path; an unknown or
+        // empty value is treated as "no filter" rather than an error so the
+        // overall status is always retrievable.
+        let repo_filter: Option<String> = match repo {
+            Some(r) if !r.is_empty() => self.resolve_repo(r).ok(),
+            _ => None,
+        };
+
         let mut output = String::new();
         output.push_str("# Index Status\n\n");
 
@@ -2649,16 +2581,18 @@ impl CodeIntelEngine {
         output.push_str("\n## Repositories\n\n");
         for entry in self.repos.iter() {
             let meta = entry.value();
-            if repo.is_none() || repo == Some(entry.key()) {
+            let key = entry.key();
+            if repo_filter.as_deref().is_none_or(|f| f == key) {
                 output.push_str(&format!("### {}\n", meta.name));
+                output.push_str(&format!("- Repo: `{}`\n", key));
                 output.push_str(&format!("- Files: {}\n", meta.file_count));
                 output.push_str(&format!(
                     "- Symbols: {}\n",
-                    self.symbols.get(&meta.name).map(|s| s.len()).unwrap_or(0)
+                    self.symbols.get(key).map(|s| s.len()).unwrap_or(0)
                 ));
                 output.push_str(&format!(
                     "- Git: {}\n\n",
-                    if self.git_repos.contains_key(&meta.name) {
+                    if self.git_repos.contains_key(key) {
                         "enabled"
                     } else {
                         "disabled"
