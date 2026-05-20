@@ -173,6 +173,7 @@ impl CallGraph {
         path: &str,
         functions: &mut Vec<CallNode>,
     ) {
+        let mut depth: usize = 0;
         loop {
             let node = cursor.node();
 
@@ -180,14 +181,24 @@ impl CallGraph {
                 functions.push(func);
             }
 
-            // Recurse into children
             if cursor.goto_first_child() {
-                self.walk_for_functions(cursor, source, path, functions);
-                cursor.goto_parent();
+                depth += 1;
+                continue;
             }
 
-            if !cursor.goto_next_sibling() {
-                break;
+            if cursor.goto_next_sibling() {
+                continue;
+            }
+
+            loop {
+                if depth == 0 {
+                    return;
+                }
+                cursor.goto_parent();
+                depth -= 1;
+                if cursor.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
@@ -271,6 +282,7 @@ impl CallGraph {
         path: &str,
         current_function: &mut Option<String>,
     ) {
+        let mut depth: usize = 0;
         loop {
             let node = cursor.node();
             let kind = node.kind();
@@ -343,14 +355,24 @@ impl CallGraph {
                 }
             }
 
-            // Recurse
             if cursor.goto_first_child() {
-                self.walk_for_calls(cursor, source, path, current_function);
-                cursor.goto_parent();
+                depth += 1;
+                continue;
             }
 
-            if !cursor.goto_next_sibling() {
-                break;
+            if cursor.goto_next_sibling() {
+                continue;
+            }
+
+            loop {
+                if depth == 0 {
+                    return;
+                }
+                cursor.goto_parent();
+                depth -= 1;
+                if cursor.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
@@ -598,29 +620,34 @@ impl CallGraph {
     fn get_last_identifier(&self, node: Node, source: &[u8]) -> Option<String> {
         let mut cursor = node.walk();
         let mut last_ident = None;
+        let mut depth: usize = 0;
 
-        fn walk_idents(
-            cursor: &mut tree_sitter::TreeCursor,
-            source: &[u8],
-            last: &mut Option<String>,
-        ) {
+        loop {
+            let n = cursor.node();
+            if n.kind() == "identifier" || n.kind() == "field_identifier" {
+                last_ident = n.utf8_text(source).ok().map(|s| s.to_string());
+            }
+
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+
+            if cursor.goto_next_sibling() {
+                continue;
+            }
+
             loop {
-                let n = cursor.node();
-                if n.kind() == "identifier" || n.kind() == "field_identifier" {
-                    *last = n.utf8_text(source).ok().map(|s| s.to_string());
+                if depth == 0 {
+                    return last_ident;
                 }
-                if cursor.goto_first_child() {
-                    walk_idents(cursor, source, last);
-                    cursor.goto_parent();
-                }
-                if !cursor.goto_next_sibling() {
+                cursor.goto_parent();
+                depth -= 1;
+                if cursor.goto_next_sibling() {
                     break;
                 }
             }
         }
-
-        walk_idents(&mut cursor, source, &mut last_ident);
-        last_ident
     }
 
     fn compute_metrics(&self, node: Node, _source: &[u8]) -> FunctionMetrics {
@@ -639,12 +666,17 @@ impl CallGraph {
     fn walk_for_metrics(
         &self,
         cursor: &mut tree_sitter::TreeCursor,
-        depth: usize,
+        initial_depth: usize,
         metrics: &mut FunctionMetrics,
     ) {
+        let mut tree_depth: usize = 0;
+        // nesting_stack[tree_depth] holds the nesting depth at that AST level.
+        let mut nesting_stack: Vec<usize> = vec![initial_depth];
+
         loop {
             let node = cursor.node();
             let kind = node.kind();
+            let depth = *nesting_stack.last().unwrap_or(&0);
 
             // Track nesting depth
             metrics.max_depth = metrics.max_depth.max(depth);
@@ -695,8 +727,8 @@ impl CallGraph {
                 metrics.cognitive += 1 + depth;
             }
 
-            // Recurse with updated depth for control structures
-            let new_depth = if matches!(
+            // Nesting depth increments for children of control structures
+            let child_depth = if matches!(
                 kind,
                 "if_statement"
                     | "if_expression"
@@ -715,18 +747,30 @@ impl CallGraph {
             };
 
             if cursor.goto_first_child() {
-                self.walk_for_metrics(cursor, new_depth, metrics);
+                tree_depth += 1;
+                nesting_stack.push(child_depth);
+                continue;
+            }
+
+            if cursor.goto_next_sibling() {
+                continue;
+            }
+
+            loop {
+                if tree_depth == 0 {
+                    // Base cyclomatic is 1
+                    if metrics.cyclomatic == 0 {
+                        metrics.cyclomatic = 1;
+                    }
+                    return;
+                }
                 cursor.goto_parent();
+                tree_depth -= 1;
+                nesting_stack.pop();
+                if cursor.goto_next_sibling() {
+                    break;
+                }
             }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // Base cyclomatic is 1
-        if metrics.cyclomatic == 0 {
-            metrics.cyclomatic = 1;
         }
     }
 
