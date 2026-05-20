@@ -98,9 +98,18 @@ impl McpServer {
             // Return default config by loading it again
             ConfigLoader::new().default_config.clone()
         });
+        let tool_registry = ToolRegistry::new();
+        let engine = Arc::new(engine);
+        engine.metrics.set_known_tools(
+            tool_registry
+                .tool_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         Self {
-            engine: Arc::new(engine),
-            tool_registry: ToolRegistry::new(),
+            engine,
+            tool_registry,
             config,
             client_info: Arc::new(Mutex::new(None)),
         }
@@ -123,9 +132,17 @@ impl McpServer {
             config.preset = preset_override;
         }
 
+        let tool_registry = ToolRegistry::new();
+        engine.metrics.set_known_tools(
+            tool_registry
+                .tool_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         Self {
             engine,
-            tool_registry: ToolRegistry::new(),
+            tool_registry,
             config,
             client_info: Arc::new(Mutex::new(None)),
         }

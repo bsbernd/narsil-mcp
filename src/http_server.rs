@@ -100,9 +100,17 @@ pub struct ToolInfo {
 impl HttpServer {
     /// Create a new HTTP server
     pub fn new(engine: Arc<CodeIntelEngine>, port: u16) -> Self {
+        let tool_registry = ToolRegistry::new();
+        engine.metrics.set_known_tools(
+            tool_registry
+                .tool_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         Self {
             engine,
-            tool_registry: ToolRegistry::new(),
+            tool_registry,
             port,
         }
     }
@@ -183,10 +191,16 @@ async fn call_tool(
     State(state): State<AppState>,
     Json(request): Json<ToolCallRequest>,
 ) -> impl IntoResponse {
+    let start_time = std::time::Instant::now();
+    let tool_name = request.tool.clone();
     let result = state
         .tool_registry
-        .dispatch(&request.tool, &state.engine, request.args)
+        .dispatch(&tool_name, &state.engine, request.args)
         .await;
+    state
+        .engine
+        .metrics
+        .record_tool(&tool_name, start_time.elapsed());
 
     match result {
         Ok(output) => {

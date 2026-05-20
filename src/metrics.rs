@@ -441,6 +441,9 @@ pub struct Metrics {
     dirty: AtomicBool,
     /// Notifies the flush task to wake up (used for shutdown).
     flush_notify: Arc<Notify>,
+    /// Full list of registered tool names, used to show zero rows in reports.
+    /// In-memory only; not persisted.
+    known_tools: RwLock<Vec<String>>,
 }
 
 impl Metrics {
@@ -456,6 +459,7 @@ impl Metrics {
             persist_path: None,
             dirty: AtomicBool::new(false),
             flush_notify: Arc::new(Notify::new()),
+            known_tools: RwLock::new(Vec::new()),
         }
     }
 
@@ -498,6 +502,7 @@ impl Metrics {
             persist_path: Some(stats_path),
             dirty: AtomicBool::new(false),
             flush_notify: Arc::new(Notify::new()),
+            known_tools: RwLock::new(Vec::new()),
         }
     }
 
@@ -596,6 +601,13 @@ impl Metrics {
 
     pub fn first_started_at(&self) -> u64 {
         self.lifetime.read().first_started_at
+    }
+
+    /// Register the full set of tool names so that reports can show zero rows
+    /// for tools that have never been called. Call once at startup after the
+    /// tool registry is built. In-memory only; not persisted.
+    pub fn set_known_tools(&self, names: Vec<String>) {
+        *self.known_tools.write() = names;
     }
 
     pub fn lifetime_total_requests(&self) -> u64 {
@@ -764,12 +776,13 @@ impl Metrics {
             push_parse_table(&mut output, &parse_rows);
         }
 
-        let lifetime_tools = &lifetime_snapshot.tools;
-        let session_tools = self.get_all_tool_stats();
+        let known = self.known_tools.read();
+        let lifetime_tools = fill_known_tools(&lifetime_snapshot.tools, &known);
+        let session_tools = fill_known_tools(&self.get_all_tool_stats(), &known);
 
         output.push_str("## Tool Execution Times (Lifetime)\n\n");
         if !lifetime_tools.is_empty() {
-            push_tool_table(&mut output, lifetime_tools);
+            push_tool_table(&mut output, &lifetime_tools);
         } else {
             output.push_str("*No tool calls recorded yet.*\n");
         }
@@ -854,6 +867,20 @@ impl Drop for Metrics {
 
 // ---------- Helpers / rendering ---------------------------------------------
 
+/// Return a copy of `recorded` extended with zero-count entries for every name
+/// in `known` that is not already present. This ensures the report table lists
+/// every registered tool even if it has never been called.
+fn fill_known_tools(
+    recorded: &HashMap<String, MetricStats>,
+    known: &[String],
+) -> HashMap<String, MetricStats> {
+    let mut out = recorded.clone();
+    for name in known {
+        out.entry(name.clone()).or_default();
+    }
+    out
+}
+
 fn push_md_row<'a>(output: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
     output.push('|');
     for (cell, w) in cells.zip(widths.iter()) {
@@ -906,11 +933,12 @@ fn push_tool_table(output: &mut String, tools: &HashMap<String, MetricStats>) {
     let data: Vec<[String; 5]> = sorted
         .iter()
         .map(|(name, stats)| {
+            let min = if stats.count == 0 { 0 } else { stats.min_ms };
             [
                 name.to_string(),
                 stats.count.to_string(),
                 format!("{:.2}", stats.avg_ms()),
-                stats.min_ms.to_string(),
+                min.to_string(),
                 stats.max_ms.to_string(),
             ]
         })
