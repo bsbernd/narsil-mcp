@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
-use crate::callgraph::CallGraph;
+use crate::callgraph::{CallEdge, CallGraph, CallType, EdgeSource};
 use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
@@ -2864,7 +2864,27 @@ impl CodeIntelEngine {
         Ok(result)
     }
 
-    /// Get callers of a function
+    /// Find the symbol (function/method) in `repo` whose body contains `file:line`.
+    /// Used to map an LSP reference location back to a caller name.
+    fn enclosing_function_at<'a>(
+        symbols: &'a [Symbol],
+        file: &str,
+        line: usize,
+    ) -> Option<&'a Symbol> {
+        symbols.iter().find(|sym| {
+            matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                && sym.file_path == file
+                && sym.start_line <= line
+                && line <= sym.end_line
+        })
+    }
+
+    /// Get callers of a function.
+    ///
+    /// When LSP is enabled and the queried function lives in a C/C++ file, LSP
+    /// `textDocument/references` results are merged with the AST-based call graph
+    /// to produce the most complete caller list. Each edge is tagged with its
+    /// source (`[LSP]`, `[ast]`, or confirmed by both).
     pub async fn get_callers(
         &self,
         repo: &str,
@@ -2873,8 +2893,19 @@ impl CodeIntelEngine {
         max_depth: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
         let repo = self.resolve_repo_name(repo)?;
+
+        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callers_hybrid", function);
+        let repo_hash = self.compute_repo_hash(&repo);
+        if self.options.cache_enabled {
+            if let Some(cached) = self
+                .analysis_cache
+                .get_if_hash_matches(&cache_key, &repo_hash)
+            {
+                return Ok(cached);
+            }
+        }
+
         let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not found for '{}'. Is --call-graph enabled?",
@@ -2892,18 +2923,98 @@ impl CodeIntelEngine {
                 callers.len(),
                 max_depth
             ));
-
             for (name, depth) in &callers {
                 output.push_str(&format!("- `{}` (depth: {})\n", name, depth));
             }
         } else {
-            let callers = call_graph.get_callers(function);
-            output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
+            // Collect AST-derived callers.
+            let mut callers: Vec<CallEdge> = call_graph.get_callers(function);
 
+            // LSP augmentation for C/C++ when a language server is available.
+            let repo_path = self.get_repo_path(&repo).ok();
+            if let (Some(lsp), Some(repo_path), false) = (&self.lsp_manager, repo_path, transitive)
+            {
+                if lsp.is_enabled() {
+                    if let Some(sym_list) = self.symbols.get(&repo) {
+                        // Find the definition of the queried function to know its file/language.
+                        let def_sym = sym_list.iter().find(|s| {
+                            s.name == function || s.qualified_name.as_deref() == Some(function)
+                        });
+                        if let Some(def) = def_sym {
+                            let lang = get_language_from_path(&def.file_path);
+                            if lang == "c" || lang == "cpp" {
+                                if let Some(lsp_refs) = self
+                                    .lsp_search_references(&repo, function, &repo_path)
+                                    .await
+                                {
+                                    let sym_slice: Vec<Symbol> = sym_list.iter().cloned().collect();
+                                    let ast_keys: std::collections::HashSet<(String, usize)> =
+                                        callers
+                                            .iter()
+                                            .map(|e| (e.file_path.clone(), e.line))
+                                            .collect();
+
+                                    let mut lsp_count = 0usize;
+                                    let mut overlap_count = 0usize;
+
+                                    for (rel_path, ref_line, _content) in &lsp_refs {
+                                        let key = (rel_path.clone(), *ref_line);
+                                        if ast_keys.contains(&key) {
+                                            // Both sources agree — upgrade edge source.
+                                            for edge in callers.iter_mut() {
+                                                if edge.file_path == *rel_path
+                                                    && edge.line == *ref_line
+                                                {
+                                                    edge.source = EdgeSource::Both;
+                                                }
+                                            }
+                                            overlap_count += 1;
+                                        } else {
+                                            // LSP-only edge: resolve enclosing function.
+                                            let caller_name = Self::enclosing_function_at(
+                                                &sym_slice, rel_path, *ref_line,
+                                            )
+                                            .map(|s| s.name.clone())
+                                            .unwrap_or_else(|| format!("<unknown>@{}", ref_line));
+
+                                            callers.push(CallEdge {
+                                                target: caller_name,
+                                                file_path: rel_path.clone(),
+                                                line: *ref_line,
+                                                column: 0,
+                                                call_type: CallType::Unknown,
+                                                scope_hint: None,
+                                                source: EdgeSource::Lsp,
+                                            });
+                                            lsp_count += 1;
+                                        }
+                                    }
+
+                                    let ast_only = callers
+                                        .iter()
+                                        .filter(|e| e.source == EdgeSource::Ast)
+                                        .count();
+                                    output.push_str(&format!(
+                                        "*Sources: {} AST-only, {} LSP-only, {} confirmed by both*\n\n",
+                                        ast_only, lsp_count, overlap_count
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
             for caller in &callers {
+                let tag = match caller.source {
+                    EdgeSource::Lsp => " `[LSP]`",
+                    EdgeSource::Ast => " `[ast]`",
+                    EdgeSource::Both => "",
+                };
                 output.push_str(&format!(
-                    "- `{}` at `{}:{}` ({:?})\n",
-                    caller.target, caller.file_path, caller.line, caller.call_type
+                    "- `{}` at `{}:{}`{} ({:?})\n",
+                    caller.target, caller.file_path, caller.line, tag, caller.call_type
                 ));
             }
         }
@@ -2912,10 +3023,15 @@ impl CodeIntelEngine {
             output.push_str("*No callers found.*\n");
         }
 
+        if self.options.cache_enabled {
+            self.analysis_cache
+                .insert_with_hash(cache_key, output.clone(), Some(repo_hash));
+        }
+
         Ok(output)
     }
 
-    /// Get callees of a function
+    /// Get callees of a function.
     pub async fn get_callees(
         &self,
         repo: &str,
@@ -2924,8 +3040,19 @@ impl CodeIntelEngine {
         max_depth: usize,
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
         let repo = self.resolve_repo_name(repo)?;
+
+        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callees_hybrid", function);
+        let repo_hash = self.compute_repo_hash(&repo);
+        if self.options.cache_enabled {
+            if let Some(cached) = self
+                .analysis_cache
+                .get_if_hash_matches(&cache_key, &repo_hash)
+            {
+                return Ok(cached);
+            }
+        }
+
         let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not found for '{}'. Is --call-graph enabled?",
@@ -2943,14 +3070,12 @@ impl CodeIntelEngine {
                 callees.len(),
                 max_depth
             ));
-
             for (name, depth) in &callees {
                 output.push_str(&format!("- `{}` (depth: {})\n", name, depth));
             }
         } else {
             let callees = call_graph.get_callees(function);
             output.push_str(&format!("Found {} direct callees\n\n", callees.len()));
-
             for callee in &callees {
                 output.push_str(&format!(
                     "- `{}` at `{}:{}` ({:?})\n",
@@ -2961,6 +3086,11 @@ impl CodeIntelEngine {
 
         if output.ends_with("\n\n") {
             output.push_str("*No callees found.*\n");
+        }
+
+        if self.options.cache_enabled {
+            self.analysis_cache
+                .insert_with_hash(cache_key, output.clone(), Some(repo_hash));
         }
 
         Ok(output)
