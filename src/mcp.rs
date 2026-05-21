@@ -51,30 +51,30 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
+pub(crate) struct JsonRpcRequest {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: Option<Value>,
+    pub(crate) method: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Option<Value>,
+pub(crate) struct JsonRpcResponse {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
+    pub(crate) result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
+    pub(crate) error: Option<JsonRpcError>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+pub(crate) struct JsonRpcError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
+    pub(crate) data: Option<Value>,
 }
 
 impl JsonRpcResponse {
@@ -227,10 +227,10 @@ impl McpServer {
                     if request.id.is_none() {
                         // This is a notification - handle it but don't respond
                         debug!("Handling notification: {}", request.method);
-                        let _ = self.handle_request(request, &session).await;
+                        let _ = self.dispatch(request, &session).await;
                         continue;
                     }
-                    self.handle_request(request, &session).await
+                    self.dispatch(request, &session).await
                 }
                 Err(e) => {
                     // Parse error - try to extract ID from raw JSON for error response
@@ -271,7 +271,7 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_request(
+    pub(crate) async fn dispatch(
         &self,
         request: JsonRpcRequest,
         session: &SessionState,
