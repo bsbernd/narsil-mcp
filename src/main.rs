@@ -1,14 +1,28 @@
 #![recursion_limit = "256"]
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser as ClapParser, Subcommand};
+use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use narsil_mcp::{
     config, http_server, index, lsp, mcp, neural, persist, repo, stats_cli, streaming,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+
+/// Transport for the MCP server.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum Transport {
+    /// Read JSON-RPC from stdin, write responses to stdout. The
+    /// historical narsil-mcp transport; suitable when an editor spawns a
+    /// fresh subprocess per session.
+    #[default]
+    Stdio,
+    /// MCP HTTP+SSE transport (spec 2024-11-05). Serves one persistent
+    /// narsil-mcp to many editor sessions over a shared HTTP listener.
+    Sse,
+}
 
 #[derive(ClapParser, Debug)]
 #[command(name = "narsil-mcp")]
@@ -120,6 +134,27 @@ struct ServerArgs {
     /// HTTP server port (default: 3000)
     #[arg(long, env = "NARSIL_HTTP_PORT", default_value = "3000")]
     http_port: u16,
+
+    /// MCP transport to expose: `stdio` (default) or `sse`.
+    /// SSE binds an HTTP listener (see --sse-host / --sse-port) and lets
+    /// multiple editor sessions share one persistent narsil-mcp process.
+    #[arg(long, env = "NARSIL_TRANSPORT", value_enum, default_value = "stdio")]
+    transport: Transport,
+
+    /// Bind address for the SSE transport. Only loopback addresses are
+    /// accepted today — exposing on a network requires a future
+    /// --allow-remote flag plus authentication.
+    #[arg(long, env = "NARSIL_SSE_HOST", default_value = "127.0.0.1")]
+    sse_host: String,
+
+    /// TCP port for the SSE transport.
+    #[arg(long, env = "NARSIL_SSE_PORT", default_value = "7557")]
+    sse_port: u16,
+
+    /// SSE keep-alive interval in seconds. Comments are emitted on the
+    /// stream to keep proxies / NATs from dropping idle connections.
+    #[arg(long, env = "NARSIL_SSE_KEEPALIVE_SECS", default_value = "15")]
+    sse_keepalive_secs: u64,
 
     /// Tool preset (minimal, balanced, full, security-focused)
     /// Overrides the preset from config file
@@ -345,35 +380,83 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Start HTTP server in background if enabled (for visualization frontend)
-    // The MCP server still runs on stdio for editor communication
-    if server_args.http {
-        info!("Starting HTTP server on port {}", server_args.http_port);
-        let http_engine = Arc::clone(&engine);
-        let http_port = server_args.http_port;
-        tokio::spawn(async move {
-            let http_server = http_server::HttpServer::new(http_engine, http_port);
-            if let Err(e) = http_server.run().await {
-                warn!("HTTP server error: {}", e);
-            }
-        });
-    }
-
-    // Always start the MCP server on stdio (for editor communication).
-    //
-    // The server is raced against Ctrl-C (and SIGTERM on Unix) so that, when
-    // the user terminates the process, we get a chance to flush accumulated
-    // metrics to disk before exiting. Without this, the periodic flush could
-    // miss the last few minutes of activity.
+    // The chosen transport is raced against Ctrl-C (and SIGTERM on Unix)
+    // so that, when the user terminates the process, we get a chance to
+    // flush accumulated metrics to disk before exiting. Without this, the
+    // periodic flush could miss the last few minutes of activity.
     let shutdown_engine = Arc::clone(&engine);
-    let server = mcp::McpServer::from_arc(engine, server_args.preset);
 
-    let server_result = run_with_shutdown(server).await;
+    let server_result = match server_args.transport {
+        Transport::Stdio => {
+            // Start HTTP server in background if enabled (visualization
+            // frontend only); MCP runs on stdio for editor communication.
+            if server_args.http {
+                info!("Starting HTTP server on port {}", server_args.http_port);
+                let http_engine = Arc::clone(&engine);
+                let http_port = server_args.http_port;
+                tokio::spawn(async move {
+                    let http_server = http_server::HttpServer::new(http_engine, http_port);
+                    if let Err(e) = http_server.run().await {
+                        warn!("HTTP server error: {}", e);
+                    }
+                });
+            }
+
+            let server = mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset);
+            run_stdio_with_shutdown(server).await
+        }
+        Transport::Sse => {
+            // Refuse non-loopback bind. A network-exposed MCP transport
+            // without authentication would let any host on the LAN drive
+            // tool calls and read source. Adding network exposure must go
+            // through a future --allow-remote flag plus auth.
+            if !is_loopback_bind_addr(&server_args.sse_host) {
+                bail!(
+                    "--sse-host {} is not a loopback address. Refusing to bind: \
+                     the SSE transport has no authentication. Use 127.0.0.1, \
+                     ::1, or localhost.",
+                    server_args.sse_host
+                );
+            }
+            if server_args.http {
+                info!(
+                    "--http is implicit when --transport sse is set; --http-port {} ignored, \
+                     frontend routes are mounted on the SSE listener",
+                    server_args.http_port
+                );
+            }
+            let keepalive = Duration::from_secs(server_args.sse_keepalive_secs);
+            let mcp_server = Arc::new(mcp::McpServer::from_arc(
+                Arc::clone(&engine),
+                server_args.preset,
+            ));
+            info!(
+                "Starting MCP SSE transport on http://{}:{}/mcp/sse",
+                server_args.sse_host, server_args.sse_port
+            );
+            let http_server =
+                http_server::HttpServer::new(Arc::clone(&engine), server_args.sse_port)
+                    .with_mcp_routes(
+                        mcp_server,
+                        server_args.sse_host.clone(),
+                        server_args.sse_port,
+                        keepalive,
+                    );
+            run_http_with_shutdown(http_server).await
+        }
+    };
 
     shutdown_engine.shutdown().await;
 
     server_result?;
     Ok(())
+}
+
+/// True if `host` names a loopback bind target. Network-facing binds
+/// (e.g. `0.0.0.0`, LAN IPs) are explicitly rejected for the unauthenticated
+/// SSE transport.
+fn is_loopback_bind_addr(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
 #[cfg(unix)]
@@ -396,7 +479,21 @@ async fn wait_for_terminate_signal() {
     std::future::pending::<()>().await;
 }
 
-async fn run_with_shutdown(server: mcp::McpServer) -> Result<()> {
+async fn run_stdio_with_shutdown(server: mcp::McpServer) -> Result<()> {
+    tokio::select! {
+        result = server.run() => result,
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl-C, shutting down");
+            Ok(())
+        }
+        _ = wait_for_terminate_signal() => {
+            info!("Received SIGTERM, shutting down");
+            Ok(())
+        }
+    }
+}
+
+async fn run_http_with_shutdown(server: http_server::HttpServer) -> Result<()> {
     tokio::select! {
         result = server.run() => result,
         _ = tokio::signal::ctrl_c() => {
