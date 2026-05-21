@@ -11,6 +11,33 @@ use crate::config::{ClientInfo, ConfigLoader, ToolFilter};
 use crate::index::CodeIntelEngine;
 use crate::tool_metadata::TOOL_METADATA;
 
+/// Per-session state owned by the caller of [`McpServer::handle_request`].
+///
+/// Each MCP transport session has its own `SessionState`: stdio creates one
+/// for the lifetime of `run()`; the SSE transport creates one per connected
+/// editor so concurrent sessions cannot overwrite each other's detected
+/// client info.
+#[derive(Default)]
+pub struct SessionState {
+    client_info: Mutex<Option<ClientInfo>>,
+}
+
+impl SessionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_client_info(&self, info: ClientInfo) {
+        if let Ok(mut guard) = self.client_info.lock() {
+            *guard = Some(info);
+        }
+    }
+
+    fn client_info(&self) -> Option<ClientInfo> {
+        self.client_info.lock().ok().and_then(|guard| guard.clone())
+    }
+}
+
 // Re-export for internal use
 pub use crate::tool_handlers::ToolRegistry;
 
@@ -78,7 +105,6 @@ pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
     config: ToolConfig,
-    client_info: Arc<Mutex<Option<ClientInfo>>>,
 }
 
 impl McpServer {
@@ -111,7 +137,6 @@ impl McpServer {
             engine,
             tool_registry,
             config,
-            client_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -144,7 +169,6 @@ impl McpServer {
             engine,
             tool_registry,
             config,
-            client_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -155,6 +179,7 @@ impl McpServer {
         let mut stdout = tokio::io::stdout();
         let mut reader = tokio::io::BufReader::new(stdin);
         let mut line = String::new();
+        let session = SessionState::new();
 
         loop {
             line.clear();
@@ -202,10 +227,10 @@ impl McpServer {
                     if request.id.is_none() {
                         // This is a notification - handle it but don't respond
                         debug!("Handling notification: {}", request.method);
-                        let _ = self.handle_request(request).await;
+                        let _ = self.handle_request(request, &session).await;
                         continue;
                     }
-                    self.handle_request(request).await
+                    self.handle_request(request, &session).await
                 }
                 Err(e) => {
                     // Parse error - try to extract ID from raw JSON for error response
@@ -246,16 +271,20 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(
+        &self,
+        request: JsonRpcRequest,
+        session: &SessionState,
+    ) -> JsonRpcResponse {
         let id = request.id.clone();
 
         match request.method.as_str() {
             // MCP Lifecycle
-            "initialize" => self.handle_initialize(id, request.params),
+            "initialize" => self.handle_initialize(id, request.params, session),
             "initialized" => JsonRpcResponse::success(id, json!({})),
 
             // Tool listing and execution
-            "tools/list" => self.handle_tools_list(id),
+            "tools/list" => self.handle_tools_list(id, session),
             "tools/call" => self.handle_tool_call(id, request.params).await,
 
             // Resource listing
@@ -272,7 +301,12 @@ impl McpServer {
         }
     }
 
-    fn handle_initialize(&self, id: Option<Value>, params: Value) -> JsonRpcResponse {
+    fn handle_initialize(
+        &self,
+        id: Option<Value>,
+        params: Value,
+        session: &SessionState,
+    ) -> JsonRpcResponse {
         // Extract and store client info for editor detection
         if let Some(client_info_value) = params.get("clientInfo") {
             if let (Some(name), version) = (
@@ -287,9 +321,7 @@ impl McpServer {
                     version,
                 };
                 info!("MCP client detected: {} {:?}", client.name, client.version);
-                if let Ok(mut guard) = self.client_info.lock() {
-                    *guard = Some(client);
-                }
+                session.set_client_info(client);
             }
         }
 
@@ -313,10 +345,9 @@ impl McpServer {
         )
     }
 
-    fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
+    fn handle_tools_list(&self, id: Option<Value>, session: &SessionState) -> JsonRpcResponse {
         // Get client info for editor-specific filtering
-        let client_info: Option<ClientInfo> =
-            self.client_info.lock().ok().and_then(|guard| guard.clone());
+        let client_info: Option<ClientInfo> = session.client_info();
 
         // Create tool filter with current config and engine options
         let filter = ToolFilter::new(self.config.clone(), self.engine.options(), client_info);
