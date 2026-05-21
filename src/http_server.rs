@@ -10,22 +10,43 @@
 use anyhow::Result;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
+use crate::mcp::{JsonRpcRequest, McpServer, SessionState};
 use crate::tool_handlers::ToolRegistry;
 
 /// Maximum HTTP request body size (2 MB).
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
+
+/// Per-session SSE response channel buffer.
+///
+/// A spawned dispatch task that fills the channel faster than the SSE
+/// consumer can drain it will await on `tx.send()`. No silent drops.
+const SSE_CHANNEL_CAPACITY: usize = 64;
+
+/// Default SSE keep-alive interval. The MCP HTTP+SSE spec does not
+/// mandate a value; 15s keeps NAT/proxy timeouts at bay without spamming
+/// the connection.
+pub const DEFAULT_SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 
 // Embedded frontend assets (only when frontend feature is enabled)
 #[cfg(feature = "frontend")]
@@ -48,11 +69,25 @@ use rust_embed::Embed;
 #[allow_missing = true]
 struct FrontendAssets;
 
-/// HTTP Server for the visualization frontend
+/// HTTP Server for the visualization frontend and (optionally) the MCP
+/// HTTP+SSE transport.
 pub struct HttpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
+    host: String,
     port: u16,
+    mcp_server: Option<Arc<McpServer>>,
+    sse_keepalive: Duration,
+}
+
+/// One in-flight SSE session.
+struct SessionEntry {
+    /// Sender to the SSE event stream. JSON-RPC response strings written
+    /// here arrive at the client as `data:` events.
+    tx: mpsc::Sender<String>,
+    /// Per-session MCP state — client identity, etc. Shared between the
+    /// SSE event stream and the POST dispatch task.
+    state: Arc<SessionState>,
 }
 
 /// Shared application state
@@ -60,6 +95,12 @@ pub struct HttpServer {
 pub struct AppState {
     engine: Arc<CodeIntelEngine>,
     tool_registry: Arc<ToolRegistry>,
+    /// MCP server for the SSE transport. `None` when only frontend routes
+    /// are mounted.
+    mcp_server: Option<Arc<McpServer>>,
+    /// Active SSE sessions keyed by `sessionId`.
+    sessions: Arc<DashMap<Uuid, SessionEntry>>,
+    sse_keepalive: Duration,
 }
 
 /// Request body for tool calls
@@ -98,7 +139,11 @@ pub struct ToolInfo {
 }
 
 impl HttpServer {
-    /// Create a new HTTP server
+    /// Create a new HTTP server for the visualization frontend.
+    ///
+    /// Binds `0.0.0.0:<port>` and exposes the legacy `/health`, `/tools`,
+    /// `/tools/call`, and `/graph` routes. Use [`Self::with_mcp_routes`]
+    /// to additionally serve the MCP HTTP+SSE transport.
     pub fn new(engine: Arc<CodeIntelEngine>, port: u16) -> Self {
         let tool_registry = ToolRegistry::new();
         engine.metrics.set_known_tools(
@@ -111,35 +156,66 @@ impl HttpServer {
         Self {
             engine,
             tool_registry,
+            host: "0.0.0.0".to_string(),
             port,
+            mcp_server: None,
+            sse_keepalive: DEFAULT_SSE_KEEPALIVE,
         }
+    }
+
+    /// Enable the MCP HTTP+SSE transport on this server.
+    ///
+    /// Mounts `/mcp/sse` and `/mcp/message` and rebinds the listener to
+    /// `host:port`. Defaults to `127.0.0.1` for safety — see the
+    /// host-header check below for the DNS-rebinding mitigation that
+    /// guards these routes regardless of bind address.
+    pub fn with_mcp_routes(
+        mut self,
+        mcp_server: Arc<McpServer>,
+        host: impl Into<String>,
+        port: u16,
+        keepalive: Duration,
+    ) -> Self {
+        self.mcp_server = Some(mcp_server);
+        self.host = host.into();
+        self.port = port;
+        self.sse_keepalive = keepalive;
+        self
     }
 
     /// Run the HTTP server
     pub async fn run(self) -> Result<()> {
+        let mcp_enabled = self.mcp_server.is_some();
         let state = AppState {
             engine: self.engine,
             tool_registry: Arc::new(self.tool_registry),
+            mcp_server: self.mcp_server,
+            sessions: Arc::new(DashMap::new()),
+            sse_keepalive: self.sse_keepalive,
         };
 
-        // Configure CORS to allow frontend access (needed for development mode)
+        // Configure CORS to allow frontend access (needed for development mode).
+        // Scoped to the frontend sub-router so it does NOT cover `/mcp/*` —
+        // browsers must not be able to reach the MCP transport cross-origin.
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
             .allow_headers(Any);
 
-        // Build router with API routes
-        let app = Router::new()
+        // Frontend / dashboard routes.
+        let frontend = Router::new()
             .route("/health", get(health_check))
             .route("/tools", get(list_tools))
             .route("/tools/call", post(call_tool))
-            .route("/graph", get(get_graph));
+            .route("/graph", get(get_graph))
+            .layer(cors);
 
         // Add embedded frontend routes when feature is enabled
         #[cfg(feature = "frontend")]
-        let app = {
+        let frontend = {
             info!("Frontend assets embedded - serving at /");
-            app.route("/", get(serve_index))
+            frontend
+                .route("/", get(serve_index))
                 .fallback(serve_static_fallback)
         };
 
@@ -149,12 +225,25 @@ impl HttpServer {
             info!("Run frontend separately: cd frontend && npm run dev");
         }
 
+        let app = if mcp_enabled {
+            info!("MCP HTTP+SSE transport enabled at /mcp/sse, /mcp/message");
+            // MCP routes get the host-header check (DNS rebinding mitigation
+            // required by the MCP spec for HTTP-based transports). CORS is
+            // deliberately not applied here.
+            let mcp_routes = Router::new()
+                .route("/mcp/sse", get(mcp_sse_handler))
+                .route("/mcp/message", post(mcp_message_handler))
+                .layer(middleware::from_fn(host_header_check));
+            frontend.merge(mcp_routes)
+        } else {
+            frontend
+        };
+
         let app = app
-            .layer(cors)
             .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
             .with_state(state);
 
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.host, self.port);
         info!("HTTP server starting on http://{}", addr);
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -162,6 +251,160 @@ impl HttpServer {
 
         Ok(())
     }
+}
+
+/// MCP HTTP+SSE: GET `/mcp/sse`.
+///
+/// Allocates a session id, opens an SSE stream that first emits the
+/// `endpoint` event the spec requires, then forwards JSON-RPC responses
+/// queued by [`mcp_message_handler`]. The session entry is removed when
+/// the stream is dropped (client disconnect, server shutdown, or keep-alive
+/// failure).
+async fn mcp_sse_handler(
+    State(state): State<AppState>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    if state.mcp_server.is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let session_id = Uuid::new_v4();
+    let (tx, mut rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
+    let session_state = Arc::new(SessionState::new());
+
+    state.sessions.insert(
+        session_id,
+        SessionEntry {
+            tx,
+            state: Arc::clone(&session_state),
+        },
+    );
+    debug!("SSE session opened: {}", session_id);
+
+    let sessions = Arc::clone(&state.sessions);
+    let endpoint_url = format!("/mcp/message?sessionId={}", session_id);
+    let keepalive = state.sse_keepalive;
+
+    // The generator owns `_guard`, `rx`, and `endpoint_url`. When the
+    // consumer drops the SSE response (client disconnect, keep-alive write
+    // failure, server shutdown), the generator future is dropped and the
+    // guard removes the session entry.
+    let stream = async_stream::stream! {
+        let _guard = SessionGuard { sessions, id: session_id };
+
+        // Spec mandates the endpoint event first.
+        yield Ok::<Event, Infallible>(
+            Event::default().event("endpoint").data(endpoint_url)
+        );
+
+        while let Some(json) = rx.recv().await {
+            yield Ok(Event::default().data(json));
+        }
+
+        debug!("SSE session ended: {}", session_id);
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(keepalive)))
+}
+
+/// Removes a session from the registry when the SSE stream is dropped.
+struct SessionGuard {
+    sessions: Arc<DashMap<Uuid, SessionEntry>>,
+    id: Uuid,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.sessions.remove(&self.id);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageQuery {
+    #[serde(rename = "sessionId")]
+    session_id: Uuid,
+}
+
+/// MCP HTTP+SSE: POST `/mcp/message?sessionId=<uuid>`.
+///
+/// Looks up the session, spawns the dispatch on the runtime so the POST
+/// returns `202 Accepted` immediately, and queues the JSON-RPC response
+/// for delivery on the SSE channel. Notifications (no `id`) still
+/// dispatch but their response is dropped, matching stdio behaviour.
+async fn mcp_message_handler(
+    State(state): State<AppState>,
+    Query(params): Query<MessageQuery>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let Some(mcp_server) = state.mcp_server.clone() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+
+    let (tx, session_state) = match state.sessions.get(&params.session_id) {
+        Some(entry) => (entry.tx.clone(), Arc::clone(&entry.state)),
+        None => return Err(StatusCode::GONE),
+    };
+
+    let is_notification = req.id.is_none();
+
+    tokio::spawn(async move {
+        let response = mcp_server.dispatch(req, &session_state).await;
+        if is_notification {
+            return;
+        }
+        let json = match serde_json::to_string(&response) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize JSON-RPC response: {}", e);
+                return;
+            }
+        };
+        // A send error here means the SSE consumer (the client) has
+        // disconnected. Drop the response silently — the session cleanup
+        // path handles registry removal.
+        let _ = tx.send(json).await;
+    });
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Host-header check for `/mcp/*` routes.
+///
+/// The MCP HTTP-based-transport spec requires servers to validate the
+/// `Host` header to mitigate DNS-rebinding attacks. We accept only
+/// loopback hostnames so a malicious page pointing at `evil.example` →
+/// `127.0.0.1` cannot drive the local MCP server.
+async fn host_header_check(request: Request<axum::body::Body>, next: Next) -> Response {
+    let host_header = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if is_loopback_host(host_header) {
+        next.run(request).await
+    } else {
+        warn!(
+            "Rejecting MCP request with non-loopback Host header: {:?}",
+            host_header
+        );
+        (StatusCode::FORBIDDEN, "Forbidden: invalid Host header").into_response()
+    }
+}
+
+/// True if `host` parses as a loopback hostname, with optional port.
+fn is_loopback_host(host: &str) -> bool {
+    // IPv6 literal form: `[::1]` or `[::1]:7557`. Strip the brackets and
+    // trailing port before comparing.
+    let hostname = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        // For hostname or IPv4: trim at the last `:` if present. Plain
+        // IPv4 addresses cannot contain `:`, so a single split is safe.
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Health check endpoint
@@ -519,5 +762,31 @@ mod tests {
             serde_json::from_str(r#"{"repo": "test", "depth": 1000, "max_nodes": 99999}"#).unwrap();
         assert_eq!(query.depth.min(20), 20);
         assert_eq!(query.max_nodes.map(|n| n.min(5000)), Some(5000));
+    }
+
+    #[test]
+    fn test_loopback_host_accepts_loopback_forms() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("localhost:7557"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.1:7557"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("[::1]:7557"));
+    }
+
+    #[test]
+    fn test_loopback_host_rejects_remote_and_rebinding() {
+        // External hostnames that may resolve to 127.0.0.1 via DNS
+        // rebinding must not be accepted.
+        assert!(!is_loopback_host("evil.example"));
+        assert!(!is_loopback_host("evil.example:7557"));
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("192.168.1.1:7557"));
+        assert!(!is_loopback_host(""));
+        // 127.0.0.2 etc. are loopback by RFC but we intentionally accept
+        // only the canonical address.
+        assert!(!is_loopback_host("127.0.0.2"));
+        // Malformed IPv6 bracket — bail out.
+        assert!(!is_loopback_host("[::1"));
     }
 }
