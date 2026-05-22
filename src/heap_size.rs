@@ -9,7 +9,10 @@
 //! under-sized-allocation-plus-sprintf overflow shape this module
 //! exists to catch.
 
+use std::collections::HashMap;
 use std::fmt;
+
+use tree_sitter::Node;
 
 /// A symbolic byte-count expression. Each variant represents the
 /// number of bytes a buffer holds, or that a source-write produces.
@@ -66,6 +69,230 @@ impl SizeExpr {
             _ => SizeExpr::Sum(symbolic_terms),
         }
     }
+}
+
+/// Walk a C function body and return a map from each allocation
+/// target's source text to the [`SizeExpr`] the corresponding
+/// allocator was called with.
+///
+/// Recognised allocators:
+///
+/// * `malloc(size)` — maps to `parse_size_expression(size)`
+/// * `calloc(nmemb, size)` — folds to a constant only when both
+///   arguments parse to `Constant`; otherwise `Unknown`
+/// * `realloc(pointer, size)` — maps to `parse_size_expression(size)`
+///
+/// Recognised left-hand sides:
+///
+/// * plain `identifier`: `p = malloc(...)`
+/// * `field_expression`: `dst->buf = malloc(...)`, keyed by the full
+///   `dst->buf` source text
+/// * `pointer_declarator` wrapping any of the above, for the
+///   declaration form `char *p = malloc(...)`
+///
+/// A `(T *)` cast around the allocator call is unwrapped. Any other
+/// shape is silently skipped; this function never raises and never
+/// returns false positives — unrecognised allocations simply do not
+/// appear in the map.
+pub fn collect_allocation_sizes(
+    function_body: Node<'_>,
+    source: &str,
+) -> HashMap<String, SizeExpr> {
+    let mut out = HashMap::new();
+    collect_into(function_body, source, &mut out);
+    out
+}
+
+fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr>) {
+    match node.kind() {
+        "declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "init_declarator" {
+                    let declarator = child.child_by_field_name("declarator");
+                    let value = child.child_by_field_name("value");
+                    if let (Some(decl), Some(rhs)) = (declarator, value) {
+                        if let Some(name) = extract_lhs_name(decl, source) {
+                            if let Some(size) = recognise_allocator_call(rhs, source) {
+                                out.insert(name, size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "assignment_expression" => {
+            let lhs = node.child_by_field_name("left");
+            let rhs = node.child_by_field_name("right");
+            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                if let Some(name) = extract_lhs_name(lhs, source) {
+                    if let Some(size) = recognise_allocator_call(rhs, source) {
+                        out.insert(name, size);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_into(child, source, out);
+    }
+}
+
+fn extract_lhs_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_expression" => {
+            node.utf8_text(source.as_bytes()).ok().map(str::to_string)
+        }
+        "pointer_declarator" => {
+            for idx in 0..(node.named_child_count() as u32) {
+                if let Some(child) = node.named_child(idx) {
+                    if let Some(name) = extract_lhs_name(child, source) {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn recognise_allocator_call(node: Node<'_>, source: &str) -> Option<SizeExpr> {
+    let call = unwrap_to_call(node)?;
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .collect();
+    match function_name {
+        "malloc" => argument_nodes
+            .first()
+            .map(|node| parse_size_expression(*node, source)),
+        "calloc" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            let nmemb = parse_size_expression(argument_nodes[0], source);
+            let size = parse_size_expression(argument_nodes[1], source);
+            Some(multiply_sizes(nmemb, size))
+        }
+        "realloc" => argument_nodes
+            .get(1)
+            .map(|node| parse_size_expression(*node, source)),
+        _ => None,
+    }
+}
+
+fn unwrap_to_call(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "call_expression" => Some(node),
+        "cast_expression" => node.child_by_field_name("value").and_then(unwrap_to_call),
+        "parenthesized_expression" => (0..(node.named_child_count() as u32))
+            .filter_map(|idx| node.named_child(idx))
+            .find_map(unwrap_to_call),
+        _ => None,
+    }
+}
+
+fn multiply_sizes(left: SizeExpr, right: SizeExpr) -> SizeExpr {
+    match (left, right) {
+        (SizeExpr::Constant(left_value), SizeExpr::Constant(right_value)) => {
+            SizeExpr::Constant(left_value.saturating_mul(right_value))
+        }
+        _ => SizeExpr::Unknown,
+    }
+}
+
+/// Parse a C expression node into a [`SizeExpr`]. Returns `Unknown`
+/// for anything not recognised.
+///
+/// Recognised forms:
+///
+/// * integer literals (decimal, `0x` hex; trailing `u`/`l` suffixes stripped)
+/// * `strlen(name)` and `strlen(field_expr)` — emits `StrlenOf(text)`
+/// * `+` of two recognised forms — emits the symbolic sum
+/// * `*` of two `Constant` forms only — non-constant multiplications
+///   are `Unknown` because they could overflow or depend on values
+///   the analyser cannot bound
+/// * parenthesised wrappers around any of the above
+pub fn parse_size_expression(node: Node<'_>, source: &str) -> SizeExpr {
+    match node.kind() {
+        "number_literal" => {
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+            parse_c_integer(text)
+        }
+        "binary_expression" => {
+            let operator = node
+                .child_by_field_name("operator")
+                .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                .unwrap_or("");
+            let left = node
+                .child_by_field_name("left")
+                .map(|child| parse_size_expression(child, source))
+                .unwrap_or(SizeExpr::Unknown);
+            let right = node
+                .child_by_field_name("right")
+                .map(|child| parse_size_expression(child, source))
+                .unwrap_or(SizeExpr::Unknown);
+            match operator {
+                "+" => left.add(right),
+                "*" => multiply_sizes(left, right),
+                _ => SizeExpr::Unknown,
+            }
+        }
+        "parenthesized_expression" => (0..(node.named_child_count() as u32))
+            .filter_map(|idx| node.named_child(idx))
+            .next()
+            .map(|inner| parse_size_expression(inner, source))
+            .unwrap_or(SizeExpr::Unknown),
+        "call_expression" => {
+            let function_name = node
+                .child_by_field_name("function")
+                .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                .unwrap_or("");
+            if function_name != "strlen" {
+                return SizeExpr::Unknown;
+            }
+            let Some(arguments) = node.child_by_field_name("arguments") else {
+                return SizeExpr::Unknown;
+            };
+            let Some(first_arg) = arguments.named_child(0) else {
+                return SizeExpr::Unknown;
+            };
+            match first_arg.kind() {
+                "identifier" | "field_expression" => first_arg
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|text| SizeExpr::StrlenOf(text.to_string()))
+                    .unwrap_or(SizeExpr::Unknown),
+                _ => SizeExpr::Unknown,
+            }
+        }
+        _ => SizeExpr::Unknown,
+    }
+}
+
+fn parse_c_integer(text: &str) -> SizeExpr {
+    let cleaned = text.trim_end_matches(|byte: char| matches!(byte, 'u' | 'U' | 'l' | 'L'));
+    if let Some(hex_digits) = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
+        if let Ok(value) = u64::from_str_radix(hex_digits, 16) {
+            return SizeExpr::Constant(value);
+        }
+        return SizeExpr::Unknown;
+    }
+    if let Ok(value) = cleaned.parse::<u64>() {
+        return SizeExpr::Constant(value);
+    }
+    SizeExpr::Unknown
 }
 
 /// Upper bound on the number of bytes a printf-family call will write
@@ -377,6 +604,116 @@ mod tests {
     fn format_trailing_percent_is_unknown() {
         // Malformed "...%" with no conversion — treat as Unknown.
         assert_eq!(write_size_of_format("abc%", &[]), SizeExpr::Unknown);
+    }
+
+    fn parse_function_body(parser: &mut tree_sitter::Parser, source: &str) -> tree_sitter::Tree {
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn find_first_function_body<'a>(tree: &'a tree_sitter::Tree) -> tree_sitter::Node<'a> {
+        fn walk<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if node.kind() == "function_definition" {
+                return node.child_by_field_name("body");
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = walk(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(tree.root_node()).expect("test source must contain a function")
+    }
+
+    fn allocations_in(c_source: &str) -> HashMap<String, SizeExpr> {
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_function_body(&mut parser, c_source);
+        let body = find_first_function_body(&tree);
+        collect_allocation_sizes(body, c_source)
+    }
+
+    #[test]
+    fn recognise_malloc_with_constant_size() {
+        let code = "void f(void) { char *p = malloc(42); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(42)));
+    }
+
+    #[test]
+    fn recognise_malloc_with_strlen_plus_one() {
+        let code = "void f(const char *x) {\n    char *buf = malloc(strlen(x) + 1);\n}";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("buf"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_calloc_with_two_constants_folds_to_product() {
+        let code = "void f(void) { int *p = calloc(4, 8); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(32)));
+    }
+
+    #[test]
+    fn calloc_with_non_constant_factor_is_unknown() {
+        let code = "void f(int n) { char *p = calloc(n, 1); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Unknown));
+    }
+
+    #[test]
+    fn recognise_realloc_size_argument_only() {
+        let code =
+            "void f(char *old, const char *x) {\n    char *p = realloc(old, strlen(x) + 8);\n}";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(8));
+        assert_eq!(allocations.get("p"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_assignment_to_struct_field_keyed_by_full_lhs_text() {
+        // Canonical shape: a struct-field destination of an allocation
+        // sized strlen(name) + 1 — the typical under-sized buffer that
+        // a later sprintf overflows.
+        let code = "struct dst { char *buf; };\n\
+                    void f(struct dst *dst, const char *name) {\n\
+                        dst->buf = malloc(strlen(name) + 1);\n\
+                    }";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("dst->buf"), Some(&expected));
+    }
+
+    #[test]
+    fn cast_around_allocator_is_unwrapped() {
+        let code = "void f(void) { int *p = (int *)malloc(40); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(40)));
+    }
+
+    #[test]
+    fn unrecognised_allocator_is_not_recorded() {
+        let code = "void f(void) { char *p = my_alloc(10); }";
+        let allocations = allocations_in(code);
+        assert!(!allocations.contains_key("p"));
+    }
+
+    #[test]
+    fn malloc_with_unknown_size_expression_records_unknown() {
+        let code = "void f(int n) { char *p = malloc(n); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Unknown));
+    }
+
+    #[test]
+    fn parse_c_integer_handles_hex_and_suffixes() {
+        let code = "void f(void) { char *p = malloc(0x100UL); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(256)));
     }
 
     #[test]
