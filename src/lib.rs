@@ -53,6 +53,10 @@ pub mod persist;
 #[cfg(feature = "native")]
 pub mod remote;
 #[cfg(feature = "native")]
+pub mod sse_discovery;
+#[cfg(feature = "native")]
+pub mod stdio_proxy;
+#[cfg(feature = "native")]
 pub mod streaming;
 #[cfg(feature = "native")]
 pub mod tool_handlers;

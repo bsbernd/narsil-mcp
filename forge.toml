@@ -6,8 +6,9 @@
 # ─── Code Intelligence ────────────────────────────────────────────────
 
 [servers.narsil]
-url = "http://localhost:7557/mcp"
-transport = "sse"
+command   = "narsil-mcp"
+args      = ["--repos", ".", "--git", "--call-graph", "--persist", "--watch"]
+transport = "stdio"
 timeout_secs = 30
 circuit_breaker = true
 failure_threshold = 3

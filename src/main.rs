@@ -3,7 +3,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use narsil_mcp::{
-    config, http_server, index, lsp, mcp, neural, persist, repo, stats_cli, streaming,
+    config, http_server, index, lsp, mcp, neural, persist, repo, sse_discovery, stats_cli,
+    stdio_proxy, streaming,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -262,6 +263,19 @@ async fn main() -> Result<()> {
 
     info!("Repos to index: {:?}", repos);
 
+    // Stdio auto-discovery: if a long-running SSE narsil-mcp is already
+    // indexing a superset of these repos, delegate to it and skip local
+    // engine construction entirely. The probe is a single MCP `ping`;
+    // anything that fails (no registry file, no matching repos, transport
+    // error) falls through to the normal local-index path.
+    if matches!(server_args.transport, Transport::Stdio) {
+        if let Some(proxy_url) = sse_discovery::find_server_for_repos(&repos) {
+            info!("SSE discovery: delegating stdio to {}", proxy_url);
+            return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url).await;
+        }
+        info!("SSE discovery: no matching server, building local index");
+    }
+
     // Check if --graph flag is used but feature isn't compiled
     #[cfg(not(feature = "graph"))]
     if server_args.graph {
@@ -361,7 +375,8 @@ async fn main() -> Result<()> {
     // NOTE: Engine creation is now fast and returns immediately.
     // Indexing happens in background to allow quick MCP server startup.
     let mut engine =
-        index::CodeIntelEngine::with_options(server_args.index_path, repos, options).await?;
+        index::CodeIntelEngine::with_options(server_args.index_path, repos.clone(), options)
+            .await?;
 
     // Initialize remote repository support if enabled
     if server_args.remote {
@@ -463,7 +478,16 @@ async fn main() -> Result<()> {
                 sse_host, sse_port
             );
             let http_server = http_server::HttpServer::new(Arc::clone(&engine), sse_port)
-                .with_mcp_routes(mcp_server, sse_host, sse_port, keepalive);
+                .with_mcp_routes(mcp_server, sse_host.clone(), sse_port, keepalive);
+
+            // Advertise this listener for stdio auto-discovery. The guard
+            // is bound in match-arm scope so it drops (and removes the
+            // entry) when the arm returns, whether normally or on error.
+            let discovery_url = format_discovery_url(&sse_host, sse_port);
+            let _discovery_entry = sse_discovery::register_server(&discovery_url, &repos)
+                .map_err(|e| warn!("SSE discovery: could not register: {}", e))
+                .ok();
+
             run_http_with_shutdown(http_server).await
         }
     };
@@ -472,6 +496,17 @@ async fn main() -> Result<()> {
 
     server_result?;
     Ok(())
+}
+
+/// Format the canonical base URL for the SSE listener, suitable for
+/// publishing in the discovery file. Wraps bare IPv6 addresses in
+/// brackets so the result parses as a valid URL.
+fn format_discovery_url(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{}]:{}", host, port)
+    } else {
+        format!("http://{}:{}", host, port)
+    }
 }
 
 /// True if `host` names a loopback bind target. Network-facing binds
