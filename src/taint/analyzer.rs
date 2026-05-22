@@ -206,6 +206,22 @@ impl TaintAnalyzer {
 
                 for func_pattern in &pattern.function_patterns {
                     if line.contains(func_pattern) {
+                        // Skip Python subprocess.{call,run,Popen,check_*} calls
+                        // whose first positional argument is a list literal of
+                        // string literals. These cannot carry an injection: the
+                        // argv is fully known at code-authoring time, no shell
+                        // is invoked, and the canonical safe pattern is
+                        // exactly `subprocess.Popen(['which', 'X'], ...)`.
+                        // Without this exemption, the safe pattern was being
+                        // reported as Critical command injection.
+                        if is_python_subprocess_literal_argv_call(
+                            &self.language,
+                            func_pattern,
+                            line,
+                        ) {
+                            continue;
+                        }
+
                         sinks.push(TaintSink {
                             id: format!("sink_{}", id_counter),
                             kind: pattern.kind.clone(),
@@ -838,6 +854,136 @@ pub fn analyze_code(source_code: &str, file_path: &str) -> TaintAnalysisResult {
     analyzer.analyze_code(source_code, file_path)
 }
 
+/// Whether the given line is a Python `subprocess.{call,run,Popen,check_*}`
+/// call whose first positional argument is a list literal of only string
+/// literals. Such calls cannot be a command-injection vector — argv is
+/// fully constant — and the OWASP guidance explicitly identifies this
+/// form as the *safe* alternative to `shell=True`. The taint analyzer
+/// uses substring matching that would otherwise flag the safe form as
+/// critical.
+///
+/// Limitations: this is a line-local string check. f-strings, variable
+/// elements, or string concatenation inside the list disqualify the
+/// exemption — those forms must continue to flag.
+fn is_python_subprocess_literal_argv_call(language: &str, func_pattern: &str, line: &str) -> bool {
+    if language != "python" {
+        return false;
+    }
+    let is_subprocess_pattern = matches!(
+        func_pattern,
+        "subprocess.call"
+            | "subprocess.run"
+            | "subprocess.Popen"
+            | "subprocess.check_call"
+            | "subprocess.check_output"
+    );
+    if !is_subprocess_pattern {
+        return false;
+    }
+
+    // Find the call's opening paren after the function name.
+    let func_start = match line.find(func_pattern) {
+        Some(i) => i,
+        None => return false,
+    };
+    let after_func = &line[func_start + func_pattern.len()..];
+    let after_paren = match after_func.strip_prefix('(') {
+        Some(s) => s.trim_start(),
+        None => return false,
+    };
+
+    // First positional must be a list literal.
+    let after_lbracket = match after_paren.strip_prefix('[') {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Find the matching closing bracket (no nesting allowed — keeps this
+    // a tight literal-only check).
+    let rbracket_idx = match after_lbracket.find(']') {
+        Some(i) => i,
+        None => return false,
+    };
+    let inside = &after_lbracket[..rbracket_idx];
+
+    // Inside must contain only quoted string literals separated by commas
+    // and whitespace. A presence of any non-quoted, non-comma, non-space
+    // character disqualifies — that covers variables, concatenation,
+    // f-strings (which start with `f"`), method calls, etc.
+    is_only_string_literals_and_commas(inside)
+}
+
+/// True if `s` is composed entirely of well-formed Python single- or
+/// double-quoted string literals separated by commas and whitespace.
+/// Empty list contents (zero elements) and trailing commas are accepted
+/// as degenerate "literal-only" cases — Python allows both.
+fn is_only_string_literals_and_commas(s: &str) -> bool {
+    enum State {
+        /// Awaiting the next list element (or end-of-input).
+        ExpectElement,
+        /// Just consumed an element; awaiting comma or end-of-input.
+        ExpectCommaOrEnd,
+    }
+
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut state = State::ExpectElement;
+    let mut have_any = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' || b == b'\t' {
+            i += 1;
+            continue;
+        }
+
+        match state {
+            State::ExpectElement => {
+                // Must be the opening quote of a string literal. Anything
+                // else (f-/b-/r-prefix, identifier, paren, ...) means the
+                // argv has non-literal content and we must not exempt.
+                if b != b'\'' && b != b'"' {
+                    return false;
+                }
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return false; // unterminated literal
+                }
+                i += 1; // skip closing quote
+                have_any = true;
+                state = State::ExpectCommaOrEnd;
+            }
+            State::ExpectCommaOrEnd => {
+                if b == b',' {
+                    state = State::ExpectElement;
+                    i += 1;
+                } else {
+                    // Two strings with no comma between them, or anything
+                    // else following a string — not a clean literal list.
+                    return false;
+                }
+            }
+        }
+    }
+
+    have_any
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1001,63 @@ mod tests {
         assert_eq!(detect_language("app.rb"), "ruby");
         assert_eq!(detect_language("main.kt"), "kotlin");
         assert_eq!(detect_language("unknown.xyz"), "unknown");
+    }
+
+    #[test]
+    fn test_literal_argv_helper_accepts_pure_string_lists() {
+        assert!(is_only_string_literals_and_commas("'a', 'b'"));
+        assert!(is_only_string_literals_and_commas("\"which\", \"ls\""));
+        assert!(is_only_string_literals_and_commas("'one'"));
+        // Empty list is degenerate but literal-only.
+        assert!(is_only_string_literals_and_commas(""));
+        assert!(is_only_string_literals_and_commas("   "));
+        // Escaped quotes inside a string.
+        assert!(is_only_string_literals_and_commas("'a\\'b'"));
+    }
+
+    #[test]
+    fn test_literal_argv_helper_rejects_anything_dynamic() {
+        // Bare variable.
+        assert!(!is_only_string_literals_and_commas("'a', user_input"));
+        // f-string.
+        assert!(!is_only_string_literals_and_commas("'a', f'{x}'"));
+        // Concatenation.
+        assert!(!is_only_string_literals_and_commas("'a' + b"));
+        // Trailing comma is allowed... actually it counts as `saw_element=true`
+        // then the next iteration finds end-of-string. Allow it.
+        assert!(is_only_string_literals_and_commas("'a',"));
+        // Leading comma is malformed.
+        assert!(!is_only_string_literals_and_commas(",'a'"));
+        // Unterminated string.
+        assert!(!is_only_string_literals_and_commas("'a"));
+    }
+
+    /// The whole point of patch 6: a `subprocess.Popen` call whose argv is
+    /// fully literal must not be flagged as a command-injection sink. The
+    /// same call shape with a non-literal element should still flag.
+    #[test]
+    fn test_subprocess_literal_argv_skips_sink_but_variable_argv_still_flags() {
+        let safe = "proc = subprocess.Popen(['which', 'ls'], stdout=PIPE)";
+        let unsafe_ = "proc = subprocess.Popen(['which', name], stdout=PIPE)";
+
+        let analyzer = TaintAnalyzer::new("python");
+        let safe_sinks = analyzer.find_sinks(safe, "x.py");
+        let unsafe_sinks = analyzer.find_sinks(unsafe_, "x.py");
+
+        // Safe form: no command-exec sink reported.
+        assert!(
+            !safe_sinks
+                .iter()
+                .any(|s| matches!(s.kind, SinkKind::CommandExec)),
+            "literal-argv subprocess.Popen must not be a command-exec sink"
+        );
+        // Unsafe form: still flagged.
+        assert!(
+            unsafe_sinks
+                .iter()
+                .any(|s| matches!(s.kind, SinkKind::CommandExec)),
+            "variable-argv subprocess.Popen must remain a command-exec sink"
+        );
     }
 
     #[test]
