@@ -144,12 +144,14 @@ struct ServerArgs {
     /// Bind address for the SSE transport. Only loopback addresses are
     /// accepted today — exposing on a network requires a future
     /// --allow-remote flag plus authentication.
-    #[arg(long, env = "NARSIL_SSE_HOST", default_value = "127.0.0.1")]
-    sse_host: String,
+    /// Setting this flag implicitly selects --transport sse.
+    #[arg(long, env = "NARSIL_SSE_HOST")]
+    sse_host: Option<String>,
 
     /// TCP port for the SSE transport.
-    #[arg(long, env = "NARSIL_SSE_PORT", default_value = "7557")]
-    sse_port: u16,
+    /// Setting this flag implicitly selects --transport sse.
+    #[arg(long, env = "NARSIL_SSE_PORT")]
+    sse_port: Option<u16>,
 
     /// SSE keep-alive interval in seconds. Comments are emitted on the
     /// stream to keep proxies / NATs from dropping idle connections.
@@ -233,9 +235,30 @@ async fn main() -> Result<()> {
 
     apply_named_profile(&mut server_args)?;
 
+    // --sse-host / --sse-port are SSE-specific flags; passing either one
+    // implicitly activates SSE transport so `narsil-mcp --sse-host localhost`
+    // does the right thing without also requiring --transport sse.
+    if matches!(server_args.transport, Transport::Stdio)
+        && (server_args.sse_host.is_some() || server_args.sse_port.is_some())
+    {
+        info!(
+            "--sse-host/--sse-port specified without --transport sse; \
+             activating SSE transport implicitly"
+        );
+        server_args.transport = Transport::Sse;
+    }
+
     // Resolve the final list of repository paths from CLI args, env, and
-    // discovery. Auto-falls back to cwd when nothing is specified.
-    let repos = resolve_repo_paths(server_args.repos.clone(), server_args.discover.clone())?;
+    // discovery. For stdio transport, fall back to cwd when nothing is
+    // specified so bare `narsil-mcp` "just works" inside a project.
+    // SSE transport requires explicit --repos to avoid silently indexing
+    // whatever directory the server process was started in.
+    let cwd_fallback = matches!(server_args.transport, Transport::Stdio);
+    let repos = resolve_repo_paths(
+        server_args.repos.clone(),
+        server_args.discover.clone(),
+        cwd_fallback,
+    )?;
 
     info!("Repos to index: {:?}", repos);
 
@@ -406,16 +429,21 @@ async fn main() -> Result<()> {
             run_stdio_with_shutdown(server).await
         }
         Transport::Sse => {
+            let sse_host = server_args
+                .sse_host
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let sse_port = server_args.sse_port.unwrap_or(7557);
+
             // Refuse non-loopback bind. A network-exposed MCP transport
             // without authentication would let any host on the LAN drive
             // tool calls and read source. Adding network exposure must go
             // through a future --allow-remote flag plus auth.
-            if !is_loopback_bind_addr(&server_args.sse_host) {
+            if !is_loopback_bind_addr(&sse_host) {
                 bail!(
                     "--sse-host {} is not a loopback address. Refusing to bind: \
                      the SSE transport has no authentication. Use 127.0.0.1, \
                      ::1, or localhost.",
-                    server_args.sse_host
+                    sse_host
                 );
             }
             if server_args.http {
@@ -432,16 +460,10 @@ async fn main() -> Result<()> {
             ));
             info!(
                 "Starting MCP SSE transport on http://{}:{}/mcp/sse",
-                server_args.sse_host, server_args.sse_port
+                sse_host, sse_port
             );
-            let http_server =
-                http_server::HttpServer::new(Arc::clone(&engine), server_args.sse_port)
-                    .with_mcp_routes(
-                        mcp_server,
-                        server_args.sse_host.clone(),
-                        server_args.sse_port,
-                        keepalive,
-                    );
+            let http_server = http_server::HttpServer::new(Arc::clone(&engine), sse_port)
+                .with_mcp_routes(mcp_server, sse_host, sse_port, keepalive);
             run_http_with_shutdown(http_server).await
         }
     };
@@ -587,7 +609,11 @@ fn apply_bool_default(target: &mut bool, profile_value: Option<bool>) {
 ///    indexes the project the user is sitting in (issue #22).
 /// 5. Drop paths that do not exist on disk, logging each at WARN. If all
 ///    explicit paths were invalid, return a clear error.
-fn resolve_repo_paths(cli_repos: Vec<PathBuf>, discover: Option<PathBuf>) -> Result<Vec<PathBuf>> {
+fn resolve_repo_paths(
+    cli_repos: Vec<PathBuf>,
+    discover: Option<PathBuf>,
+    cwd_fallback: bool,
+) -> Result<Vec<PathBuf>> {
     let mut repos = cli_repos;
     let had_explicit_input = !repos.is_empty() || discover.is_some();
 
@@ -602,7 +628,15 @@ fn resolve_repo_paths(cli_repos: Vec<PathBuf>, discover: Option<PathBuf>) -> Res
 
     // Fall back to the current working directory when no repos are specified
     // anywhere — bare `narsil-mcp` should "just work" inside a project.
+    // This fallback is intentionally disabled for SSE transport, where the
+    // server is a persistent process not tied to any project directory.
     if repos.is_empty() {
+        if !cwd_fallback {
+            bail!(
+                "No repositories specified. Pass --repos <path> (or set NARSIL_REPOS) \
+                 to tell the SSE server which repositories to index."
+            );
+        }
         let cwd = std::env::current_dir().context(
             "--repos was not specified and the current working directory is unavailable",
         )?;
@@ -816,9 +850,15 @@ mod tests {
 
     #[test]
     fn resolve_repo_paths_falls_back_to_cwd_when_empty() {
-        let resolved = resolve_repo_paths(vec![], None).unwrap();
+        let resolved = resolve_repo_paths(vec![], None, true).unwrap();
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(resolved, vec![cwd]);
+    }
+
+    #[test]
+    fn resolve_repo_paths_no_cwd_fallback_errors_when_empty() {
+        let err = resolve_repo_paths(vec![], None, false).unwrap_err();
+        assert!(err.to_string().contains("No repositories specified"));
     }
 
     #[test]
@@ -827,7 +867,7 @@ mod tests {
         let nonexistent = PathBuf::from("/this/path/definitely/does/not/exist/narsil-test-zzz");
         assert!(!nonexistent.exists());
 
-        let resolved = resolve_repo_paths(vec![cwd.clone(), nonexistent], None).unwrap();
+        let resolved = resolve_repo_paths(vec![cwd.clone(), nonexistent], None, false).unwrap();
         // The missing path is dropped; the existing one survives.
         assert_eq!(resolved, vec![cwd]);
     }
@@ -835,13 +875,13 @@ mod tests {
     #[test]
     fn resolve_repo_paths_errors_when_all_explicit_paths_are_missing() {
         let nonexistent = PathBuf::from("/this/path/definitely/does/not/exist/narsil-test-zzz");
-        let err = resolve_repo_paths(vec![nonexistent], None).unwrap_err();
+        let err = resolve_repo_paths(vec![nonexistent], None, false).unwrap_err();
         assert!(err.to_string().contains("No valid repository paths"));
     }
 
     #[test]
     fn resolve_repo_paths_expands_dot_to_cwd() {
-        let resolved = resolve_repo_paths(vec![PathBuf::from(".")], None).unwrap();
+        let resolved = resolve_repo_paths(vec![PathBuf::from(".")], None, false).unwrap();
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(resolved, vec![cwd]);
     }
@@ -849,7 +889,7 @@ mod tests {
     #[test]
     fn resolve_repo_paths_keeps_explicit_paths() {
         let cwd = std::env::current_dir().unwrap();
-        let resolved = resolve_repo_paths(vec![cwd.clone()], None).unwrap();
+        let resolved = resolve_repo_paths(vec![cwd.clone()], None, false).unwrap();
         assert_eq!(resolved, vec![cwd]);
     }
 
