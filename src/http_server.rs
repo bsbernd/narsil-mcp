@@ -10,7 +10,7 @@
 use anyhow::Result;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{header, Request, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -100,6 +100,8 @@ pub struct AppState {
     mcp_server: Option<Arc<McpServer>>,
     /// Active SSE sessions keyed by `sessionId`.
     sessions: Arc<DashMap<Uuid, SessionEntry>>,
+    /// Active Streamable HTTP sessions keyed by session ID.
+    streamable_sessions: Arc<DashMap<Uuid, Arc<SessionState>>>,
     sse_keepalive: Duration,
 }
 
@@ -191,6 +193,7 @@ impl HttpServer {
             tool_registry: Arc::new(self.tool_registry),
             mcp_server: self.mcp_server,
             sessions: Arc::new(DashMap::new()),
+            streamable_sessions: Arc::new(DashMap::new()),
             sse_keepalive: self.sse_keepalive,
         };
 
@@ -227,12 +230,14 @@ impl HttpServer {
 
         let app = if mcp_enabled {
             info!("MCP HTTP+SSE transport enabled at /mcp/sse, /mcp/message");
+            info!("MCP Streamable HTTP transport enabled at /mcp");
             // MCP routes get the host-header check (DNS rebinding mitigation
             // required by the MCP spec for HTTP-based transports). CORS is
             // deliberately not applied here.
             let mcp_routes = Router::new()
                 .route("/mcp/sse", get(mcp_sse_handler))
                 .route("/mcp/message", post(mcp_message_handler))
+                .route("/mcp", post(mcp_streamable_handler))
                 .layer(middleware::from_fn(host_header_check));
             frontend.merge(mcp_routes)
         } else {
@@ -251,6 +256,82 @@ impl HttpServer {
 
         Ok(())
     }
+}
+
+/// MCP Streamable HTTP: POST `/mcp`.
+///
+/// Implements the MCP 2025-03 Streamable HTTP transport (single-endpoint).
+/// The client POSTs JSON-RPC requests to this URL. Session state is tracked
+/// via the `Mcp-Session-Id` header: the server assigns one on the first
+/// request (initialize) and the client echoes it on all subsequent requests.
+///
+/// Responses:
+/// - 200 OK + `Content-Type: application/json` for requests with an id
+/// - 202 Accepted for notifications (no id)
+/// - 404 Not Found if the session ID is not found (session expired)
+async fn mcp_streamable_handler(
+    State(state): State<AppState>,
+    req_headers: HeaderMap,
+    Json(req): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    let Some(mcp_server) = state.mcp_server.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    // Extract session ID from the Mcp-Session-Id header.
+    let header_session_id: Option<Uuid> = req_headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let (session_id, session_state) = match header_session_id {
+        Some(id) => match state.streamable_sessions.get(&id) {
+            Some(entry) => (id, Arc::clone(entry.value())),
+            // Session not found: tell the client to start a new session.
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
+        None => {
+            // No session yet — create one (this should be the initialize request).
+            let id = Uuid::new_v4();
+            let new_state = Arc::new(SessionState::new());
+            state.streamable_sessions.insert(id, Arc::clone(&new_state));
+            debug!("Streamable HTTP session created: {}", id);
+            (id, new_state)
+        }
+    };
+
+    let session_id_str = session_id.to_string();
+    let sid_header = HeaderValue::from_str(&session_id_str)
+        .unwrap_or_else(|_| HeaderValue::from_static("error"));
+
+    // Notifications have no id and never need a response body.
+    if req.id.is_none() {
+        let server = mcp_server.clone();
+        let ss = Arc::clone(&session_state);
+        tokio::spawn(async move {
+            server.dispatch(req, &ss).await;
+        });
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(HeaderName::from_static("mcp-session-id"), sid_header);
+        return (StatusCode::ACCEPTED, resp_headers).into_response();
+    }
+
+    let response = mcp_server.dispatch(req, &session_state).await;
+    let json_body = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize JSON-RPC response: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp_headers.insert(HeaderName::from_static("mcp-session-id"), sid_header);
+    (StatusCode::OK, resp_headers, json_body).into_response()
 }
 
 /// MCP HTTP+SSE: GET `/mcp/sse`.

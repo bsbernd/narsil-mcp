@@ -1,0 +1,125 @@
+# SSE Transport
+
+The MCP HTTP+SSE transport lets a single persistent `narsil-mcp` process serve
+multiple editor sessions simultaneously. Instead of each session spawning its
+own subprocess and re-indexing from scratch, all sessions share one warm index.
+
+## When to use SSE vs stdio
+
+| Scenario | Transport |
+|---|---|
+| Single editor session, local project | `stdio` (default) |
+| Multiple sessions sharing one index | `sse` |
+| Remote server (SSH), multiple clients | `sse` |
+| Editor only supports stdio | `stdio` (default) |
+
+## Quick start
+
+Start the server once, pointing it at the repositories to index:
+
+```bash
+narsil-mcp --transport sse --repos /path/to/project
+```
+
+Multiple repos:
+
+```bash
+narsil-mcp --transport sse --repos /path/to/repo1 --repos /path/to/repo2
+```
+
+`--sse-host` and `--sse-port` also implicitly activate SSE transport, so this
+is equivalent:
+
+```bash
+narsil-mcp --sse-host localhost --repos /path/to/project
+```
+
+The server binds to `127.0.0.1:7557` by default and logs:
+
+```
+INFO narsil_mcp: Starting MCP SSE transport on http://127.0.0.1:7557/mcp/sse
+```
+
+## Connecting Claude Code
+
+Add the server to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "narsil-mcp": {
+      "type": "sse",
+      "url": "http://localhost:7557/mcp/sse"
+    }
+  }
+}
+```
+
+Or register it from the command line:
+
+```bash
+claude mcp add --transport sse narsil-mcp http://localhost:7557/mcp/sse
+```
+
+## Connecting Claude Desktop
+
+In `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "narsil-mcp": {
+      "type": "sse",
+      "url": "http://localhost:7557/mcp/sse"
+    }
+  }
+}
+```
+
+## Remote server (SSH)
+
+When `narsil-mcp` runs on a remote host, forward the port locally:
+
+```bash
+ssh -L 7557:localhost:7557 user@remote-host
+```
+
+Then configure your local client to use `http://localhost:7557/mcp/sse` as
+shown above. The tunnel keeps all traffic local on both ends.
+
+Alternatively, run Claude Code on the remote host directly — it can reach the
+SSE server at `http://localhost:7557/mcp/sse` without any port forwarding.
+
+## Options reference
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--transport sse` | `NARSIL_TRANSPORT=sse` | `stdio` | Activate SSE transport |
+| `--sse-host` | `NARSIL_SSE_HOST` | `127.0.0.1` | Bind address (loopback only) |
+| `--sse-port` | `NARSIL_SSE_PORT` | `7557` | TCP port |
+| `--sse-keepalive-secs` | `NARSIL_SSE_KEEPALIVE_SECS` | `15` | Keep-alive comment interval |
+| `--repos` | `NARSIL_REPOS` | *(required in SSE mode)* | Repositories to index |
+
+`--repos` is required in SSE mode. Passing `--sse-host` or `--sse-port`
+without `--repos` will error with a clear message.
+
+Only loopback addresses (`127.0.0.1`, `::1`, `localhost`) are accepted for
+`--sse-host`. Network-facing binds are rejected — the SSE transport has no
+authentication.
+
+## Persistent indexing
+
+Add `--persist` to save the index to disk so restarts are fast:
+
+```bash
+narsil-mcp --transport sse --repos /path/to/project --persist --git --call-graph
+```
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/mcp/sse` | Open SSE stream (MCP HTTP+SSE spec 2024-11-05) |
+| `POST` | `/mcp/message` | Send JSON-RPC request to a session |
+| `GET` | `/health` | Health check |
