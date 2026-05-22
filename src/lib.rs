@@ -11,6 +11,7 @@ pub mod dead_code;
 pub mod dfg;
 pub mod embeddings;
 pub mod extract;
+pub mod heap_size;
 pub mod hybrid_search;
 pub mod incremental;
 pub mod metrics;
