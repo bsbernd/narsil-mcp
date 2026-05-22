@@ -2665,6 +2665,50 @@ strcpy(dest, src);
         assert!(!findings.is_empty());
     }
 
+    /// The default engine must register CWE-787-001 against the
+    /// `cwe_top25_rules` index. Without this entry, `scan_cwe_top25`
+    /// silently skips the unsafe-string-function rule even though it
+    /// loads successfully — that is the silent-miss symptom this
+    /// regression test guards against.
+    #[test]
+    fn test_default_engine_registers_cwe_787_001_in_top25_index() {
+        let engine = SecurityRulesEngine::new();
+        assert!(
+            engine.get_rule("CWE-787-001").is_some(),
+            "CWE-787-001 must be loaded from rules/cwe-top25.yaml"
+        );
+        assert!(
+            engine.cwe_top25_rules.iter().any(|id| id == "CWE-787-001"),
+            "CWE-787-001 must be indexed in cwe_top25_rules; \
+             otherwise scan_cwe_top25 cannot find it"
+        );
+    }
+
+    /// Regression: an indented `sprintf(dst, "%s#%s", ...)` call,
+    /// nested inside conditional control flow with a struct-pointer
+    /// destination, must be reported by `scan_cwe_top25` and not just
+    /// by the broader `scan` path. The original
+    /// `test_buffer_overflow_detection` only exercised top-level calls
+    /// via `scan`; the CWE Top 25 path walks a separate rule index
+    /// and needs its own coverage.
+    #[test]
+    fn test_cwe_top25_flags_indented_sprintf_call() {
+        let engine = SecurityRulesEngine::new();
+        let code = "static void format_into(struct ctx *ctx)\n\
+                    {\n\
+                    \tif (ctx->name) {\n\
+                    \t\tif (!ctx->is_block)\n\
+                    \t\t\tsprintf(ctx->buf, \"%s#%s\", ctx->prefix, ctx->name);\n\
+                    \t}\n\
+                    }\n";
+        let findings = engine.scan_cwe_top25(code, "helper.c", "c");
+        assert!(
+            findings.iter().any(|f| f.rule_id == "CWE-787-001"),
+            "expected CWE-787-001 finding for sprintf into heap pointer; got {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_explain_vulnerability() {
         let engine = SecurityRulesEngine::new();
