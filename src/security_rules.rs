@@ -13,11 +13,11 @@
 //! - **ControlFlow**: Required operations before sensitive calls
 //! - **Typestate**: State machine validation (future)
 
-use crate::taint::{self, Confidence, Severity};
+use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Check if a file path appears to be a test file.
 ///
@@ -982,11 +982,34 @@ impl SecurityRulesEngine {
         // Use the existing taint analyzer
         let taint_result = taint::analyze_code(code, file_path);
 
+        // Build the set of vulnerability kinds this rule actually targets,
+        // derived from the rule's declared CWE list. Without this filter,
+        // every taint_flow rule reports every flow the analyzer produces —
+        // so OWASP-A03-001 (declared CWE-89 SQL injection) ends up tagging
+        // a command-injection flow with the label "SQL Injection", and
+        // every other taint_flow rule re-reports the same flow under its
+        // own (also wrong) label. The output is mislabeled and duplicated.
+        let target_kinds: HashSet<VulnerabilityKind> = rule
+            .cwe
+            .iter()
+            .filter_map(|c| VulnerabilityKind::from_cwe(c))
+            .collect();
+
         let mut findings = Vec::new();
 
-        // Map vulnerabilities (unsanitized taint flows) to security findings
+        // Map vulnerabilities (unsanitized taint flows) to security findings,
+        // skipping any flow whose vuln kind isn't what this rule is for.
         for flow in taint_result.vulnerabilities {
             if let Some(ref vuln_kind) = flow.vulnerability {
+                // If the rule declares CWEs that map to known vuln kinds,
+                // restrict to those. If it declares only un-mapped CWEs
+                // (or no CWEs), fall back to reporting all flows — that
+                // preserves the catch-all behaviour for custom rules
+                // whose CWE isn't in the taint analyzer's vocabulary.
+                if !target_kinds.is_empty() && !target_kinds.contains(vuln_kind) {
+                    continue;
+                }
+
                 findings.push(SecurityFinding {
                     rule_id: rule.id.clone(),
                     rule_name: rule.name.clone(),
@@ -2324,6 +2347,35 @@ def search(request):
         assert!(findings
             .iter()
             .any(|f| f.cwe.contains(&"CWE-89".to_string())));
+    }
+
+    /// Taint flows produced by the global analyzer must be attributed only
+    /// to rules whose declared CWE matches the flow's vulnerability kind.
+    /// Without this filter, the SQL-injection taint rule (OWASP-A03-001,
+    /// CWE-89) ends up tagging every command-injection flow with the label
+    /// "SQL Injection" — the symptom called out in the noise report.
+    #[test]
+    fn test_taint_rule_does_not_attribute_command_injection_to_sql_rule() {
+        let engine = SecurityRulesEngine::new();
+        let code = r#"
+import os, sys
+def run(req):
+    arg = req.args.get('cmd')
+    os.system("echo " + arg)
+"#;
+        let findings = engine.scan(code, "vuln.py", "python");
+
+        // Whatever fires, no finding should carry the SQL Injection
+        // rule_id/name while reporting CWE-78 (Command Injection).
+        for f in &findings {
+            let labeled_sql = f.rule_id == "OWASP-A03-001" || f.rule_name == "SQL Injection";
+            let is_cmd_inj = f.cwe.iter().any(|c| c == "CWE-78");
+            assert!(
+                !(labeled_sql && is_cmd_inj),
+                "command-injection flow mislabeled by SQL-injection rule: {:?}",
+                f
+            );
+        }
     }
 
     #[test]

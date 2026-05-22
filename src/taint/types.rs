@@ -197,6 +197,28 @@ impl VulnerabilityKind {
         }
     }
 
+    /// Map a CWE identifier (e.g. `"CWE-89"`) back to its
+    /// `VulnerabilityKind`. Returns `None` for CWEs not modeled by the taint
+    /// analyzer (which is expected: the engine has many pattern-only rules
+    /// whose CWEs have no corresponding taint vuln kind).
+    #[must_use]
+    pub fn from_cwe(cwe: &str) -> Option<Self> {
+        match cwe {
+            "CWE-89" => Some(VulnerabilityKind::SqlInjection),
+            "CWE-79" => Some(VulnerabilityKind::Xss),
+            "CWE-78" => Some(VulnerabilityKind::CommandInjection),
+            "CWE-22" => Some(VulnerabilityKind::PathTraversal),
+            "CWE-94" => Some(VulnerabilityKind::CodeInjection),
+            "CWE-502" => Some(VulnerabilityKind::InsecureDeserialization),
+            "CWE-90" => Some(VulnerabilityKind::LdapInjection),
+            "CWE-611" => Some(VulnerabilityKind::XxeInjection),
+            "CWE-1333" => Some(VulnerabilityKind::ReDoS),
+            "CWE-117" => Some(VulnerabilityKind::LogInjection),
+            "CWE-601" => Some(VulnerabilityKind::OpenRedirect),
+            _ => None,
+        }
+    }
+
     /// Get OWASP Top 10 category if applicable
     #[must_use]
     pub fn owasp_category(&self) -> Option<&'static str> {
