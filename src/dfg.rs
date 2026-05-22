@@ -279,6 +279,11 @@ pub struct DfgAnalyzer<'a> {
     /// excluded — eliminating the bulk of false positives that arise when the
     /// fallback tokenizer treats raw statement text as a flat character stream.
     ast_idents_per_line: Option<AstIdentIndex>,
+    /// Variables whose address is taken anywhere in the function (via `&x`).
+    /// A function that receives `&base` may write through it to any of base's
+    /// fields, so prior assignments to those fields are not dead even though
+    /// the dataflow can't see the write through the pointer.
+    address_taken: HashSet<String>,
 }
 
 impl<'a> DfgAnalyzer<'a> {
@@ -290,6 +295,7 @@ impl<'a> DfgAnalyzer<'a> {
             uses: Vec::new(),
             def_counters: HashMap::new(),
             ast_idents_per_line: None,
+            address_taken: HashSet::new(),
         }
     }
 
@@ -299,6 +305,7 @@ impl<'a> DfgAnalyzer<'a> {
     /// is available.
     pub fn with_tree(cfg: &'a ControlFlowGraph, tree: &Tree, source: &str) -> Self {
         let index = build_ast_ident_index(tree.root_node(), source);
+        let address_taken = collect_address_taken(tree.root_node(), source);
         Self {
             cfg,
             block_facts: HashMap::new(),
@@ -306,6 +313,7 @@ impl<'a> DfgAnalyzer<'a> {
             uses: Vec::new(),
             def_counters: HashMap::new(),
             ast_idents_per_line: Some(index),
+            address_taken,
         }
     }
 
@@ -671,8 +679,35 @@ impl<'a> DfgAnalyzer<'a> {
         chains
             .iter()
             .filter(|c| !c.is_used)
+            .filter(|c| !self.is_field_of_address_taken(&c.definition.variable))
             .map(|c| c.definition.clone())
             .collect()
+    }
+
+    /// Whether `variable` looks like a struct/union field path (`base.field`,
+    /// `base->field`, `base[i].field`, ...) whose base has had its address
+    /// taken somewhere in the function. Such an assignment must not be
+    /// reported as dead, because a later call receiving the base pointer can
+    /// observe — or overwrite — the field. Standard escape analysis.
+    fn is_field_of_address_taken(&self, variable: &str) -> bool {
+        if self.address_taken.is_empty() {
+            return false;
+        }
+        for base in &self.address_taken {
+            if variable.len() <= base.len() {
+                continue;
+            }
+            if !variable.starts_with(base.as_str()) {
+                continue;
+            }
+            // Character immediately following the base must start a field
+            // access — `.`, `->`, or `[` (array element whose field follows).
+            let rest = &variable[base.len()..];
+            if rest.starts_with('.') || rest.starts_with("->") || rest.starts_with('[') {
+                return true;
+            }
+        }
+        false
     }
 
     fn find_uninitialized_uses(&self) -> Vec<Use> {
@@ -1169,6 +1204,110 @@ fn is_ident_excluded_subtree(kind: &str) -> bool {
 /// (`msg->msg_control`).
 fn is_ident_node_kind(kind: &str) -> bool {
     matches!(kind, "identifier" | "variable_name")
+}
+
+/// Walk `root` collecting the names of all variables whose address is taken
+/// — i.e. operands of a `&` operator. Used by [`DfgAnalyzer`] to suppress
+/// false-positive dead-store reports for struct fields whose containing
+/// struct's address escapes (e.g. `msg.msg_control = ...; sendmsg(fd, &msg, 0);`).
+///
+/// The C tree-sitter grammar represents `&x` as a `pointer_expression` whose
+/// `operator` child is `&`. Other languages use various forms; this pass
+/// matches both `pointer_expression` (C/C++) and `reference_expression`
+/// (Rust) as well as any unary node whose first child token is `&`, which
+/// covers JavaScript/TypeScript's lack of address-of (does nothing) and the
+/// common case across the C family.
+fn collect_address_taken(root: Node, source: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    walk_for_address_taken(root, source, &mut out);
+    out
+}
+
+fn walk_for_address_taken(node: Node, source: &str, out: &mut HashSet<String>) {
+    let kind = node.kind();
+
+    // Skip subtrees that can never contain a meaningful `&var`.
+    if is_ident_excluded_subtree(kind) {
+        return;
+    }
+
+    let is_address_of = match kind {
+        // C, C++: `&x` is parsed as `pointer_expression` with operator '&'.
+        // The same node kind is used for `*x`, so check the operator.
+        "pointer_expression" => first_operator_is(node, source, "&"),
+        // Rust: `&x` is `reference_expression`.
+        "reference_expression" => true,
+        // Generic unary expressions in some grammars.
+        "unary_expression" => first_operator_is(node, source, "&"),
+        _ => false,
+    };
+
+    if is_address_of {
+        // The operand is the first non-operator named child (often field
+        // `argument`). Extract its base identifier.
+        let operand = node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0));
+        if let Some(op) = operand {
+            if let Some(base) = extract_base_identifier(op, source) {
+                out.insert(base);
+            }
+        }
+        // Continue walking — `&(x.y.z)` is one address-of, but a larger
+        // subtree like `&foo[g(&bar)]` has a nested `&bar` we must catch.
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_address_taken(child, source, out);
+    }
+}
+
+/// Whether the first child of `node` named with field `operator` (or, if no
+/// such field, the first leaf token) equals `op`.
+fn first_operator_is(node: Node, source: &str, op: &str) -> bool {
+    if let Some(opnode) = node.child_by_field_name("operator") {
+        if let Ok(text) = opnode.utf8_text(source.as_bytes()) {
+            return text == op;
+        }
+    }
+    // Fallback: scan unnamed children for a token matching `op`.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                return text == op;
+            }
+        }
+    }
+    false
+}
+
+/// Reduce a (possibly field-access) operand expression to its outermost
+/// identifier name. For `x`, returns `"x"`. For `x.y`, returns `"x"`.
+/// For `x->y[i].z`, returns `"x"`. For `*p` or anything starting with a
+/// non-identifier, returns `None`.
+fn extract_base_identifier(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" | "variable_name" => {
+                return current.utf8_text(source.as_bytes()).ok().map(String::from);
+            }
+            // Strip outer field/subscript/parenthesis layers.
+            "field_expression"
+            | "member_expression"
+            | "subscript_expression"
+            | "parenthesized_expression" => {
+                let inner = current
+                    .child_by_field_name("argument")
+                    .or_else(|| current.child_by_field_name("object"))
+                    .or_else(|| current.named_child(0))?;
+                current = inner;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Whether `text` contains `word` as a whole-word match — i.e., not abutted
@@ -1776,6 +1915,68 @@ int demo(struct msghdr *msg) {
 
         assert!(all.iter().any(|s| s.as_str() == "msg"));
         assert!(!all.iter().any(|s| s.as_str() == "msg_control"));
+    }
+
+    /// Assignments to struct fields must not be flagged as dead stores when
+    /// the containing struct's address is later passed to a function — the
+    /// callee can read or overwrite those fields, so they are live by escape
+    /// analysis. Reproduces a false-positive class where every `msg.msg_*`
+    /// initialiser was flagged as dead because the dataflow couldn't see
+    /// the read through `sendmsg(fd, &msg, 0)`.
+    #[test]
+    fn test_dead_store_exempts_fields_of_address_taken_struct() {
+        let source = r#"
+struct msghdr { int msg_control; int msg_controllen; };
+int demo(int fd) {
+    struct msghdr msg;
+    msg.msg_control = 0;
+    msg.msg_controllen = 0;
+    return sendmsg(fd, &msg, 0);
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("load tree-sitter-c");
+        let tree = parser.parse(source, None).expect("parse C");
+
+        let analyses = super::analyze_file(&tree, source, "demo.c").expect("analyze");
+        let demo = analyses
+            .iter()
+            .find(|a| a.function_name == "demo")
+            .expect("found demo");
+
+        for def in &demo.dead_stores {
+            assert!(
+                !def.variable.starts_with("msg."),
+                "msg.{{field}} assignments must not be reported as dead stores when &msg escapes; got dead store for `{}`",
+                def.variable
+            );
+        }
+    }
+
+    /// The exemption only applies to bases that were actually address-taken.
+    /// A struct whose address never escapes should still get its field
+    /// assignments flagged when truly dead.
+    #[test]
+    fn test_dead_store_no_exemption_without_address_taken() {
+        let mut analyzer_address_taken = HashSet::new();
+        analyzer_address_taken.insert("msg".to_string());
+        let cfg = create_simple_cfg();
+        let mut a = DfgAnalyzer::new(&cfg);
+        a.address_taken = analyzer_address_taken;
+
+        // With base in the set, field-shaped variable names are exempt.
+        assert!(a.is_field_of_address_taken("msg.msg_control"));
+        assert!(a.is_field_of_address_taken("msg->msg_control"));
+        assert!(a.is_field_of_address_taken("msg[0].msg_control"));
+        // Bare `msg` (not a field path) is NOT exempt — it can still be
+        // truly dead in the normal sense.
+        assert!(!a.is_field_of_address_taken("msg"));
+        // Unrelated bases are not exempt.
+        assert!(!a.is_field_of_address_taken("other.field"));
+        // A name that starts with `msg` but is not `msg`-the-base is not exempt.
+        assert!(!a.is_field_of_address_taken("msg_other"));
     }
 
     /// Uses of symbols that are never defined or declared in the function
