@@ -14,9 +14,15 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use tree_sitter::Tree;
+use tree_sitter::{Node, Tree};
 
 use crate::cfg::{BlockId, ControlFlowGraph};
+
+/// Per-line set of identifiers that are genuine variable uses, computed by an
+/// AST walk that excludes string-literal contents, comments, function callees,
+/// and field-access target names. When present, [`DfgAnalyzer`] consults this
+/// index instead of tokenizing raw statement text.
+type AstIdentIndex = HashMap<usize, HashSet<String>>;
 
 /// Unique identifier for a variable
 pub type VarId = String;
@@ -267,6 +273,12 @@ pub struct DfgAnalyzer<'a> {
     uses: Vec<Use>,
     /// Definition index counter per block
     def_counters: HashMap<BlockId, usize>,
+    /// When constructed via [`Self::with_tree`], an AST-derived per-line index
+    /// of identifiers that should be considered variable uses. Identifiers from
+    /// string literals, comments, function callees, and field-access targets are
+    /// excluded — eliminating the bulk of false positives that arise when the
+    /// fallback tokenizer treats raw statement text as a flat character stream.
+    ast_idents_per_line: Option<AstIdentIndex>,
 }
 
 impl<'a> DfgAnalyzer<'a> {
@@ -277,6 +289,23 @@ impl<'a> DfgAnalyzer<'a> {
             definitions: Vec::new(),
             uses: Vec::new(),
             def_counters: HashMap::new(),
+            ast_idents_per_line: None,
+        }
+    }
+
+    /// Construct an analyzer that uses the parsed tree-sitter `tree` to build
+    /// a high-signal per-line identifier index, instead of tokenizing raw
+    /// statement text. Prefer this over [`Self::new`] whenever a parsed tree
+    /// is available.
+    pub fn with_tree(cfg: &'a ControlFlowGraph, tree: &Tree, source: &str) -> Self {
+        let index = build_ast_ident_index(tree.root_node(), source);
+        Self {
+            cfg,
+            block_facts: HashMap::new(),
+            definitions: Vec::new(),
+            uses: Vec::new(),
+            def_counters: HashMap::new(),
+            ast_idents_per_line: Some(index),
         }
     }
 
@@ -396,7 +425,34 @@ impl<'a> DfgAnalyzer<'a> {
     }
 
     fn extract_uses_from_text(&self, text: &str, block: BlockId, line: usize) -> Vec<Use> {
-        // Simplified: extract identifiers that look like variable names
+        // High-signal path: if we have a tree-sitter-derived per-line identifier
+        // index, use it. Only emit identifiers that the AST classified as a
+        // variable reference (excludes string/comment contents, callees, and
+        // field-access target names) AND that also appear in this statement's
+        // text — the text check disambiguates between multiple statements that
+        // share a line.
+        if let Some(index) = &self.ast_idents_per_line {
+            if let Some(line_idents) = index.get(&line) {
+                let mut uses = Vec::new();
+                for ident in line_idents {
+                    if contains_word(text, ident) {
+                        uses.push(Use {
+                            variable: ident.clone(),
+                            block,
+                            line,
+                            kind: UseKind::Read,
+                        });
+                    }
+                }
+                return uses;
+            }
+            // Line not in index (e.g. macro-generated line in a fallback tree):
+            // fall through to the legacy tokenizer rather than silently dropping.
+        }
+
+        // Legacy fallback: extract identifiers that look like variable names by
+        // tokenizing raw text. Inherently noisy — used only when no AST is
+        // available (e.g. unit tests that construct a CFG without a parsed tree).
         let mut uses = Vec::new();
         let mut current_ident = String::new();
 
@@ -989,14 +1045,142 @@ pub fn analyze_file(tree: &Tree, source: &str, file_path: &str) -> Result<Vec<Da
     // First build CFGs
     let cfgs = crate::cfg::analyze_function(tree, source, file_path)?;
 
-    // Then analyze each CFG
+    // Then analyze each CFG, using the parsed tree to get AST-driven Use
+    // extraction (much higher signal than the legacy text tokenizer).
     let mut analyses = Vec::new();
     for cfg in &cfgs {
-        let mut analyzer = DfgAnalyzer::new(cfg);
+        let mut analyzer = DfgAnalyzer::with_tree(cfg, tree, source);
         analyses.push(analyzer.analyze());
     }
 
     Ok(analyses)
+}
+
+/// Build a per-line index of identifiers that are genuine variable uses by
+/// walking the AST and excluding identifier-like text that the legacy
+/// tokenizer would have included as a "use":
+///   - contents of string/char literals and comments
+///   - function callees of `call_expression` / `call`
+///   - the `field` child of `field_expression` / `member_expression`
+///   - `type_identifier` nodes (type names, not values)
+///
+/// The keyword filter is also applied as a defensive measure even though
+/// tree-sitter shouldn't produce keyword-named `identifier` nodes.
+fn build_ast_ident_index(root: Node, source: &str) -> AstIdentIndex {
+    let mut index: AstIdentIndex = HashMap::new();
+    walk_for_idents(root, source, &mut index);
+    index
+}
+
+fn walk_for_idents(node: Node, source: &str, index: &mut AstIdentIndex) {
+    let kind = node.kind();
+
+    // Subtrees whose textual contents look like identifiers but never name
+    // a variable use.
+    if is_ident_excluded_subtree(kind) {
+        return;
+    }
+
+    if is_ident_node_kind(kind) {
+        // Skip the callee position of a call expression: in `printf("%s", x)`,
+        // `printf` is an identifier but a function name, not a variable use.
+        if let Some(parent) = node.parent() {
+            let p_kind = parent.kind();
+            if matches!(p_kind, "call_expression" | "call") {
+                if let Some(func) = parent.child_by_field_name("function") {
+                    if func.id() == node.id() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Ok(text) = node.utf8_text(source.as_bytes()) {
+            if !text.is_empty() && !is_keyword(text) {
+                // tree-sitter rows are 0-indexed; our line numbers are 1-indexed.
+                let line = node.start_position().row + 1;
+                index.entry(line).or_default().insert(text.to_string());
+            }
+        }
+        // Identifier nodes have no children we care about.
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_idents(child, source, index);
+    }
+}
+
+/// Tree-sitter node kinds whose subtrees should never yield variable uses,
+/// across all the languages narsil parses. Covers literal/comment forms used
+/// by tree-sitter-c, tree-sitter-cpp, tree-sitter-rust, tree-sitter-python,
+/// tree-sitter-javascript, tree-sitter-typescript, tree-sitter-go,
+/// tree-sitter-java, tree-sitter-c-sharp, tree-sitter-kotlin,
+/// tree-sitter-ruby, tree-sitter-php, tree-sitter-swift.
+fn is_ident_excluded_subtree(kind: &str) -> bool {
+    matches!(
+        kind,
+        // string literals
+        "string_literal"
+            | "raw_string_literal"
+            | "byte_string_literal"
+            | "concatenated_string"
+            | "system_lib_string"
+            | "char_literal"
+            | "character_literal"
+            | "string"
+            | "interpreted_string_literal"
+            | "raw_string"
+            | "template_string"
+            | "string_content"
+            // comments
+            | "comment"
+            | "line_comment"
+            | "block_comment"
+            | "doc_comment"
+            // type names
+            | "type_identifier"
+    )
+}
+
+/// Tree-sitter node kinds that represent a single identifier reference.
+///
+/// Deliberately excludes `field_identifier` / `property_identifier` /
+/// `shorthand_property_identifier`: those name struct fields, class
+/// properties, or object keys — they are *never* a variable reference,
+/// whether they appear in a declaration (`int msg_control;`) or a use
+/// (`msg->msg_control`).
+fn is_ident_node_kind(kind: &str) -> bool {
+    matches!(kind, "identifier" | "variable_name")
+}
+
+/// Whether `text` contains `word` as a whole-word match — i.e., not abutted
+/// by another identifier character on either side. Used to disambiguate
+/// per-line identifier hits when a statement's truncated `text` slice may or
+/// may not actually mention an identifier the AST emitted for that line.
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() || text.len() < word.len() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let wb = word.as_bytes();
+    let mut i = 0;
+    while i + wb.len() <= bytes.len() {
+        if &bytes[i..i + wb.len()] == wb {
+            let before_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+            let after_ok = i + wb.len() == bytes.len() || !is_word_byte(bytes[i + wb.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Find all dead stores in a file
@@ -1513,6 +1697,82 @@ mod tests {
         assert!(uses.iter().any(|u| u.variable == "x"));
         assert!(uses.iter().any(|u| u.variable == "y"));
         assert!(uses.iter().any(|u| u.variable == "z"));
+    }
+
+    /// AST-driven Use extraction must not treat words inside string literals,
+    /// comments, or function callees as variable uses. This was the source of
+    /// hundreds of false positives from `find_uninitialized` on C source.
+    #[test]
+    fn test_ast_extraction_excludes_strings_comments_and_callees() {
+        let source = r#"
+int demo(int count) {
+    /* this could be a problem */
+    fprintf(stderr, "count=%d, could not parse\n", count);
+    return count;
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("load tree-sitter-c");
+        let tree = parser.parse(source, None).expect("parse C");
+
+        let idents = build_ast_ident_index(tree.root_node(), source);
+        let all: HashSet<&String> = idents.values().flatten().collect();
+
+        // The only genuine variable is `count`.
+        assert!(all.iter().any(|s| s.as_str() == "count"));
+
+        // Function callees: not variable uses.
+        assert!(!all.iter().any(|s| s.as_str() == "fprintf"));
+
+        // String-literal words and format specifiers: not variable uses.
+        assert!(!all.iter().any(|s| s.as_str() == "could"));
+        assert!(!all.iter().any(|s| s.as_str() == "not"));
+        assert!(!all.iter().any(|s| s.as_str() == "parse"));
+
+        // Comment words: not variable uses.
+        assert!(!all.iter().any(|s| s.as_str() == "problem"));
+
+        // `stderr` is technically an identifier expression — it IS extracted
+        // here. The "drop uses with no definition" sanity filter in a later
+        // patch removes uses of unknown globals like this.
+    }
+
+    /// Field-access target names (e.g., `msg_control` in `msg.msg_control`)
+    /// must not be reported as variable uses. The base identifier (`msg`) is.
+    #[test]
+    fn test_ast_extraction_excludes_field_targets() {
+        let source = r#"
+struct msghdr { int msg_control; };
+int demo(struct msghdr *msg) {
+    return msg->msg_control;
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("load tree-sitter-c");
+        let tree = parser.parse(source, None).expect("parse C");
+
+        let idents = build_ast_ident_index(tree.root_node(), source);
+        let all: HashSet<&String> = idents.values().flatten().collect();
+
+        assert!(all.iter().any(|s| s.as_str() == "msg"));
+        assert!(!all.iter().any(|s| s.as_str() == "msg_control"));
+    }
+
+    #[test]
+    fn test_contains_word_is_whole_word() {
+        assert!(super::contains_word("foo + bar", "foo"));
+        assert!(super::contains_word("foo + bar", "bar"));
+        assert!(super::contains_word("a = foo", "foo"));
+        // Substring matches must not count.
+        assert!(!super::contains_word("foobar", "foo"));
+        assert!(!super::contains_word("snprintf", "sprintf"));
+        assert!(!super::contains_word("my_foo_var", "foo"));
+        // Word at start / end.
+        assert!(super::contains_word("foo", "foo"));
     }
 
     #[test]
