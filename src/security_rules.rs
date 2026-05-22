@@ -547,6 +547,30 @@ pub struct Ruleset {
     pub rules: Vec<SecurityRule>,
 }
 
+/// Drop duplicate findings in-place. Two findings are considered duplicates
+/// if every field that identifies the matched location and the firing rule
+/// is identical: `(rule_id, file_path, line, column, snippet)`.
+///
+/// Why this is needed: several scanner paths can fire on the same code at
+/// the same location. Most commonly, a single taint flow used to be
+/// reported once per registered taint-flow rule (the per-rule vuln-kind
+/// filter in the previous patch fixes the worst of that, but the same flow
+/// can still legitimately match through different evaluation paths). Two
+/// *different* rules that match the same location are kept — different
+/// `rule_id` is a different finding.
+pub(crate) fn dedupe_findings(findings: &mut Vec<SecurityFinding>) {
+    let mut seen: HashSet<(String, String, usize, usize, String)> = HashSet::new();
+    findings.retain(|f| {
+        seen.insert((
+            f.rule_id.clone(),
+            f.file_path.clone(),
+            f.line,
+            f.column,
+            f.snippet.clone(),
+        ))
+    });
+}
+
 /// Security Rules Engine for scanning code
 pub struct SecurityRulesEngine {
     /// Loaded rules indexed by ID
@@ -745,6 +769,7 @@ impl SecurityRulesEngine {
             }
         }
 
+        dedupe_findings(&mut findings);
         // Sort by severity (Critical first)
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         findings
@@ -772,6 +797,7 @@ impl SecurityRulesEngine {
             }
         }
 
+        dedupe_findings(&mut findings);
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         findings
     }
@@ -798,6 +824,7 @@ impl SecurityRulesEngine {
             }
         }
 
+        dedupe_findings(&mut findings);
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         findings
     }
@@ -833,6 +860,7 @@ impl SecurityRulesEngine {
             findings.extend(rule_findings);
         }
 
+        dedupe_findings(&mut findings);
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         findings
     }
@@ -2347,6 +2375,41 @@ def search(request):
         assert!(findings
             .iter()
             .any(|f| f.cwe.contains(&"CWE-89".to_string())));
+    }
+
+    /// Findings sharing every identifying field — rule_id, file_path, line,
+    /// column, and snippet — collapse to a single entry. Two findings that
+    /// differ only in rule_id are kept separate.
+    #[test]
+    fn test_dedupe_findings_collapses_exact_duplicates_only() {
+        fn mk(rule_id: &str, line: usize) -> SecurityFinding {
+            SecurityFinding {
+                rule_id: rule_id.to_string(),
+                rule_name: format!("rule {rule_id}"),
+                severity: Severity::High,
+                confidence: Confidence::Medium,
+                file_path: "a.py".to_string(),
+                line,
+                column: 1,
+                end_line: line,
+                end_column: 10,
+                snippet: "foo".to_string(),
+                message: "msg".to_string(),
+                remediation: "fix".to_string(),
+                cwe: vec![],
+                owasp: vec![],
+                context: HashMap::new(),
+            }
+        }
+
+        let mut findings = vec![
+            mk("R-1", 10),
+            mk("R-1", 10), // exact duplicate of [0]
+            mk("R-2", 10), // same location, different rule — kept
+            mk("R-1", 11), // same rule, different line — kept
+        ];
+        super::dedupe_findings(&mut findings);
+        assert_eq!(findings.len(), 3);
     }
 
     /// Taint flows produced by the global analyzer must be attributed only
