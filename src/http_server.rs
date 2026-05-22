@@ -295,7 +295,12 @@ async fn mcp_streamable_handler(
             let id = Uuid::new_v4();
             let new_state = Arc::new(SessionState::new());
             state.streamable_sessions.insert(id, Arc::clone(&new_state));
-            debug!("Streamable HTTP session created: {}", id);
+            debug!(
+                "session opened (streamable): {} — active: sse={} streamable={}",
+                id,
+                state.sessions.len(),
+                state.streamable_sessions.len()
+            );
             (id, new_state)
         }
     };
@@ -359,7 +364,12 @@ async fn mcp_sse_handler(
             state: Arc::clone(&session_state),
         },
     );
-    debug!("SSE session opened: {}", session_id);
+    debug!(
+        "session opened (sse): {} — active: sse={} streamable={}",
+        session_id,
+        state.sessions.len(),
+        state.streamable_sessions.len()
+    );
 
     let sessions = Arc::clone(&state.sessions);
     let endpoint_url = format!("/mcp/message?sessionId={}", session_id);
@@ -380,8 +390,6 @@ async fn mcp_sse_handler(
         while let Some(json) = rx.recv().await {
             yield Ok(Event::default().data(json));
         }
-
-        debug!("SSE session ended: {}", session_id);
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(keepalive)))
@@ -396,6 +404,11 @@ struct SessionGuard {
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.sessions.remove(&self.id);
+        debug!(
+            "session closed (sse): {} — active sse={}",
+            self.id,
+            self.sessions.len()
+        );
     }
 }
 
