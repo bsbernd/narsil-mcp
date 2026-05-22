@@ -678,16 +678,32 @@ impl<'a> DfgAnalyzer<'a> {
     fn find_uninitialized_uses(&self) -> Vec<Use> {
         let mut uninitialized = Vec::new();
 
-        // Get function parameters - they are implicitly defined at function entry
-        let params: std::collections::HashSet<_> = self.cfg.parameters.iter().collect();
+        // Function parameters: implicitly defined at function entry.
+        let params: std::collections::HashSet<&String> = self.cfg.parameters.iter().collect();
+
+        // A genuine uninitialized-variable bug is "a variable that IS defined
+        // somewhere in this function, but the specific control-flow path to
+        // this use doesn't see the definition" (e.g. defined only on the
+        // `if` branch but used after the `if`). An identifier that has no
+        // definition anywhere in the function is either a global, an external
+        // symbol (errno, stderr), or — if we got it from the legacy
+        // tokenizer fallback — a parsing artifact. None of these are
+        // uninit-bug candidates, so omit them from the report.
+        let locally_defined: std::collections::HashSet<&String> =
+            self.definitions.iter().map(|d| &d.id.variable).collect();
 
         for use_ in &self.uses {
-            // Skip function parameters - they are implicitly defined
             if params.contains(&use_.variable) {
                 continue;
             }
 
-            // Check if any definition of this variable reaches this use
+            // Variable never defined or declared in this function — not an
+            // uninit bug candidate. Skip.
+            if !locally_defined.contains(&use_.variable) {
+                continue;
+            }
+
+            // Check if any definition of this variable reaches this use.
             let has_reaching_def = self.definitions.iter().any(|d| {
                 d.id.variable == use_.variable && self.definition_reaches_use(&d.id, use_)
             });
@@ -1760,6 +1776,43 @@ int demo(struct msghdr *msg) {
 
         assert!(all.iter().any(|s| s.as_str() == "msg"));
         assert!(!all.iter().any(|s| s.as_str() == "msg_control"));
+    }
+
+    /// Uses of symbols that are never defined or declared in the function
+    /// (typical case: globals like `stderr`, `errno`) must not be flagged as
+    /// uninitialized.
+    #[test]
+    fn test_uninitialized_skips_undeclared_globals() {
+        let source = r#"
+int demo(int count) {
+    fprintf(stderr, "count=%d\n", count);
+    return count;
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("load tree-sitter-c");
+        let tree = parser.parse(source, None).expect("parse C");
+
+        let analyses = super::analyze_file(&tree, source, "demo.c").expect("analyze");
+        let demo = analyses
+            .iter()
+            .find(|a| a.function_name == "demo")
+            .expect("found demo");
+
+        // `stderr` is an undefined-in-function global — must not appear in
+        // the uninitialized report. `count` is a parameter — also exempt.
+        for use_ in &demo.uninitialized_uses {
+            assert_ne!(
+                use_.variable, "stderr",
+                "stderr (undeclared global) should not be flagged as uninitialized"
+            );
+            assert_ne!(
+                use_.variable, "count",
+                "count (parameter) should not be flagged as uninitialized"
+            );
+        }
     }
 
     #[test]
