@@ -105,6 +105,11 @@ pub fn collect_allocation_sizes(
 
 fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr>) {
     match node.kind() {
+        "call_expression" => {
+            if let Some((destination, size)) = recognise_asprintf_call(node, source) {
+                out.insert(destination, size);
+            }
+        }
         "declaration" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -158,6 +163,106 @@ fn extract_lhs_name(node: Node<'_>, source: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Recognise an `asprintf(&dest, fmt, args...)` or
+/// `vasprintf(&dest, fmt, va_list)` call and return the destination's
+/// source text together with the [`SizeExpr`] the call allocates.
+///
+/// `asprintf` writes the formatted output plus a NUL terminator into
+/// a freshly malloc'd buffer. So the allocation is exactly
+/// `write_size_of_format(fmt, args) + 1` bytes — assuming the format
+/// is fully modelled. `vasprintf` takes a `va_list` whose contents
+/// the analyser cannot inspect, so it always returns `Unknown` while
+/// still recording the destination so downstream code knows the
+/// buffer exists.
+///
+/// Returns `None` if the call is not asprintf/vasprintf, if the first
+/// argument is not an address-of expression, or if (for asprintf) the
+/// format string is not a plain literal that can be decoded.
+fn recognise_asprintf_call(call: Node<'_>, source: &str) -> Option<(String, SizeExpr)> {
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    if function_name != "asprintf" && function_name != "vasprintf" {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .collect();
+    if argument_nodes.len() < 2 {
+        return None;
+    }
+
+    let destination = extract_address_of_target(argument_nodes[0], source)?;
+
+    if function_name == "vasprintf" {
+        // The format args come from a va_list — opaque to us — and
+        // even a literal format can't be combined with unknown args.
+        // Skip format extraction so we still record the destination.
+        return Some((destination, SizeExpr::Unknown));
+    }
+
+    let format = extract_string_literal_content(argument_nodes[1], source)?;
+
+    let argument_names: Vec<String> = argument_nodes[2..]
+        .iter()
+        .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+        .collect();
+
+    let written = write_size_of_format(&format, &argument_names);
+    Some((destination, written.plus_constant(1)))
+}
+
+/// If `node` represents `&expr`, return the source text of `expr`.
+/// Otherwise return `None`. Falls back to a leading-`&` text strip so
+/// it works across tree-sitter-c versions that disagree on the
+/// `pointer_expression` vs `unary_expression` node kind for `&`.
+fn extract_address_of_target(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node.utf8_text(source.as_bytes()).ok()?.trim();
+    let stripped = text.strip_prefix('&')?.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+/// Decode the contents of a `string_literal` node into the byte
+/// sequence the C compiler would see. Returns `None` if the literal
+/// contains an escape sequence we do not know how to decode — that
+/// preserves the analyser's "miss rather than misreport" stance.
+fn extract_string_literal_content(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "string_literal" {
+        return None;
+    }
+    let mut decoded = String::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_content" => {
+                decoded.push_str(child.utf8_text(source.as_bytes()).ok()?);
+            }
+            "escape_sequence" => {
+                let raw = child.utf8_text(source.as_bytes()).ok()?;
+                let replacement = match raw {
+                    "\\n" => "\n",
+                    "\\t" => "\t",
+                    "\\r" => "\r",
+                    "\\0" => "\0",
+                    "\\\\" => "\\",
+                    "\\\"" => "\"",
+                    _ => return None,
+                };
+                decoded.push_str(replacement);
+            }
+            "\"" => {}
+            _ => return None,
+        }
+    }
+    Some(decoded)
 }
 
 fn recognise_allocator_call(node: Node<'_>, source: &str) -> Option<SizeExpr> {
@@ -714,6 +819,85 @@ mod tests {
         let code = "void f(void) { char *p = malloc(0x100UL); }";
         let allocations = allocations_in(code);
         assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(256)));
+    }
+
+    /// Canonical under-sized allocation: `asprintf(&result, "%s", name)`
+    /// allocates strlen(name) + 1 bytes — exactly enough for the
+    /// formatted output and the NUL terminator. That allocation is
+    /// the buffer a later sprintf with extra prefix bytes would
+    /// overflow.
+    #[test]
+    fn recognise_asprintf_with_single_percent_s_yields_strlen_plus_nul() {
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    void f(const char *name) {\n\
+                        char *result;\n\
+                        asprintf(&result, \"%s\", name);\n\
+                    }";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("result"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_asprintf_into_struct_field() {
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    struct dst { char *buf; };\n\
+                    void f(struct dst *dst, const char *x) {\n\
+                        asprintf(&dst->buf, \"%s\", x);\n\
+                    }";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("dst->buf"), Some(&expected));
+    }
+
+    #[test]
+    fn vasprintf_destination_size_is_unknown() {
+        let code = "int vasprintf(char **, const char *, void *);\n\
+                    void f(const char *fmt, void *ap) {\n\
+                        char *result;\n\
+                        vasprintf(&result, fmt, ap);\n\
+                    }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("result"), Some(&SizeExpr::Unknown));
+    }
+
+    #[test]
+    fn asprintf_with_unmodeled_directive_is_unknown_via_format_parser() {
+        // %d propagates Unknown through write_size_of_format, and
+        // plus_constant(1) keeps it Unknown.
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    void f(int n) {\n\
+                        char *result;\n\
+                        asprintf(&result, \"n=%d\", n);\n\
+                    }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("result"), Some(&SizeExpr::Unknown));
+    }
+
+    #[test]
+    fn asprintf_without_address_of_first_argument_is_skipped() {
+        // If the destination isn't &something, we cannot key the size
+        // back to a variable — skip rather than guess.
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    void f(char **outptr, const char *x) {\n\
+                        asprintf(outptr, \"%s\", x);\n\
+                    }";
+        let allocations = allocations_in(code);
+        assert!(allocations.is_empty());
+    }
+
+    #[test]
+    fn asprintf_with_newline_in_format_counts_one_byte_per_escape() {
+        // \n is one byte after decoding — the analyser must match.
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    void f(const char *x) {\n\
+                        char *result;\n\
+                        asprintf(&result, \"%s\\n\", x);\n\
+                    }";
+        let allocations = allocations_in(code);
+        // strlen(x) + 1 byte newline + 1 byte NUL
+        let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(2));
+        assert_eq!(allocations.get("result"), Some(&expected));
     }
 
     #[test]
