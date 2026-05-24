@@ -308,3 +308,83 @@ async fn test_check_type_errors_accepts_directory_path() {
     assert!(result.contains("**Files analyzed**: 1"));
     assert!(result.contains("**Functions analyzed**: 1"));
 }
+
+/// End-to-end fixture exercising the CWE-122 heap-overflow rule.
+///
+/// Loads tests/fixtures/heap_size/canonical_overflows.c, runs the
+/// security-rules engine over it, and asserts that every function
+/// marked OVERFLOW emits a finding while every function marked CLEAN
+/// does not. The fixture deliberately mixes allocator kinds (malloc,
+/// asprintf, calloc, strdup, strndup, cross-function helper) and
+/// writer kinds (sprintf, strcpy, strcat, memcpy, memset) so a
+/// regression in any one path surfaces here.
+#[test]
+fn test_heap_size_canonical_overflows_fixture() {
+    use narsil_mcp::security_rules::SecurityRulesEngine;
+
+    let code = include_str!("fixtures/heap_size/canonical_overflows.c");
+    let engine = SecurityRulesEngine::new();
+    let findings = engine.scan(code, "canonical_overflows.c", "c");
+
+    let overflow_findings: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.rule_id == "CWE-122-001")
+        .collect();
+
+    let fired_in_snippets: Vec<&str> = overflow_findings
+        .iter()
+        .map(|finding| finding.snippet.as_str())
+        .collect();
+
+    // Every OVERFLOW-marked function must produce exactly one finding,
+    // identifiable by a substring of its write call.
+    let expected_overflow_substrings = [
+        ("overflow_malloc_strcpy", "very long literal"),
+        ("overflow_asprintf_then_sprintf", "prefix, name"),
+        ("overflow_calloc_memset", "memset(dst, 0, 40)"),
+        ("overflow_strdup_then_sprintf", "name, name"),
+        ("overflow_through_helper", "strcpy(dst, user_input)"),
+    ];
+    for (function_label, expected_substring) in expected_overflow_substrings {
+        let count = fired_in_snippets
+            .iter()
+            .filter(|snippet| snippet.contains(expected_substring))
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one CWE-122-001 finding for {} (looking for snippet containing {:?}); \
+             got fired snippets {:?}",
+            function_label, expected_substring, fired_in_snippets,
+        );
+    }
+
+    // CLEAN functions must not fire. Match by substring from each
+    // clean function's call site.
+    let forbidden_substrings = [
+        ("clean_malloc_strcpy", "strcpy(dst, name)"),
+        ("clean_calloc_memcpy", "memcpy(dst, src, 16)"),
+        ("clean_strndup_then_strcpy", "thirteen0000"),
+    ];
+    for (function_label, forbidden_substring) in forbidden_substrings {
+        assert!(
+            !fired_in_snippets
+                .iter()
+                .any(|snippet| snippet.contains(forbidden_substring)),
+            "CWE-122-001 must not fire on the {} clean case; \
+             saw a snippet containing {:?} in fired list {:?}",
+            function_label,
+            forbidden_substring,
+            fired_in_snippets,
+        );
+    }
+
+    // Total firing count must equal the OVERFLOW arm size — guards
+    // against a future regression that adds a spurious finding
+    // elsewhere in the fixture.
+    assert_eq!(
+        overflow_findings.len(),
+        expected_overflow_substrings.len(),
+        "unexpected total CWE-122-001 count; fired snippets: {:?}",
+        fired_in_snippets,
+    );
+}
