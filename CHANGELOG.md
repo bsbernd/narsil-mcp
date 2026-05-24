@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scan_security` + `check_owasp_top10` + `check_cwe_top25` by hand.
   The accompanying `/security-audit` skill documents when to reach
   for the aggregator vs. the individual tools.
+- **Partial CWE-680 (integer-overflow-to-buffer) detection**. Two
+  new rules cover the most common shapes: **CWE-680-001** fires on
+  literal-constant arithmetic in allocator size arguments that
+  provably wraps u64 (`calloc(0xFFFFFFFFFFFFFFFF, 2)`,
+  `malloc(0xFFFFFFFFFFFFFFFF + 1)`, etc.); **CWE-680-002** fires on
+  the structural exploit shape `malloc(n * sizeof(T))` /
+  `calloc(n, sizeof(T))` where `n` is not a compile-time constant.
+  Both rules are **PARTIAL** by design — they have no value-range
+  analysis, no taint, and no inter-procedural reasoning. The
+  caveat is carried verbatim in every emitted finding's `message`
+  field so AI callers reading the output understand a clean scan
+  does not prove the file free of CWE-680 bugs.
 
 ## [1.7.0] - 2026-05-12
 

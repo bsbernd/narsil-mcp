@@ -29,8 +29,29 @@ repositories and ask which one to audit.
 
 - Pattern rules (CWE Top 25 + OWASP Top 10 + any custom ruleset YAML)
 - Symbolic heap-overflow detection (CWE-122) for C and C++
+- Partial integer-overflow-to-buffer detection (CWE-680) for C and C++
 - Taint-flow analysis with unsanitised source-to-sink flows folded into
   the unified findings list
+
+## Partial-coverage rules — important caveats
+
+Some rules in the audit are partial by design. The rule's `message`
+field always carries the caveat verbatim, but it is worth surfacing
+the limitations up front when you summarise the output to a user:
+
+- **CWE-680-001** (literal-constant wraparound): fires only when an
+  allocator's size arithmetic uses literal operands that provably
+  wrap u64. Cannot reason about non-literal operands. A clean scan
+  does **not** prove the file is free of CWE-680.
+- **CWE-680-002** (variable × sizeof(T)): fires on the structural
+  exploit shape but has no value-range analysis and does not follow
+  helper calls. May miss bugs where bounds checking happens in a
+  caller or via a wrapper; may false-flag safe code whose bounds
+  check happens elsewhere.
+
+When you report a clean CWE-680 result to a user, say so explicitly:
+"no CWE-680 findings — but the rule is partial; a separate audit is
+warranted for high-risk allocator code paths."
 
 Reach for the individual tools when you need a *narrower* answer than
 the audit gives you, or when you want to drill into one specific

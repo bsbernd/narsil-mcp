@@ -309,6 +309,102 @@ async fn test_check_type_errors_accepts_directory_path() {
     assert!(result.contains("**Functions analyzed**: 1"));
 }
 
+/// End-to-end fixture for the CWE-680 integer-overflow-to-buffer
+/// rules. CWE-680 detection in this engine is **partial** — patches
+/// 21 and 22 cover literal-constant wraparound (CWE-680-001) and
+/// the `var * sizeof(T)` shape (CWE-680-002), respectively. This
+/// test asserts those two arms fire on the right call sites and
+/// nothing else, and that the message carries the partial-coverage
+/// caveat so AI callers reading the output see the limitation
+/// without having to read source.
+#[test]
+fn test_heap_size_cwe680_shapes_fixture() {
+    use narsil_mcp::security_rules::SecurityRulesEngine;
+
+    let code = include_str!("fixtures/heap_size/cwe680_shapes.c");
+    let engine = SecurityRulesEngine::new();
+    let findings = engine.scan(code, "cwe680_shapes.c", "c");
+
+    let cwe680_findings: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.rule_id.starts_with("CWE-680-"))
+        .collect();
+
+    let fired: Vec<(&str, &str)> = cwe680_findings
+        .iter()
+        .map(|finding| (finding.rule_id.as_str(), finding.snippet.as_str()))
+        .collect();
+
+    // Three WRAP cases must fire CWE-680-001.
+    let wrap_calls = [
+        "malloc(0xFFFFFFFFFFFFFFFF * 2)",
+        "malloc(0xFFFFFFFFFFFFFFFF + 1)",
+        "calloc(0xFFFFFFFFFFFFFFFF, 2)",
+    ];
+    for needle in wrap_calls {
+        assert!(
+            fired
+                .iter()
+                .any(|(id, snippet)| *id == "CWE-680-001" && snippet.contains(needle)),
+            "expected CWE-680-001 finding containing {:?}; fired list: {:?}",
+            needle,
+            fired,
+        );
+    }
+
+    // Three SIZEOF cases must fire CWE-680-002.
+    let sizeof_calls = [
+        "malloc(n * sizeof(struct record))",
+        "malloc(sizeof(int) * n)",
+        "calloc(n, sizeof(struct record))",
+    ];
+    for needle in sizeof_calls {
+        assert!(
+            fired
+                .iter()
+                .any(|(id, snippet)| *id == "CWE-680-002" && snippet.contains(needle)),
+            "expected CWE-680-002 finding containing {:?}; fired list: {:?}",
+            needle,
+            fired,
+        );
+    }
+
+    // CLEAN cases must not fire either CWE-680-001 or CWE-680-002.
+    let forbidden = [
+        "malloc(4 * sizeof(int))",
+        "calloc(8, sizeof(int))",
+        "malloc(n * 4)",
+    ];
+    for needle in forbidden {
+        assert!(
+            !fired.iter().any(|(_, snippet)| snippet.contains(needle)),
+            "CWE-680 must not fire on {:?}; fired list: {:?}",
+            needle,
+            fired,
+        );
+    }
+
+    // Every emitted finding must carry the partial-coverage caveat
+    // — AI callers reading the message must see "PARTIAL check".
+    for finding in &cwe680_findings {
+        assert!(
+            finding.message.contains("PARTIAL check"),
+            "CWE-680 finding missing partial-coverage caveat; rule={} message={}",
+            finding.rule_id,
+            finding.message,
+        );
+    }
+
+    // Total count guards against silent regressions adding a stray
+    // finding elsewhere in the fixture.
+    assert_eq!(
+        cwe680_findings.len(),
+        6,
+        "expected 6 CWE-680 findings (3 WRAP + 3 SIZEOF); got {:?}",
+        fired,
+    );
+}
+
 /// End-to-end fixture exercising the CWE-122 heap-overflow rule.
 ///
 /// Loads tests/fixtures/heap_size/canonical_overflows.c, runs the
