@@ -96,7 +96,7 @@ pub fn collect_write_sites(function_body: Node<'_>, source: &str) -> Vec<WriteSi
 
 fn collect_writes_into(node: Node<'_>, source: &str, out: &mut Vec<WriteSite>) {
     if node.kind() == "call_expression" {
-        if let Some(write_site) = recognise_sprintf_call(node, source) {
+        if let Some(write_site) = recognise_write_call(node, source) {
             out.push(write_site);
         }
     }
@@ -106,57 +106,121 @@ fn collect_writes_into(node: Node<'_>, source: &str, out: &mut Vec<WriteSite>) {
     }
 }
 
-/// Recognise `sprintf(dest, fmt, args...)` or
-/// `vsprintf(dest, fmt, va_list)` and return its [`WriteSite`].
+/// Recognise a string-writing call and return its [`WriteSite`].
 ///
-/// sprintf writes the formatted output plus the trailing NUL, so the
-/// write size is `write_size_of_format(fmt, args) + 1`. vsprintf draws
-/// from an opaque `va_list` and is recorded with `SizeExpr::Unknown`.
-/// Destinations that are not a plain identifier or field reference
-/// are skipped — we have no stable name to compare allocation against.
-fn recognise_sprintf_call(call: Node<'_>, source: &str) -> Option<WriteSite> {
+/// The destination must be a plain identifier or field reference; if
+/// it isn't we have no stable name to compare against the allocation
+/// map and we skip the call.
+///
+/// Modelled calls (all write sizes include any implicit NUL the C
+/// library writes — i.e. the total buffer footprint, so the rule can
+/// compare a single `write_size` against a single allocation size):
+///
+/// * `sprintf(dst, fmt, …)` → `write_size_of_format(fmt, args) + 1`
+/// * `vsprintf(dst, fmt, va_list)` → `Unknown` (opaque va_list)
+/// * `strcpy(dst, src)` → `string_source_size(src) + 1`
+/// * `strncpy(dst, src, n)` → `parse_size_expression(n)` (no NUL guarantee)
+/// * `strcat(dst, src)` → `StrlenOf(dst) + StrlenOf(src) + 1` (total
+///   footprint after the append; the buffer must hold this many bytes)
+/// * `memcpy(dst, src, n)` → `parse_size_expression(n)`
+/// * `memmove(dst, src, n)` → `parse_size_expression(n)`
+/// * `memset(dst, c, n)` → `parse_size_expression(n)`
+fn recognise_write_call(call: Node<'_>, source: &str) -> Option<WriteSite> {
     let function_name = call
         .child_by_field_name("function")?
         .utf8_text(source.as_bytes())
         .ok()?;
-    if function_name != "sprintf" && function_name != "vsprintf" {
-        return None;
-    }
 
     let arguments = call.child_by_field_name("arguments")?;
     let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
         .filter_map(|idx| arguments.named_child(idx))
         .collect();
-    if argument_nodes.len() < 2 {
+    if argument_nodes.is_empty() {
         return None;
     }
 
-    let destination_node = argument_nodes[0];
-    let destination = match destination_node.kind() {
-        "identifier" | "field_expression" => destination_node
-            .utf8_text(source.as_bytes())
-            .ok()?
-            .to_string(),
+    let destination = extract_simple_destination(argument_nodes[0], source)?;
+
+    let write_size = match function_name {
+        "sprintf" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            let format = extract_string_literal_content(argument_nodes[1], source)?;
+            let argument_names: Vec<String> = argument_nodes[2..]
+                .iter()
+                .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+                .collect();
+            write_size_of_format(&format, &argument_names).plus_constant(1)
+        }
+        "vsprintf" => SizeExpr::Unknown,
+        "strcpy" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            string_source_size(argument_nodes[1], source).plus_constant(1)
+        }
+        "strncpy" => {
+            if argument_nodes.len() < 3 {
+                return None;
+            }
+            parse_size_expression(argument_nodes[2], source)
+        }
+        "strcat" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            // strcat writes at offset strlen(dst), so the buffer must
+            // hold strlen(dst) + strlen(src) + 1. Encode the required
+            // footprint as the write size so the overflow rule needs
+            // only one comparison against the allocation size.
+            let dst_footprint = string_source_size(argument_nodes[0], source);
+            let src_footprint = string_source_size(argument_nodes[1], source);
+            dst_footprint.add(src_footprint).plus_constant(1)
+        }
+        "memcpy" | "memmove" | "memset" => {
+            if argument_nodes.len() < 3 {
+                return None;
+            }
+            parse_size_expression(argument_nodes[2], source)
+        }
         _ => return None,
     };
 
-    if function_name == "vsprintf" {
-        return Some(WriteSite {
-            destination,
-            write_size: SizeExpr::Unknown,
-        });
-    }
-
-    let format = extract_string_literal_content(argument_nodes[1], source)?;
-    let argument_names: Vec<String> = argument_nodes[2..]
-        .iter()
-        .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_string())
-        .collect();
-    let written = write_size_of_format(&format, &argument_names);
     Some(WriteSite {
         destination,
-        write_size: written.plus_constant(1),
+        write_size,
     })
+}
+
+/// Source text of `node` if it is a plain identifier or field
+/// reference, else `None`. Used to key allocation lookups by the same
+/// string the allocation map uses.
+fn extract_simple_destination(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_expression" => {
+            node.utf8_text(source.as_bytes()).ok().map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+/// Bound on the length (in bytes, not counting NUL) of a string
+/// argument to a `str*` call. Identifiers and field references emit
+/// `StrlenOf(text)`; string literals collapse to the literal's
+/// byte length. Anything else is `Unknown`.
+fn string_source_size(node: Node<'_>, source: &str) -> SizeExpr {
+    match node.kind() {
+        "identifier" | "field_expression" => node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(|text| SizeExpr::StrlenOf(text.to_string()))
+            .unwrap_or(SizeExpr::Unknown),
+        "string_literal" => extract_string_literal_content(node, source)
+            .map(|content| SizeExpr::Constant(content.len() as u64))
+            .unwrap_or(SizeExpr::Unknown),
+        _ => SizeExpr::Unknown,
+    }
 }
 
 /// Walk a C function body and return a map from each allocation
@@ -1259,6 +1323,111 @@ mod tests {
         let code = "int sprintf(char *, const char *, ...);\n\
                     void f(char *bufs[], const char *x) {\n\
                         sprintf(bufs[0], \"%s\", x);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn strcpy_with_identifier_source_yields_strlen_plus_nul() {
+        let code = "char *strcpy(char *, const char *);\n\
+                    void f(char *buf, const char *name) {\n\
+                        strcpy(buf, name);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(sites[0].write_size, expected);
+    }
+
+    #[test]
+    fn strcpy_with_string_literal_source_uses_literal_length_plus_nul() {
+        // "hello" is five bytes; the NUL makes six.
+        let code = "char *strcpy(char *, const char *);\n\
+                    void f(char *buf) {\n\
+                        strcpy(buf, \"hello\");\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].write_size, SizeExpr::Constant(6));
+    }
+
+    #[test]
+    fn strncpy_with_literal_count_uses_constant_size() {
+        let code = "char *strncpy(char *, const char *, unsigned long);\n\
+                    void f(char *buf, const char *name) {\n\
+                        strncpy(buf, name, 64);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        // strncpy writes exactly n bytes; no NUL guarantee.
+        assert_eq!(sites[0].write_size, SizeExpr::Constant(64));
+    }
+
+    #[test]
+    fn strncpy_with_variable_count_is_unknown() {
+        let code = "char *strncpy(char *, const char *, unsigned long);\n\
+                    void f(char *buf, const char *name, unsigned long n) {\n\
+                        strncpy(buf, name, n);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].write_size, SizeExpr::Unknown);
+    }
+
+    #[test]
+    fn strcat_models_dst_plus_src_plus_nul_as_required_footprint() {
+        let code = "char *strcat(char *, const char *);\n\
+                    void f(char *buf, const char *name) {\n\
+                        strcat(buf, name);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        let expected = SizeExpr::StrlenOf("buf".into())
+            .add(SizeExpr::StrlenOf("name".into()))
+            .add(SizeExpr::Constant(1));
+        assert_eq!(sites[0].write_size, expected);
+    }
+
+    #[test]
+    fn memcpy_with_literal_count_uses_constant_size() {
+        let code = "void *memcpy(void *, const void *, unsigned long);\n\
+                    void f(char *buf, const char *src) {\n\
+                        memcpy(buf, src, 128);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].write_size, SizeExpr::Constant(128));
+    }
+
+    #[test]
+    fn memmove_with_strlen_plus_one_uses_symbolic_size() {
+        let code = "void *memmove(void *, const void *, unsigned long);\n\
+                    void f(char *buf, const char *name) {\n\
+                        memmove(buf, name, strlen(name) + 1);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(sites[0].write_size, expected);
+    }
+
+    #[test]
+    fn memset_records_count_as_write_size() {
+        let code = "void *memset(void *, int, unsigned long);\n\
+                    void f(char *buf) {\n\
+                        memset(buf, 0, 32);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].write_size, SizeExpr::Constant(32));
+    }
+
+    #[test]
+    fn unrecognised_write_call_is_not_recorded() {
+        let code = "void *my_write(char *, const char *);\n\
+                    void f(char *buf, const char *src) {\n\
+                        my_write(buf, src);\n\
                     }";
         let sites = write_sites_in(code);
         assert!(sites.is_empty());
