@@ -2166,6 +2166,62 @@ pub struct SuggestedFix {
 
 // Helper functions
 
+/// Project an unsanitised taint flow into the engine's
+/// [`SecurityFinding`] shape so `scan_security` can return taint
+/// findings alongside pattern findings without forcing the caller to
+/// run `trace_taint` and `get_taint_sources` separately.
+///
+/// Returns `None` when the flow is sanitised or carries no
+/// vulnerability classification — sanitised flows are informational
+/// only and unclassified flows have no meaningful CWE/severity to
+/// report.
+pub fn taint_flow_to_security_finding(flow: &crate::taint::TaintFlow) -> Option<SecurityFinding> {
+    if flow.is_sanitized {
+        return None;
+    }
+    let vulnerability = flow.vulnerability.as_ref()?;
+    let display_name = vulnerability.display_name().to_string();
+    let mut cwe = Vec::new();
+    if let Some(cwe_id) = vulnerability.cwe_id() {
+        cwe.push(cwe_id.to_string());
+    }
+    let mut owasp = Vec::new();
+    if let Some(category) = vulnerability.owasp_category() {
+        owasp.push(category.to_string());
+    }
+    let rule_id_suffix = display_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    Some(SecurityFinding {
+        rule_id: format!("TAINT-{}", rule_id_suffix),
+        rule_name: format!("Tainted {} sink", display_name),
+        severity: flow.severity.unwrap_or(Severity::Medium),
+        confidence: flow.confidence,
+        file_path: flow.sink.file_path.clone(),
+        line: flow.sink.line,
+        column: 1,
+        end_line: flow.sink.line,
+        end_column: 1,
+        snippet: flow.sink.code.clone(),
+        message: format!(
+            "Tainted data from {} reaches {} sink without sanitisation",
+            flow.source.kind.display_name(),
+            flow.sink.function,
+        ),
+        remediation: "Sanitise or validate input before it reaches this sink".to_string(),
+        cwe,
+        owasp,
+        context: HashMap::new(),
+    })
+}
+
 /// Project a heap-size analyser finding into the engine's
 /// [`SecurityFinding`] shape, carrying the symbolic size comparison in
 /// the human-readable message so explain/UI surfaces show the WHY.
@@ -2764,6 +2820,103 @@ strcpy(dest, src);
             "CWE-787-001 must be indexed in cwe_top25_rules; \
              otherwise scan_cwe_top25 cannot find it"
         );
+    }
+
+    /// A tainted flow must project into a SecurityFinding that
+    /// reports the sink location (not the source) and carries the
+    /// vulnerability's CWE and severity verbatim. This is what
+    /// `scan_security` consumes to fold taint output into its
+    /// unified findings list.
+    #[test]
+    fn test_taint_flow_to_security_finding_projects_sink_location_and_cwe() {
+        use crate::taint::types::{SinkKind, SourceKind, TaintSink};
+        use crate::taint::{
+            Confidence as TaintConfidence, TaintFlow, TaintSource, VulnerabilityKind,
+        };
+
+        let flow = TaintFlow {
+            id: "flow-1".to_string(),
+            source: TaintSource {
+                id: "src-1".to_string(),
+                kind: SourceKind::UserInput {
+                    input_type: "request_arg".to_string(),
+                },
+                file_path: "vuln.py".to_string(),
+                line: 3,
+                variable: "user_id".to_string(),
+                code: "user_id = request.args.get('id')".to_string(),
+                confidence: TaintConfidence::High,
+            },
+            sink: TaintSink {
+                id: "sink-1".to_string(),
+                kind: SinkKind::SqlQuery,
+                file_path: "vuln.py".to_string(),
+                line: 7,
+                function: "execute".to_string(),
+                code: "cursor.execute(query)".to_string(),
+                dangerous_arg: 0,
+            },
+            path: Vec::new(),
+            sanitizers: Vec::new(),
+            vulnerability: Some(VulnerabilityKind::SqlInjection),
+            severity: Some(Severity::High),
+            confidence: TaintConfidence::High,
+            is_sanitized: false,
+        };
+
+        let finding = taint_flow_to_security_finding(&flow).expect("vulnerable flow projects");
+        assert_eq!(
+            finding.line, 7,
+            "finding must point at the sink, not the source"
+        );
+        assert_eq!(finding.file_path, "vuln.py");
+        assert!(finding.rule_id.starts_with("TAINT-"));
+        assert_eq!(finding.severity, Severity::High);
+        assert!(finding.cwe.iter().any(|c| c == "CWE-89"));
+        assert!(finding.message.contains("execute"));
+    }
+
+    /// Sanitised flows are informational only and must not surface
+    /// as findings — folding them into scan_security would produce
+    /// noise for code that already does the right thing.
+    #[test]
+    fn test_taint_flow_to_security_finding_skips_sanitised_flow() {
+        use crate::taint::types::{SinkKind, SourceKind, TaintSink};
+        use crate::taint::{
+            Confidence as TaintConfidence, TaintFlow, TaintSource, VulnerabilityKind,
+        };
+
+        let flow = TaintFlow {
+            id: "flow-2".to_string(),
+            source: TaintSource {
+                id: "src-1".to_string(),
+                kind: SourceKind::UserInput {
+                    input_type: "request_arg".to_string(),
+                },
+                file_path: "ok.py".to_string(),
+                line: 1,
+                variable: "x".to_string(),
+                code: "x = request.args.get('x')".to_string(),
+                confidence: TaintConfidence::High,
+            },
+            sink: TaintSink {
+                id: "sink-1".to_string(),
+                kind: SinkKind::SqlQuery,
+                file_path: "ok.py".to_string(),
+                line: 3,
+                function: "execute".to_string(),
+                code: "cursor.execute(query, (x,))".to_string(),
+                dangerous_arg: 0,
+            },
+            path: Vec::new(),
+            sanitizers: Vec::new(),
+            vulnerability: Some(VulnerabilityKind::SqlInjection),
+            severity: Some(Severity::High),
+            confidence: TaintConfidence::High,
+            is_sanitized: true,
+        };
+
+        assert!(taint_flow_to_security_finding(&flow).is_none());
     }
 
     /// The CWE-122-001 rule is symbolic, not pattern-based, so it

@@ -5194,6 +5194,34 @@ impl CodeIntelEngine {
             .filter(|f| f.severity >= min_severity)
             .collect();
 
+        // Fold in the taint analyser's output so the caller does not
+        // need a separate trace_taint / get_taint_sources pass: every
+        // unsanitised flow becomes a TAINT-* finding alongside the
+        // pattern matches. Skip when a tag-filtered ruleset is in
+        // effect — the caller asked for a specific tag set, and
+        // taint flows are not currently tagged.
+        if ruleset_tags.is_none() {
+            for (file_path, content) in &files {
+                let file_str = file_path.to_string_lossy();
+                let scan_content = if exclude_tests {
+                    strip_inline_test_code(&file_str, content)
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                let analysis = crate::taint::analyze_code(scan_content.as_ref(), &file_str);
+                for flow in &analysis.vulnerabilities {
+                    if let Some(finding) =
+                        crate::security_rules::taint_flow_to_security_finding(flow)
+                    {
+                        if finding.severity >= min_severity {
+                            findings.push(finding);
+                        }
+                    }
+                }
+            }
+            crate::security_rules::dedupe_findings(&mut findings);
+        }
+
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         // Phase C2: Apply pagination (offset and limit)
