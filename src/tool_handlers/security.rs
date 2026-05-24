@@ -168,6 +168,29 @@ impl ToolHandler for ExplainVulnerabilityHandler {
     }
 }
 
+/// Handler for security_audit tool — aggregates every security pass
+/// the engine supports into a single report so callers do not need
+/// to chain scan_security, taint analysis, and heap-overflow checks
+/// by hand.
+pub struct SecurityAuditHandler;
+
+#[async_trait::async_trait]
+impl ToolHandler for SecurityAuditHandler {
+    fn name(&self) -> &'static str {
+        "security_audit"
+    }
+
+    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
+        let repo = args.get_str("repo").unwrap_or("");
+        let path = args.get_str("path");
+        let severity_threshold = args.get_str("severity_threshold");
+        let exclude_tests = args.get_bool("exclude_tests");
+        engine
+            .security_audit(repo, path, severity_threshold, exclude_tests)
+            .await
+    }
+}
+
 /// Handler for suggest_fix tool
 pub struct SuggestFixHandler;
 

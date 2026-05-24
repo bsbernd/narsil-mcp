@@ -124,6 +124,7 @@ impl ToolRegistry {
 
         // Register security handlers
         registry.register(Box::new(security::ScanSecurityHandler));
+        registry.register(Box::new(security::SecurityAuditHandler));
         registry.register(Box::new(security::CheckOwaspTop10Handler));
         registry.register(Box::new(security::CheckCweTop25Handler));
         registry.register(Box::new(security::FindInjectionVulnerabilitiesHandler));

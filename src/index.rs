@@ -5097,6 +5097,67 @@ impl CodeIntelEngine {
     // Phase 4: Security Rules Engine
     // ========================================================================
 
+    /// Run every security pass the engine supports and assemble a
+    /// single audit report. The aggregator is a thin wrapper: it
+    /// delegates the heavy lifting to `scan_security` (which already
+    /// folds pattern matches, the symbolic CWE-122 heap-overflow
+    /// pass, and unsanitised taint flows into one severity-ordered
+    /// list) and prefixes the result with a summary panel built from
+    /// `get_security_summary`.
+    ///
+    /// Callers were previously expected to chain those tools by
+    /// hand. Having a single audit entry point makes the
+    /// "is this codebase healthy?" question one round trip and
+    /// guarantees the aggregated findings are deduplicated against
+    /// each other rather than against whatever the user happens to
+    /// have called.
+    pub async fn security_audit(
+        &self,
+        repo_name: &str,
+        path: Option<&str>,
+        severity_threshold: Option<&str>,
+        exclude_tests: Option<bool>,
+    ) -> Result<String> {
+        let scan_output = self
+            .scan_security(
+                repo_name,
+                SecurityScanOptions {
+                    path,
+                    severity_threshold,
+                    ruleset: None,
+                    exclude_tests,
+                    max_findings: None,
+                    offset: None,
+                },
+            )
+            .await?;
+
+        let summary_output = self
+            .get_security_summary(repo_name, exclude_tests)
+            .await
+            .ok();
+
+        let mut output = String::from("# Security Audit\n\n");
+        output.push_str("Aggregated report from every security pass the engine supports:\n\n");
+        output.push_str("- Pattern rules (CWE Top 25 + OWASP Top 10 + custom rulesets)\n");
+        output.push_str("- Symbolic heap-overflow detection (CWE-122)\n");
+        output.push_str("- Taint-flow analysis (sources → sinks, unsanitised only)\n\n");
+
+        if let Some(summary) = summary_output {
+            output.push_str("## At a Glance\n\n");
+            output.push_str(&summary);
+            if !summary.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+
+        output.push_str("## Detailed Findings\n\n");
+        output.push_str(&scan_output);
+
+        Ok(output)
+    }
+
     /// Scan repository for security issues using the security rules engine
     ///
     /// Phase C2: Added `max_findings` and `offset` parameters for pagination.

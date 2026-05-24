@@ -1172,7 +1172,29 @@ lazy_static! {
             aliases: vec!["remote_file", "fetch_file"],
         });
 
-        // ===== Security Tools (9) =====
+        // ===== Security Tools (10) =====
+
+        map.insert("security_audit", ToolMetadata {
+            name: "security_audit",
+            description: "Run every security pass the engine supports (pattern rules, symbolic CWE-122 heap-overflow detection, taint-flow analysis) and return a single ranked report with a summary panel up top.",
+            category: ToolCategory::Security,
+            tags: ["security", "audit", "scan", "aggregator", "cwe", "owasp", "taint"].iter().copied().collect(),
+            stability: StabilityLevel::Stable,
+            performance: PerformanceImpact::High,
+            required_flags: HashSet::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "path": {"type": "string", "description": "Optional specific file or directory path to audit"},
+                    "severity_threshold": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"], "description": "Minimum severity to include (default: low)"},
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from the audit (default: true)"}
+                },
+                "required": ["repo"]
+            }),
+            requires_api_key: false,
+            aliases: vec!["audit"],
+        });
 
         map.insert("scan_security", ToolMetadata {
             name: "scan_security",
