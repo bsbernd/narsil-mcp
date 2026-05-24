@@ -71,6 +71,94 @@ impl SizeExpr {
     }
 }
 
+/// A single string-writing call: which destination it writes into and
+/// how many bytes the analyser believes it produces. Used to compare
+/// against the allocation map returned by [`collect_allocation_sizes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteSite {
+    /// Source text of the destination — an identifier or field
+    /// reference whose allocation size the analyser is expected to
+    /// know from a prior allocator call.
+    pub destination: String,
+    /// Number of bytes the call writes, including any implicit NUL.
+    /// `Unknown` when the analyser cannot bound the write.
+    pub write_size: SizeExpr,
+}
+
+/// Walk a C function body and return one [`WriteSite`] per modeled
+/// string-writing call. Currently recognises `sprintf` and `vsprintf`;
+/// the str/mem family is added in a later patch.
+pub fn collect_write_sites(function_body: Node<'_>, source: &str) -> Vec<WriteSite> {
+    let mut out = Vec::new();
+    collect_writes_into(function_body, source, &mut out);
+    out
+}
+
+fn collect_writes_into(node: Node<'_>, source: &str, out: &mut Vec<WriteSite>) {
+    if node.kind() == "call_expression" {
+        if let Some(write_site) = recognise_sprintf_call(node, source) {
+            out.push(write_site);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_writes_into(child, source, out);
+    }
+}
+
+/// Recognise `sprintf(dest, fmt, args...)` or
+/// `vsprintf(dest, fmt, va_list)` and return its [`WriteSite`].
+///
+/// sprintf writes the formatted output plus the trailing NUL, so the
+/// write size is `write_size_of_format(fmt, args) + 1`. vsprintf draws
+/// from an opaque `va_list` and is recorded with `SizeExpr::Unknown`.
+/// Destinations that are not a plain identifier or field reference
+/// are skipped — we have no stable name to compare allocation against.
+fn recognise_sprintf_call(call: Node<'_>, source: &str) -> Option<WriteSite> {
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    if function_name != "sprintf" && function_name != "vsprintf" {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .collect();
+    if argument_nodes.len() < 2 {
+        return None;
+    }
+
+    let destination_node = argument_nodes[0];
+    let destination = match destination_node.kind() {
+        "identifier" | "field_expression" => destination_node
+            .utf8_text(source.as_bytes())
+            .ok()?
+            .to_string(),
+        _ => return None,
+    };
+
+    if function_name == "vsprintf" {
+        return Some(WriteSite {
+            destination,
+            write_size: SizeExpr::Unknown,
+        });
+    }
+
+    let format = extract_string_literal_content(argument_nodes[1], source)?;
+    let argument_names: Vec<String> = argument_nodes[2..]
+        .iter()
+        .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+        .collect();
+    let written = write_size_of_format(&format, &argument_names);
+    Some(WriteSite {
+        destination,
+        write_size: written.plus_constant(1),
+    })
+}
+
 /// Walk a C function body and return a map from each allocation
 /// target's source text to the [`SizeExpr`] the corresponding
 /// allocator was called with.
@@ -1100,6 +1188,94 @@ mod tests {
             summary.get("caller").unwrap().get("buf"),
             Some(&SizeExpr::Constant(42))
         );
+    }
+
+    fn write_sites_in(c_source: &str) -> Vec<WriteSite> {
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_function_body(&mut parser, c_source);
+        let body = find_first_function_body(&tree);
+        collect_write_sites(body, c_source)
+    }
+
+    #[test]
+    fn sprintf_with_percent_s_records_strlen_plus_nul_write() {
+        let code = "int sprintf(char *, const char *, ...);\n\
+                    void f(char *buf, const char *name) {\n\
+                        sprintf(buf, \"%s\", name);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].destination, "buf");
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(sites[0].write_size, expected);
+    }
+
+    #[test]
+    fn sprintf_into_struct_field_is_keyed_by_full_lhs() {
+        let code = "int sprintf(char *, const char *, ...);\n\
+                    struct ctx { char *buf; };\n\
+                    void f(struct ctx *ctx, const char *x) {\n\
+                        sprintf(ctx->buf, \"%s#%s\", x, x);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].destination, "ctx->buf");
+        // %s#%s writes 2*strlen(x) + 1 separator byte, then +1 NUL.
+        let expected = SizeExpr::StrlenOf("x".into())
+            .add(SizeExpr::StrlenOf("x".into()))
+            .add(SizeExpr::Constant(2));
+        assert_eq!(sites[0].write_size, expected);
+    }
+
+    #[test]
+    fn sprintf_with_unmodeled_directive_records_unknown_write() {
+        let code = "int sprintf(char *, const char *, ...);\n\
+                    void f(char *buf, int n) {\n\
+                        sprintf(buf, \"n=%d\", n);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        // write_size_of_format returns Unknown, plus_constant(1) stays Unknown.
+        assert_eq!(sites[0].write_size, SizeExpr::Unknown);
+    }
+
+    #[test]
+    fn vsprintf_records_unknown_write_size() {
+        let code = "int vsprintf(char *, const char *, void *);\n\
+                    void f(char *buf, const char *fmt, void *ap) {\n\
+                        vsprintf(buf, fmt, ap);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].destination, "buf");
+        assert_eq!(sites[0].write_size, SizeExpr::Unknown);
+    }
+
+    #[test]
+    fn sprintf_with_non_simple_destination_is_skipped() {
+        // We have no stable name to compare an allocation against —
+        // skip rather than record an entry the overflow rule cannot
+        // resolve.
+        let code = "int sprintf(char *, const char *, ...);\n\
+                    void f(char *bufs[], const char *x) {\n\
+                        sprintf(bufs[0], \"%s\", x);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn collect_write_sites_finds_every_call_in_function_body() {
+        let code = "int sprintf(char *, const char *, ...);\n\
+                    void f(char *a, char *b, const char *x) {\n\
+                        sprintf(a, \"%s\", x);\n\
+                        sprintf(b, \"%s%s\", x, x);\n\
+                    }";
+        let sites = write_sites_in(code);
+        assert_eq!(sites.len(), 2);
+        let destinations: Vec<_> = sites.iter().map(|s| s.destination.as_str()).collect();
+        assert!(destinations.contains(&"a"));
+        assert!(destinations.contains(&"b"));
     }
 
     #[test]
