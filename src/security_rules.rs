@@ -5753,4 +5753,63 @@ async fn create_user(Json(body): Json<CreateUser>) -> Result<Json<User>, ApiErro
             .locate_function("not_in_graph", &caller_abs.to_string_lossy())
             .is_none());
     }
+
+    #[test]
+    fn engine_scan_with_context_emits_cwe_122_across_translation_units() {
+        // End-to-end shape that motivated this series, with neutral
+        // identifiers: a helper TU returns a strdup-allocated buffer
+        // sized strlen(name)+1; the caller TU sprintfs "%s#%s" into it,
+        // which writes strlen(prefix)+strlen(name)+2 — overflows by
+        // exactly the prefix length. The previous per-TU pass missed
+        // this entirely because the helper lived in a different file
+        // from the write site. With scan_with_context wired up, the
+        // rule engine must surface the overflow as a CWE-122 finding.
+        //
+        // (strdup is used in place of asprintf-with-status because the
+        // current summariser only recognises functions that return an
+        // allocator call directly; asprintf populates its destination
+        // through an out-parameter, which would need assignment
+        // tracking — out of scope for this series.)
+        let helper_source = "char *build_buffer(const char *name) {\n    return strdup(name);\n}\n";
+        let caller_source = "void use(const char *name, const char *prefix) {\n    char *buf = build_buffer(name);\n    sprintf(buf, \"%s#%s\", prefix, name);\n}\n";
+
+        let repo_root = PathBuf::from("/repo");
+        let (graph, file_cache) = build_graph(
+            &repo_root,
+            &[
+                ("lib/helper.c", helper_source),
+                ("util/caller.c", caller_source),
+            ],
+        );
+
+        let ctx = CallGraphContext::new(&graph, &file_cache, &repo_root);
+        let engine = SecurityRulesEngine::new();
+        let caller_abs = repo_root.join("util/caller.c");
+        let findings =
+            engine.scan_with_context(caller_source, &caller_abs.to_string_lossy(), "c", &ctx);
+
+        let cwe_122 = findings
+            .iter()
+            .filter(|f| f.cwe.iter().any(|c| c == "CWE-122"))
+            .count();
+        assert!(
+            cwe_122 >= 1,
+            "expected at least one CWE-122 finding, got {:?}",
+            findings,
+        );
+
+        // Sanity: the per-TU path with NullContext sees only the caller
+        // and therefore misses the overflow. The cross-file finding is
+        // genuinely a new capability, not a duplicated per-TU pass.
+        let baseline = engine.scan(caller_source, &caller_abs.to_string_lossy(), "c");
+        let baseline_cwe_122 = baseline
+            .iter()
+            .filter(|f| f.cwe.iter().any(|c| c == "CWE-122"))
+            .count();
+        assert_eq!(
+            baseline_cwe_122, 0,
+            "per-TU baseline must remain unable to see the helper's allocation, got {:?}",
+            baseline,
+        );
+    }
 }
