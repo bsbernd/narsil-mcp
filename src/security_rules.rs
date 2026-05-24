@@ -13,6 +13,7 @@
 //! - **ControlFlow**: Required operations before sensitive calls
 //! - **Typestate**: State machine validation (future)
 
+use crate::heap_size::{self, HeapOverflowFinding};
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -769,10 +770,37 @@ impl SecurityRulesEngine {
             }
         }
 
+        findings.extend(self.scan_heap_overflows_if_c(code, file_path, language));
+
         dedupe_findings(&mut findings);
         // Sort by severity (Critical first)
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
         findings
+    }
+
+    /// Run the symbolic heap-overflow pass when the language is C or
+    /// C++ and the rule is enabled. The pass parses `code` with
+    /// tree-sitter-c and looks for write sites whose size provably
+    /// exceeds the allocation backing their destination.
+    fn scan_heap_overflows_if_c(
+        &self,
+        code: &str,
+        file_path: &str,
+        language: &str,
+    ) -> Vec<SecurityFinding> {
+        if language != "c" && language != "cpp" {
+            return Vec::new();
+        }
+        let Some(rule) = self.rules.get("CWE-122-001") else {
+            return Vec::new();
+        };
+        if !rule.enabled {
+            return Vec::new();
+        }
+        heap_size::scan_heap_overflows(code, file_path)
+            .into_iter()
+            .map(|finding| heap_overflow_to_security_finding(finding, rule))
+            .collect()
     }
 
     /// Scan for OWASP Top 10 issues only
@@ -823,6 +851,8 @@ impl SecurityRulesEngine {
                 findings.extend(rule_findings);
             }
         }
+
+        findings.extend(self.scan_heap_overflows_if_c(code, file_path, language));
 
         dedupe_findings(&mut findings);
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
@@ -1702,6 +1732,28 @@ impl SecurityRulesEngine {
             tags: vec!["memory".to_string(), "buffer".to_string()],
         });
 
+        // CWE-122: Heap-based Buffer Overflow. Detection is driven by
+        // the heap_size analyser, not a pattern match — registered here
+        // so `get_rule`, explain, and CWE-top-25 indexing all resolve.
+        self.add_rule(SecurityRule {
+            id: "CWE-122-001".to_string(),
+            name: "Heap Buffer Overflow (symbolic)".to_string(),
+            severity: Severity::Critical,
+            cwe: vec!["CWE-122".to_string()],
+            owasp: vec![],
+            rule_type: RuleType::Pattern {
+                patterns: vec![],
+                safe_patterns: vec![],
+            },
+            languages: vec!["c".to_string(), "cpp".to_string()],
+            message: "Write provably exceeds allocation size on this heap buffer".to_string(),
+            remediation: "Size the allocation to include every byte sprintf/strcpy/memcpy writes, \
+                 including the trailing NUL"
+                .to_string(),
+            enabled: true,
+            tags: vec!["memory".to_string(), "buffer".to_string()],
+        });
+
         // CWE-79: XSS (already covered in OWASP A03)
 
         // CWE-89: SQL Injection (already covered in OWASP A03)
@@ -2114,13 +2166,43 @@ pub struct SuggestedFix {
 
 // Helper functions
 
+/// Project a heap-size analyser finding into the engine's
+/// [`SecurityFinding`] shape, carrying the symbolic size comparison in
+/// the human-readable message so explain/UI surfaces show the WHY.
+fn heap_overflow_to_security_finding(
+    finding: HeapOverflowFinding,
+    rule: &SecurityRule,
+) -> SecurityFinding {
+    let message = format!(
+        "{}: write of {} bytes into '{}' which allocates {} bytes",
+        rule.message, finding.write_size, finding.destination, finding.allocation_size
+    );
+    SecurityFinding {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        severity: rule.severity,
+        confidence: Confidence::High,
+        file_path: finding.file_path,
+        line: finding.line,
+        column: finding.column,
+        end_line: finding.end_line,
+        end_column: finding.end_column,
+        snippet: finding.snippet,
+        message,
+        remediation: rule.remediation.clone(),
+        cwe: rule.cwe.clone(),
+        owasp: rule.owasp.clone(),
+        context: HashMap::new(),
+    }
+}
+
 /// Check if a CWE is in the Top 25
 fn is_cwe_top25(cwe: &str) -> bool {
     const CWE_TOP25: &[&str] = &[
         "CWE-787", "CWE-79", "CWE-89", "CWE-416", "CWE-78", "CWE-20", "CWE-125", "CWE-22",
         "CWE-352", "CWE-434", "CWE-862", "CWE-476", "CWE-287", "CWE-190", "CWE-502", "CWE-77",
         "CWE-119", "CWE-798", "CWE-918", "CWE-306", "CWE-362", "CWE-269", "CWE-94", "CWE-863",
-        "CWE-276",
+        "CWE-276", "CWE-122",
     ];
     CWE_TOP25.contains(&cwe)
 }
@@ -2682,6 +2764,77 @@ strcpy(dest, src);
             "CWE-787-001 must be indexed in cwe_top25_rules; \
              otherwise scan_cwe_top25 cannot find it"
         );
+    }
+
+    /// The CWE-122-001 rule is symbolic, not pattern-based, so it
+    /// needs its own indexing checks: it must be registered in `rules`
+    /// and indexed in `cwe_top25_rules`. Without this, an analyser
+    /// finding would never be projected into a `SecurityFinding`.
+    #[test]
+    fn test_default_engine_registers_cwe_122_001_in_top25_index() {
+        let engine = SecurityRulesEngine::new();
+        assert!(engine.get_rule("CWE-122-001").is_some());
+        assert!(engine.cwe_top25_rules.iter().any(|id| id == "CWE-122-001"));
+    }
+
+    /// End-to-end: the engine must emit a CWE-122-001 finding for the
+    /// canonical asprintf-then-sprintf overflow pattern — the same
+    /// shape that motivated this whole subsystem. The expected message
+    /// carries the symbolic comparison, not just a vague "buffer
+    /// overflow" string.
+    #[test]
+    fn test_scan_emits_cwe_122_for_asprintf_then_sprintf_overflow() {
+        let engine = SecurityRulesEngine::new();
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    int sprintf(char *, const char *, ...);\n\
+                    void f(const char *prefix, const char *name) {\n\
+                        char *buf;\n\
+                        asprintf(&buf, \"%s\", name);\n\
+                        sprintf(buf, \"%s#%s\", prefix, name);\n\
+                    }";
+        let findings = engine.scan(code, "overflow.c", "c");
+        assert!(
+            findings.iter().any(|f| f.rule_id == "CWE-122-001"),
+            "expected CWE-122-001 finding; got {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>(),
+        );
+        let finding = findings
+            .iter()
+            .find(|f| f.rule_id == "CWE-122-001")
+            .unwrap();
+        assert!(finding.message.contains("strlen(name) + strlen(prefix)"));
+    }
+
+    /// Same finding must surface via scan_cwe_top25, since the new
+    /// symbolic pass is gated separately from pattern rules.
+    #[test]
+    fn test_scan_cwe_top25_emits_cwe_122_for_calloc_then_memset_overflow() {
+        let engine = SecurityRulesEngine::new();
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void *memset(void *, int, unsigned long);\n\
+                    void f(void) {\n\
+                        char *buf = calloc(4, 8);\n\
+                        memset(buf, 0, 40);\n\
+                    }";
+        let findings = engine.scan_cwe_top25(code, "overflow.c", "c");
+        assert!(findings.iter().any(|f| f.rule_id == "CWE-122-001"));
+    }
+
+    /// The heap-overflow pass must not fire on a clean allocation.
+    /// A false positive on `malloc(strlen(name) + 1) + strcpy(buf, name)`
+    /// would make the rule unusable on every well-formed string copy.
+    #[test]
+    fn test_scan_does_not_flag_correctly_sized_allocation() {
+        let engine = SecurityRulesEngine::new();
+        let code = "char *malloc(unsigned long);\n\
+                    char *strcpy(char *, const char *);\n\
+                    unsigned long strlen(const char *);\n\
+                    void f(const char *name) {\n\
+                        char *buf = malloc(strlen(name) + 1);\n\
+                        strcpy(buf, name);\n\
+                    }";
+        let findings = engine.scan(code, "ok.c", "c");
+        assert!(!findings.iter().any(|f| f.rule_id == "CWE-122-001"));
     }
 
     /// Regression: an indented `sprintf(dst, "%s#%s", ...)` call,

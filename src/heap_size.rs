@@ -83,6 +83,41 @@ pub struct WriteSite {
     /// Number of bytes the call writes, including any implicit NUL.
     /// `Unknown` when the analyser cannot bound the write.
     pub write_size: SizeExpr,
+    /// 1-indexed line of the call expression. Used when projecting a
+    /// detected overflow into a SecurityFinding.
+    pub line: usize,
+    /// 1-indexed column of the call expression.
+    pub column: usize,
+    /// 1-indexed end line of the call expression.
+    pub end_line: usize,
+    /// 1-indexed end column of the call expression.
+    pub end_column: usize,
+    /// Verbatim source text of the call expression.
+    pub snippet: String,
+}
+
+/// A buffer-overflow detection: a [`WriteSite`] whose write size
+/// provably exceeds the allocation associated with its destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapOverflowFinding {
+    /// Source-text key of the buffer (e.g. `buf`, `ctx->buf`).
+    pub destination: String,
+    /// Size the allocator produced.
+    pub allocation_size: SizeExpr,
+    /// Size the write site emits.
+    pub write_size: SizeExpr,
+    /// File the finding is reported against.
+    pub file_path: String,
+    /// 1-indexed line of the offending write call.
+    pub line: usize,
+    /// 1-indexed column of the offending write call.
+    pub column: usize,
+    /// 1-indexed end line of the offending write call.
+    pub end_line: usize,
+    /// 1-indexed end column of the offending write call.
+    pub end_column: usize,
+    /// Source text of the offending write call.
+    pub snippet: String,
 }
 
 /// Walk a C function body and return one [`WriteSite`] per modeled
@@ -187,10 +222,164 @@ fn recognise_write_call(call: Node<'_>, source: &str) -> Option<WriteSite> {
         _ => return None,
     };
 
+    let start = call.start_position();
+    let end = call.end_position();
+    let snippet = call
+        .utf8_text(source.as_bytes())
+        .ok()
+        .unwrap_or("")
+        .to_string();
     Some(WriteSite {
         destination,
         write_size,
+        line: start.row + 1,
+        column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+        snippet,
     })
+}
+
+/// Compare a write size to an allocation size and return `true` iff
+/// the write *provably* exceeds the allocation across every
+/// substitution of the symbolic terms.
+///
+/// The decision procedure is intentionally conservative: it only fires
+/// when the write side dominates the allocation side both in its
+/// constant component **and** in its multiset of `StrlenOf` terms.
+/// Anything involving `Unknown` short-circuits to `false`.
+///
+/// Examples (all real overflow shapes from the security report):
+///
+/// * `Constant(40)` vs `Constant(32)` → `true` (literal-vs-literal).
+/// * `StrlenOf(name) + 2` vs `StrlenOf(name) + 1` → `true` (extra NUL).
+/// * `StrlenOf(name) + StrlenOf(prefix) + 2` vs `StrlenOf(name) + 1` →
+///   `true` (the canonical asprintf-then-sprintf shape: the write's
+///   constant exceeds the allocation's and adds a non-negative term).
+/// * `Constant(5)` vs `StrlenOf(name) + 1` → `false` (the strlen term
+///   could swallow the difference; we cannot prove overflow).
+pub fn write_exceeds_allocation(write: &SizeExpr, allocation: &SizeExpr) -> bool {
+    if matches!(write, SizeExpr::Unknown) || matches!(allocation, SizeExpr::Unknown) {
+        return false;
+    }
+    let (write_strlens, write_constant) = decompose_size(write);
+    let (allocation_strlens, allocation_constant) = decompose_size(allocation);
+
+    if !multiset_contains_all(&write_strlens, &allocation_strlens) {
+        return false;
+    }
+    write_constant > allocation_constant
+}
+
+/// Pair an allocation map against a write-site list and return one
+/// [`HeapOverflowFinding`] per write whose size provably exceeds its
+/// destination's allocation. The `file_path` is propagated verbatim
+/// into every emitted finding.
+pub fn detect_overflows(
+    allocations: &HashMap<String, SizeExpr>,
+    write_sites: &[WriteSite],
+    file_path: &str,
+) -> Vec<HeapOverflowFinding> {
+    let mut findings = Vec::new();
+    for site in write_sites {
+        let Some(allocation) = allocations.get(&site.destination) else {
+            continue;
+        };
+        if !write_exceeds_allocation(&site.write_size, allocation) {
+            continue;
+        }
+        findings.push(HeapOverflowFinding {
+            destination: site.destination.clone(),
+            allocation_size: allocation.clone(),
+            write_size: site.write_size.clone(),
+            file_path: file_path.to_string(),
+            line: site.line,
+            column: site.column,
+            end_line: site.end_line,
+            end_column: site.end_column,
+            snippet: site.snippet.clone(),
+        });
+    }
+    findings
+}
+
+/// Parse `code` as C, walk every function definition, and return the
+/// heap-overflow findings the analyser can prove. Top-level entry
+/// point used by the security-rules engine for CWE-122.
+pub fn scan_heap_overflows(code: &str, file_path: &str) -> Vec<HeapOverflowFinding> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return Vec::new();
+    };
+
+    let mut findings = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            if let Some(body) = node.child_by_field_name("body") {
+                let allocations = collect_allocation_sizes(body, code);
+                let write_sites = collect_write_sites(body, code);
+                findings.extend(detect_overflows(&allocations, &write_sites, file_path));
+            }
+            // Function definitions don't nest in C; no need to recurse.
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    findings
+}
+
+/// Split a [`SizeExpr`] into its multiset of `StrlenOf` arguments and
+/// the sum of its constant terms. `Unknown` collapses to `(vec![], 0)`
+/// — callers must short-circuit on `Unknown` before calling this.
+fn decompose_size(expr: &SizeExpr) -> (Vec<String>, u64) {
+    match expr {
+        SizeExpr::Constant(value) => (Vec::new(), *value),
+        SizeExpr::StrlenOf(name) => (vec![name.clone()], 0),
+        SizeExpr::Sum(parts) => {
+            let mut strlens = Vec::new();
+            let mut constant: u64 = 0;
+            for part in parts {
+                match part {
+                    SizeExpr::Constant(value) => {
+                        constant = constant.saturating_add(*value);
+                    }
+                    SizeExpr::StrlenOf(name) => strlens.push(name.clone()),
+                    SizeExpr::Sum(_) | SizeExpr::Unknown => {
+                        // SizeExpr canonicalisation rules out nested
+                        // Sums and Unknown in Sum bodies.
+                    }
+                }
+            }
+            (strlens, constant)
+        }
+        SizeExpr::Unknown => (Vec::new(), 0),
+    }
+}
+
+/// Return `true` iff `big` contains every element of `small` with at
+/// least the same multiplicity. Used to confirm that a write's
+/// symbolic terms cover the allocation's terms before a constant-only
+/// inequality is enough to prove overflow.
+fn multiset_contains_all(big: &[String], small: &[String]) -> bool {
+    let mut remaining: Vec<&str> = big.iter().map(String::as_str).collect();
+    for needed in small {
+        if let Some(idx) = remaining.iter().position(|item| item == needed) {
+            remaining.swap_remove(idx);
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// Source text of `node` if it is a plain identifier or field
@@ -1445,6 +1634,153 @@ mod tests {
         let destinations: Vec<_> = sites.iter().map(|s| s.destination.as_str()).collect();
         assert!(destinations.contains(&"a"));
         assert!(destinations.contains(&"b"));
+    }
+
+    #[test]
+    fn constant_write_exceeding_constant_allocation_is_overflow() {
+        assert!(write_exceeds_allocation(
+            &SizeExpr::Constant(40),
+            &SizeExpr::Constant(32),
+        ));
+        assert!(!write_exceeds_allocation(
+            &SizeExpr::Constant(32),
+            &SizeExpr::Constant(40),
+        ));
+        assert!(!write_exceeds_allocation(
+            &SizeExpr::Constant(32),
+            &SizeExpr::Constant(32),
+        ));
+    }
+
+    #[test]
+    fn unknown_either_side_is_not_proved_overflow() {
+        assert!(!write_exceeds_allocation(
+            &SizeExpr::Unknown,
+            &SizeExpr::Constant(10),
+        ));
+        assert!(!write_exceeds_allocation(
+            &SizeExpr::Constant(10),
+            &SizeExpr::Unknown,
+        ));
+    }
+
+    #[test]
+    fn extra_strlen_terms_alone_do_not_prove_overflow() {
+        // write = strlen(prefix) + strlen(name), alloc = strlen(name).
+        // If prefix is empty, write == alloc — we cannot prove strict >.
+        let write = SizeExpr::StrlenOf("name".into()).add(SizeExpr::StrlenOf("prefix".into()));
+        let allocation = SizeExpr::StrlenOf("name".into());
+        assert!(!write_exceeds_allocation(&write, &allocation));
+    }
+
+    #[test]
+    fn canonical_asprintf_then_sprintf_pattern_is_detected_as_overflow() {
+        // alloc = strlen(name) + 1, write = strlen(name) + strlen(prefix) + 2
+        // The strlen multiset of write covers alloc's, and the constants
+        // differ in the right direction — this is the smoking-gun shape.
+        let allocation = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        let write = SizeExpr::StrlenOf("name".into())
+            .add(SizeExpr::StrlenOf("prefix".into()))
+            .add(SizeExpr::Constant(2));
+        assert!(write_exceeds_allocation(&write, &allocation));
+    }
+
+    #[test]
+    fn constant_write_into_strlen_allocation_is_not_proved_overflow() {
+        // write = 5, alloc = strlen(name) + 1.
+        // For long enough name, alloc dominates — we cannot prove
+        // overflow without bounding strlen(name).
+        let write = SizeExpr::Constant(5);
+        let allocation = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert!(!write_exceeds_allocation(&write, &allocation));
+    }
+
+    fn run_scan(code: &str) -> Vec<HeapOverflowFinding> {
+        scan_heap_overflows(code, "test.c")
+    }
+
+    #[test]
+    fn scan_heap_overflows_finds_malloc_then_strcpy_with_long_literal() {
+        // malloc(8) + strcpy(buf, "very long literal") — 18 bytes (17 + NUL)
+        // written into 8-byte buffer.
+        let code = "char *malloc(unsigned long);\n\
+                    char *strcpy(char *, const char *);\n\
+                    void f(void) {\n\
+                        char *buf = malloc(8);\n\
+                        strcpy(buf, \"very long literal\");\n\
+                    }";
+        let findings = run_scan(code);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].destination, "buf");
+        assert_eq!(findings[0].allocation_size, SizeExpr::Constant(8));
+        assert_eq!(findings[0].write_size, SizeExpr::Constant(18));
+        // strcpy is on line 5; column at start of call expression.
+        assert_eq!(findings[0].line, 5);
+        assert!(findings[0].snippet.starts_with("strcpy(buf"));
+    }
+
+    #[test]
+    fn scan_heap_overflows_finds_asprintf_then_sprintf_overflow() {
+        // asprintf allocates strlen(name) + 1, sprintf writes
+        // strlen(prefix) + 1 + strlen(name) + 1 NUL.
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    int sprintf(char *, const char *, ...);\n\
+                    void f(const char *prefix, const char *name) {\n\
+                        char *buf;\n\
+                        asprintf(&buf, \"%s\", name);\n\
+                        sprintf(buf, \"%s#%s\", prefix, name);\n\
+                    }";
+        let findings = run_scan(code);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].destination, "buf");
+    }
+
+    #[test]
+    fn scan_heap_overflows_finds_calloc_then_memset_overflow() {
+        // calloc(4, 8) = 32 bytes; memset writes 40 bytes.
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void *memset(void *, int, unsigned long);\n\
+                    void f(void) {\n\
+                        char *buf = calloc(4, 8);\n\
+                        memset(buf, 0, 40);\n\
+                    }";
+        let findings = run_scan(code);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].allocation_size, SizeExpr::Constant(32));
+        assert_eq!(findings[0].write_size, SizeExpr::Constant(40));
+    }
+
+    #[test]
+    fn scan_heap_overflows_reports_nothing_when_sizes_match() {
+        // malloc(strlen(name) + 1) + strcpy(buf, name) — exact fit.
+        let code = "char *malloc(unsigned long);\n\
+                    char *strcpy(char *, const char *);\n\
+                    unsigned long strlen(const char *);\n\
+                    void f(const char *name) {\n\
+                        char *buf = malloc(strlen(name) + 1);\n\
+                        strcpy(buf, name);\n\
+                    }";
+        let findings = run_scan(code);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn scan_heap_overflows_isolates_findings_per_function() {
+        // First function has an overflow; second is clean. Both buffers
+        // are local — names must not leak across function boundaries.
+        let code = "char *malloc(unsigned long);\n\
+                    char *strcpy(char *, const char *);\n\
+                    void bad(void) {\n\
+                        char *buf = malloc(4);\n\
+                        strcpy(buf, \"longer\");\n\
+                    }\n\
+                    void good(void) {\n\
+                        char *buf = malloc(64);\n\
+                        strcpy(buf, \"short\");\n\
+                    }";
+        let findings = run_scan(code);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet.contains("longer"), true);
     }
 
     #[test]
