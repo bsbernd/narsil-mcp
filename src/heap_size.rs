@@ -675,10 +675,69 @@ fn text_of(node: Node<'_>, source: &str) -> String {
     node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
 }
 
+/// A request to find a function definition outside of the current
+/// translation unit. The heap-overflow analyser consults the context
+/// when its per-TU summary cache misses a callee — without it, an
+/// allocation in `lib/helper.c` paired with a write in `util/caller.c`
+/// is invisible to the per-file pass.
+///
+/// Implementations live outside this module: the MCP layer wraps the
+/// project call graph; tests use a hand-rolled mock. Implementations
+/// must never guess on ambiguous resolution — return `None` instead, so
+/// the analyser short-circuits to `Unknown` rather than emitting a
+/// false positive against the wrong definition.
+pub trait CrossFileContext {
+    /// Locate the function named `name` somewhere in the project.
+    /// `caller_file` is the file containing the call site —
+    /// implementations use it to resolve `static` symbol collisions in
+    /// favour of the definition in the caller's own translation unit.
+    fn locate_function(&self, name: &str, caller_file: &str) -> Option<FunctionLocation>;
+}
+
+/// A function definition surfaced by [`CrossFileContext::locate_function`].
+#[derive(Debug, Clone)]
+pub struct FunctionLocation {
+    /// Path to the file containing the definition.
+    pub file_path: String,
+    /// Full source of that file, ready for tree-sitter to parse.
+    pub source: String,
+}
+
+/// A no-op resolver. Every lookup returns `None`, restoring the
+/// per-translation-unit-only behaviour the analyser had before
+/// cross-TU resolution existed. Used by single-file entry points
+/// (tests and the per-file `scan_security` pass) where no project
+/// context is available.
+pub struct NullContext;
+
+impl CrossFileContext for NullContext {
+    fn locate_function(&self, _name: &str, _caller_file: &str) -> Option<FunctionLocation> {
+        None
+    }
+}
+
 /// Parse `code` as C, walk every function definition, and return the
 /// heap-overflow findings the analyser can prove. Top-level entry
 /// point used by the security-rules engine for CWE-122.
+///
+/// This is the per-translation-unit entry point. Callers that have a
+/// project context (call graph + file reader) should use
+/// [`scan_heap_overflows_with_context`] instead to pick up overflows
+/// that span TU boundaries.
 pub fn scan_heap_overflows(code: &str, file_path: &str) -> Vec<HeapOverflowFinding> {
+    scan_heap_overflows_with_context(code, file_path, &NullContext)
+}
+
+/// Like [`scan_heap_overflows`] but consults `ctx` when the
+/// translation-unit-local summary cache misses a callee. The context
+/// is not used yet — this entry point exists so the security-rules
+/// engine can thread it through; the cross-TU resolution itself
+/// lands in a later patch.
+pub fn scan_heap_overflows_with_context(
+    code: &str,
+    file_path: &str,
+    _ctx: &dyn CrossFileContext,
+) -> Vec<HeapOverflowFinding> {
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_c::LANGUAGE.into())
@@ -2667,5 +2726,17 @@ mod tests {
         // wide-string accuracy is out of scope for this patch.
         let with_l = write_size_of_format("%ls", &names(&["x"]));
         assert_eq!(with_l, SizeExpr::StrlenOf("x".into()));
+    }
+
+    #[test]
+    fn null_context_never_resolves_a_callee() {
+        // The plumbing contract: NullContext must refuse every lookup so
+        // the analyser short-circuits to Unknown rather than guessing.
+        // A future CrossFileContext impl that *does* resolve must do so
+        // only when a single definition is unambiguous; this test guards
+        // the safe baseline.
+        let ctx = NullContext;
+        assert!(ctx.locate_function("anything", "caller.c").is_none());
+        assert!(ctx.locate_function("", "").is_none());
     }
 }

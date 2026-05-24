@@ -752,8 +752,29 @@ impl SecurityRulesEngine {
         self.rules.insert(rule.id.clone(), rule);
     }
 
-    /// Scan code for security issues
+    /// Scan code for security issues.
+    ///
+    /// Per-translation-unit entry point: equivalent to
+    /// [`scan_with_context`](Self::scan_with_context) with a
+    /// [`heap_size::NullContext`], so cross-TU heap overflows (alloc
+    /// helper in one `.c`, write in another) are not detected.
+    /// Callers that have a project call graph should use
+    /// `scan_with_context` instead.
     pub fn scan(&self, code: &str, file_path: &str, language: &str) -> Vec<SecurityFinding> {
+        self.scan_with_context(code, file_path, language, &heap_size::NullContext)
+    }
+
+    /// Like [`scan`](Self::scan) but consults `ctx` when a heap-overflow
+    /// callee is not defined in the same translation unit. The context
+    /// is wired through to the symbolic heap-overflow pass; the rest
+    /// of the rule engine ignores it.
+    pub fn scan_with_context(
+        &self,
+        code: &str,
+        file_path: &str,
+        language: &str,
+        ctx: &dyn heap_size::CrossFileContext,
+    ) -> Vec<SecurityFinding> {
         let mut findings = Vec::new();
 
         // Get applicable rules
@@ -770,7 +791,7 @@ impl SecurityRulesEngine {
             }
         }
 
-        findings.extend(self.scan_heap_overflows_if_c(code, file_path, language));
+        findings.extend(self.scan_heap_overflows_if_c(code, file_path, language, ctx));
 
         dedupe_findings(&mut findings);
         // Sort by severity (Critical first)
@@ -781,12 +802,15 @@ impl SecurityRulesEngine {
     /// Run the symbolic heap-overflow pass when the language is C or
     /// C++ and the rule is enabled. The pass parses `code` with
     /// tree-sitter-c and looks for write sites whose size provably
-    /// exceeds the allocation backing their destination.
+    /// exceeds the allocation backing their destination. `ctx` is
+    /// forwarded so cross-TU callees can be resolved when the caller
+    /// supplies a project context.
     fn scan_heap_overflows_if_c(
         &self,
         code: &str,
         file_path: &str,
         language: &str,
+        ctx: &dyn heap_size::CrossFileContext,
     ) -> Vec<SecurityFinding> {
         if language != "c" && language != "cpp" {
             return Vec::new();
@@ -795,7 +819,7 @@ impl SecurityRulesEngine {
         if let Some(rule) = self.rules.get("CWE-122-001") {
             if rule.enabled {
                 out.extend(
-                    heap_size::scan_heap_overflows(code, file_path)
+                    heap_size::scan_heap_overflows_with_context(code, file_path, ctx)
                         .into_iter()
                         .map(|finding| heap_overflow_to_security_finding(finding, rule)),
                 );
@@ -871,7 +895,12 @@ impl SecurityRulesEngine {
             }
         }
 
-        findings.extend(self.scan_heap_overflows_if_c(code, file_path, language));
+        findings.extend(self.scan_heap_overflows_if_c(
+            code,
+            file_path,
+            language,
+            &heap_size::NullContext,
+        ));
 
         dedupe_findings(&mut findings);
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
