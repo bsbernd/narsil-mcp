@@ -13,12 +13,106 @@
 //! - **ControlFlow**: Required operations before sensitive calls
 //! - **Typestate**: State machine validation (future)
 
-use crate::heap_size::{self, ConstantOverflowFinding, HeapOverflowFinding, SizeofMulFinding};
+use crate::callgraph::CallGraph;
+use crate::heap_size::{
+    self, ConstantOverflowFinding, CrossFileContext, FunctionLocation, HeapOverflowFinding,
+    SizeofMulFinding,
+};
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
+use dashmap::DashMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// A [`CrossFileContext`] backed by the project call graph. Used by
+/// the MCP `scan_security` / `security_audit` handlers to let the
+/// heap-overflow analyser resolve allocator helpers that live in a
+/// different translation unit from their write site.
+///
+/// The context borrows the call graph and the shared file-content
+/// cache the index already maintains, so cross-TU lookups cost a
+/// name-index hit plus an in-memory file read. Disambiguation rule
+/// for `static`-symbol collisions: prefer the definition in the
+/// caller's own file; otherwise accept a unique external definition;
+/// otherwise return `None` so the analyser short-circuits to
+/// `Unknown` rather than guessing.
+pub struct CallGraphContext<'a> {
+    graph: &'a CallGraph,
+    file_cache: &'a DashMap<PathBuf, Arc<String>>,
+    repo_root: &'a Path,
+}
+
+impl<'a> CallGraphContext<'a> {
+    pub fn new(
+        graph: &'a CallGraph,
+        file_cache: &'a DashMap<PathBuf, Arc<String>>,
+        repo_root: &'a Path,
+    ) -> Self {
+        Self {
+            graph,
+            file_cache,
+            repo_root,
+        }
+    }
+
+    /// Pull the file path off a qualified key of the form
+    /// `"<file_path>::<bare_name>"`. Returns `None` when the key
+    /// does not end in `::<bare_name>` — defensive guard against
+    /// malformed keys.
+    fn path_from_qualified_key<'k>(qkey: &'k str, bare_name: &str) -> Option<&'k str> {
+        let suffix = format!("::{}", bare_name);
+        qkey.strip_suffix(&suffix)
+    }
+}
+
+impl<'a> CrossFileContext for CallGraphContext<'a> {
+    fn locate_function(&self, name: &str, caller_file: &str) -> Option<FunctionLocation> {
+        let candidates = self.graph.lookup_by_name(name);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Translate the absolute `caller_file` into the repo-relative
+        // form the call graph stores. Stripping fails when the caller
+        // is outside the repo — fall back to no same-file preference,
+        // which still admits a unique external definition.
+        let caller_rel: Option<String> = Path::new(caller_file)
+            .strip_prefix(self.repo_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        let chosen_rel: String = if let Some(caller_rel) = caller_rel.as_deref() {
+            if let Some(same_file) = candidates
+                .iter()
+                .find(|qkey| Self::path_from_qualified_key(qkey, name) == Some(caller_rel))
+            {
+                Self::path_from_qualified_key(same_file, name)?.to_string()
+            } else if candidates.len() == 1 {
+                Self::path_from_qualified_key(&candidates[0], name)?.to_string()
+            } else {
+                return None;
+            }
+        } else if candidates.len() == 1 {
+            Self::path_from_qualified_key(&candidates[0], name)?.to_string()
+        } else {
+            return None;
+        };
+
+        let abs_path = self.repo_root.join(&chosen_rel);
+        let source = self
+            .file_cache
+            .get(&abs_path)
+            .map(|entry| entry.value().as_ref().clone())?;
+
+        Some(FunctionLocation {
+            file_path: chosen_rel,
+            source,
+        })
+    }
+}
 
 /// Check if a file path appears to be a test file.
 ///
@@ -5529,5 +5623,134 @@ async fn create_user(Json(body): Json<CreateUser>) -> Result<Json<User>, ApiErro
             "Should have at least 18 Elixir rules, got {}",
             elixir_rule_count
         );
+    }
+
+    // ---- CallGraphContext tests ----
+    //
+    // These verify the cross-TU resolver's disambiguation logic. The
+    // call graph is populated via the public `build_from_files` API
+    // with tiny synthetic C sources, so the test exercises real
+    // tree-sitter extraction and the real `name_index` shape.
+
+    fn build_graph(
+        repo_root: &Path,
+        files: &[(&str, &str)],
+    ) -> (CallGraph, DashMap<PathBuf, Arc<String>>) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("tree-sitter-c language must load");
+
+        let cache: DashMap<PathBuf, Arc<String>> = DashMap::new();
+        let parsed: Vec<(String, String, tree_sitter::Tree)> = files
+            .iter()
+            .map(|(rel, src)| {
+                let tree = parser.parse(*src, None).expect("parse must succeed");
+                cache.insert(repo_root.join(rel), Arc::new(src.to_string()));
+                (rel.to_string(), src.to_string(), tree)
+            })
+            .collect();
+
+        let graph = CallGraph::new();
+        graph
+            .build_from_files(&parsed)
+            .expect("call graph must build");
+        (graph, cache)
+    }
+
+    #[test]
+    fn callgraph_context_resolves_unique_external_definition() {
+        let repo_root = PathBuf::from("/repo");
+        let (graph, cache) = build_graph(
+            &repo_root,
+            &[
+                (
+                    "lib/helper.c",
+                    "char *build_buffer(const char *x) { return 0; }\n",
+                ),
+                (
+                    "util/caller.c",
+                    "void use(void) { char *p = build_buffer(\"a\"); }\n",
+                ),
+            ],
+        );
+
+        let ctx = CallGraphContext::new(&graph, &cache, &repo_root);
+        let caller_abs = repo_root.join("util/caller.c");
+        let loc = ctx
+            .locate_function("build_buffer", &caller_abs.to_string_lossy())
+            .expect("must resolve unique external definition");
+        assert_eq!(loc.file_path, "lib/helper.c");
+        assert!(loc.source.contains("build_buffer"));
+    }
+
+    #[test]
+    fn callgraph_context_prefers_same_file_for_static_collision() {
+        let repo_root = PathBuf::from("/repo");
+        let (graph, cache) = build_graph(
+            &repo_root,
+            &[
+                ("a/helper.c", "static char *build_buffer(void) { return 0; }\nvoid a_use(void) { build_buffer(); }\n"),
+                ("b/helper.c", "static char *build_buffer(void) { return 0; }\nvoid b_use(void) { build_buffer(); }\n"),
+            ],
+        );
+
+        let ctx = CallGraphContext::new(&graph, &cache, &repo_root);
+
+        // From a/helper.c, must resolve to a/helper.c (same-file static wins).
+        let from_a = repo_root.join("a/helper.c");
+        let loc = ctx
+            .locate_function("build_buffer", &from_a.to_string_lossy())
+            .expect("same-file static must resolve");
+        assert_eq!(loc.file_path, "a/helper.c");
+
+        // From b/helper.c, must resolve to b/helper.c.
+        let from_b = repo_root.join("b/helper.c");
+        let loc = ctx
+            .locate_function("build_buffer", &from_b.to_string_lossy())
+            .expect("same-file static must resolve");
+        assert_eq!(loc.file_path, "b/helper.c");
+    }
+
+    #[test]
+    fn callgraph_context_returns_none_for_ambiguous_collision() {
+        let repo_root = PathBuf::from("/repo");
+        let (graph, cache) = build_graph(
+            &repo_root,
+            &[
+                (
+                    "a/helper.c",
+                    "static char *build_buffer(void) { return 0; }\n",
+                ),
+                (
+                    "b/helper.c",
+                    "static char *build_buffer(void) { return 0; }\n",
+                ),
+            ],
+        );
+
+        let ctx = CallGraphContext::new(&graph, &cache, &repo_root);
+
+        // Caller in neither file -> two static definitions visible
+        // and no same-file preference applies. Must return None
+        // rather than guess one.
+        let caller_abs = repo_root.join("util/caller.c");
+        assert!(ctx
+            .locate_function("build_buffer", &caller_abs.to_string_lossy())
+            .is_none());
+    }
+
+    #[test]
+    fn callgraph_context_returns_none_for_unknown_name() {
+        let repo_root = PathBuf::from("/repo");
+        let (graph, cache) = build_graph(
+            &repo_root,
+            &[("lib/helper.c", "char *known(void) { return 0; }\n")],
+        );
+        let ctx = CallGraphContext::new(&graph, &cache, &repo_root);
+        let caller_abs = repo_root.join("util/caller.c");
+        assert!(ctx
+            .locate_function("not_in_graph", &caller_abs.to_string_lossy())
+            .is_none());
     }
 }

@@ -1292,6 +1292,23 @@ impl CallGraph {
         self.nodes.get(name)
     }
 
+    /// Return every qualified key (`file_path::function_name`) that
+    /// defines a function with this exact bare `name`.
+    ///
+    /// Returns an empty vector when the name is unknown. Multiple
+    /// entries indicate that several files define a function with
+    /// this name — typical for `static` helpers in C. Callers must
+    /// apply their own disambiguation rule rather than guessing,
+    /// because the wrong definition would mislead downstream analyses
+    /// (e.g. flagging a heap overflow against the wrong allocation
+    /// size).
+    pub fn lookup_by_name(&self, name: &str) -> Vec<String> {
+        self.name_index
+            .get(name)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
     /// Get the number of nodes in the call graph
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -2585,5 +2602,50 @@ mod tests {
         let result2 = graph.find_function("run");
         assert_eq!(result1, result2, "find_function must be deterministic");
         assert_eq!(result1, Some("src/agents/mod.rs::run".to_string()));
+    }
+
+    #[test]
+    fn lookup_by_name_returns_every_definition_site() {
+        // Two files defining a function with the same bare name —
+        // the cross-TU heap-overflow resolver consumes this list to
+        // pick the right definition (e.g. same-file static wins).
+        let graph = CallGraph::new();
+        insert_test_node(
+            &graph,
+            "lib/helper.c",
+            CallNode {
+                name: "build_buffer".to_string(),
+                file_path: "lib/helper.c".to_string(),
+                line: 12,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
+        insert_test_node(
+            &graph,
+            "util/other.c",
+            CallNode {
+                name: "build_buffer".to_string(),
+                file_path: "util/other.c".to_string(),
+                line: 7,
+                calls: Vec::new(),
+                called_by: Vec::new(),
+                metrics: FunctionMetrics::default(),
+            },
+        );
+
+        let mut keys = graph.lookup_by_name("build_buffer");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "lib/helper.c::build_buffer".to_string(),
+                "util/other.c::build_buffer".to_string(),
+            ]
+        );
+
+        // Unknown name -> empty vector, not panic / not None.
+        assert!(graph.lookup_by_name("does_not_exist").is_empty());
     }
 }

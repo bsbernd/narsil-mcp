@@ -5169,8 +5169,10 @@ impl CodeIntelEngine {
         repo_name: &str,
         opts: SecurityScanOptions<'_>,
     ) -> Result<String> {
+        use crate::heap_size;
         use crate::security_rules::{
-            is_security_exemplar_file, is_test_file, strip_inline_test_code, SecurityRulesEngine,
+            is_security_exemplar_file, is_test_file, strip_inline_test_code, CallGraphContext,
+            SecurityRulesEngine,
         };
 
         let path = opts.path;
@@ -5234,6 +5236,21 @@ impl CodeIntelEngine {
         let ruleset_tags: Option<Vec<&str>> =
             ruleset.map(|r| r.split(',').map(str::trim).collect());
 
+        // Build a cross-file context backed by the project call graph
+        // so the symbolic heap-overflow pass can resolve allocator
+        // helpers defined in a different translation unit from their
+        // write site. When the call graph is disabled or this repo has
+        // none, fall back to NullContext (per-TU-only behaviour).
+        let graph_ref_opt = self.call_graphs.get(&repo_name);
+        let null_ctx = heap_size::NullContext;
+        let cg_ctx = graph_ref_opt
+            .as_ref()
+            .map(|g| CallGraphContext::new(g.value(), &self.file_cache, &repo_path));
+        let cross_file_ctx: &dyn heap_size::CrossFileContext = match &cg_ctx {
+            Some(c) => c,
+            None => &null_ctx,
+        };
+
         // Scan all files and filter by severity
         let mut findings: Vec<_> = files
             .iter()
@@ -5249,7 +5266,12 @@ impl CodeIntelEngine {
                     Some(tags) => {
                         engine.scan_with_tags(scan_content.as_ref(), &file_str, &lang, tags)
                     }
-                    None => engine.scan(scan_content.as_ref(), &file_str, &lang),
+                    None => engine.scan_with_context(
+                        scan_content.as_ref(),
+                        &file_str,
+                        &lang,
+                        cross_file_ctx,
+                    ),
                 }
             })
             .filter(|f| f.severity >= min_severity)
