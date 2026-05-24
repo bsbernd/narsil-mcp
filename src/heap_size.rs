@@ -513,6 +513,168 @@ fn checked_evaluate(node: Node<'_>, source: &str) -> Option<CheckedValue> {
     }
 }
 
+/// An allocator call with `sizeof(T)` multiplied by a non-constant
+/// operand — the canonical CWE-680 exploit shape. The rule fires on
+/// shape alone; it has no way to know whether the non-constant
+/// operand is bounded elsewhere in the program, so it is an
+/// over-approximation by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeofMulFinding {
+    /// Allocator function name (`malloc`, `calloc`, `realloc`).
+    pub allocator: String,
+    /// Source text of the non-constant operand (the variable that
+    /// could be attacker-controlled).
+    pub variable_operand: String,
+    /// Source text of the `sizeof(...)` expression.
+    pub sizeof_operand: String,
+    /// File the finding is reported against.
+    pub file_path: String,
+    /// 1-indexed line of the allocator call.
+    pub line: usize,
+    /// 1-indexed column of the allocator call.
+    pub column: usize,
+    /// 1-indexed end line of the allocator call.
+    pub end_line: usize,
+    /// 1-indexed end column of the allocator call.
+    pub end_column: usize,
+    /// Source text of the full allocator call.
+    pub snippet: String,
+}
+
+/// Scan `code` for the canonical CWE-680 exploit shape:
+/// `malloc(expr * sizeof(T))` or `calloc(expr, sizeof(T))` where
+/// `expr` is not a compile-time constant. This shape is the most
+/// common path to an integer-overflow-to-buffer bug; if `expr` is
+/// attacker-controlled and large, the multiplication wraps before
+/// reaching the allocator.
+///
+/// **Coverage caveat (for AI callers)**: this rule fires on
+/// structure alone — it does not track whether `expr` is bounded by
+/// a prior check, does not follow it across functions, and does not
+/// inspect taint. A clean scan does NOT prove the file is free of
+/// CWE-680.
+pub fn scan_sizeof_multiplications(code: &str, file_path: &str) -> Vec<SizeofMulFinding> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return Vec::new();
+    };
+
+    let mut findings = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let Some(finding) = recognise_sizeof_mul(node, code, file_path) {
+                findings.push(finding);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    findings
+}
+
+fn recognise_sizeof_mul(call: Node<'_>, source: &str, file_path: &str) -> Option<SizeofMulFinding> {
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .collect();
+
+    let (sizeof_operand, variable_operand) = match function_name {
+        "malloc" => {
+            let size_arg = unwrap_paren(*argument_nodes.first()?);
+            extract_sizeof_mul_operands(size_arg, source)?
+        }
+        "realloc" => {
+            let size_arg = unwrap_paren(*argument_nodes.get(1)?);
+            extract_sizeof_mul_operands(size_arg, source)?
+        }
+        "calloc" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            let first = unwrap_paren(argument_nodes[0]);
+            let second = unwrap_paren(argument_nodes[1]);
+            // Calloc's implicit multiplication: report when one arg
+            // is sizeof(...) and the other is a non-literal expression.
+            match (is_sizeof(first), is_sizeof(second)) {
+                (true, false) if !is_integer_literal(second) => {
+                    (text_of(first, source), text_of(second, source))
+                }
+                (false, true) if !is_integer_literal(first) => {
+                    (text_of(second, source), text_of(first, source))
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let start = call.start_position();
+    let end = call.end_position();
+    let snippet = call.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    Some(SizeofMulFinding {
+        allocator: function_name.to_string(),
+        variable_operand,
+        sizeof_operand,
+        file_path: file_path.to_string(),
+        line: start.row + 1,
+        column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+        snippet,
+    })
+}
+
+/// If `node` is a binary `*` expression with one side `sizeof(...)`
+/// and the other side a non-literal operand, return both as
+/// `(sizeof_text, variable_text)`. Otherwise `None`.
+fn extract_sizeof_mul_operands(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "binary_expression" {
+        return None;
+    }
+    let operator = node
+        .child_by_field_name("operator")
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())?;
+    if operator != "*" {
+        return None;
+    }
+    let left = unwrap_paren(node.child_by_field_name("left")?);
+    let right = unwrap_paren(node.child_by_field_name("right")?);
+    match (is_sizeof(left), is_sizeof(right)) {
+        (true, false) if !is_integer_literal(right) => {
+            Some((text_of(left, source), text_of(right, source)))
+        }
+        (false, true) if !is_integer_literal(left) => {
+            Some((text_of(right, source), text_of(left, source)))
+        }
+        _ => None,
+    }
+}
+
+fn is_sizeof(node: Node<'_>) -> bool {
+    node.kind() == "sizeof_expression"
+}
+
+fn is_integer_literal(node: Node<'_>) -> bool {
+    node.kind() == "number_literal"
+}
+
+fn text_of(node: Node<'_>, source: &str) -> String {
+    node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
+}
+
 /// Parse `code` as C, walk every function definition, and return the
 /// heap-overflow findings the analyser can prove. Top-level entry
 /// point used by the security-rules engine for CWE-122.
@@ -2425,6 +2587,69 @@ mod tests {
         let code = "void *realloc(void *, unsigned long);\n\
                     void f(void *p) { void *q = realloc(p, 8 * 16); }";
         let findings = scan_constant_overflows(code, "ok.c");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn sizeof_mul_detects_malloc_with_variable_times_sizeof() {
+        let code = "void *malloc(unsigned long);\n\
+                    struct foo { int x; };\n\
+                    void f(unsigned long n) {\n\
+                        void *p = malloc(n * sizeof(struct foo));\n\
+                    }";
+        let findings = scan_sizeof_multiplications(code, "vuln.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].allocator, "malloc");
+        assert_eq!(findings[0].variable_operand, "n");
+        assert!(findings[0].sizeof_operand.contains("sizeof"));
+    }
+
+    #[test]
+    fn sizeof_mul_detects_calloc_with_variable_count() {
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(unsigned long n) {\n\
+                        void *p = calloc(n, sizeof(int));\n\
+                    }";
+        let findings = scan_sizeof_multiplications(code, "vuln.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].variable_operand, "n");
+    }
+
+    #[test]
+    fn sizeof_mul_handles_sizeof_on_either_side() {
+        // sizeof(T) * n should match the same as n * sizeof(T).
+        let code = "void *malloc(unsigned long);\n\
+                    void f(unsigned long n) {\n\
+                        void *p = malloc(sizeof(int) * n);\n\
+                    }";
+        let findings = scan_sizeof_multiplications(code, "vuln.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].variable_operand, "n");
+    }
+
+    #[test]
+    fn sizeof_mul_skips_constant_count() {
+        // 4 * sizeof(int) — both literal, no overflow risk.
+        let code = "void *malloc(unsigned long);\n\
+                    void f(void) { void *p = malloc(4 * sizeof(int)); }";
+        let findings = scan_sizeof_multiplications(code, "ok.c");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn sizeof_mul_skips_call_without_sizeof() {
+        // n * 4 — no sizeof, out of scope for this rule.
+        let code = "void *malloc(unsigned long);\n\
+                    void f(unsigned long n) { void *p = malloc(n * 4); }";
+        let findings = scan_sizeof_multiplications(code, "ok.c");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn sizeof_mul_skips_calloc_with_two_constants() {
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(void) { void *p = calloc(8, sizeof(int)); }";
+        let findings = scan_sizeof_multiplications(code, "ok.c");
         assert!(findings.is_empty());
     }
 

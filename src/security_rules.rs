@@ -13,7 +13,7 @@
 //! - **ControlFlow**: Required operations before sensitive calls
 //! - **Typestate**: State machine validation (future)
 
-use crate::heap_size::{self, ConstantOverflowFinding, HeapOverflowFinding};
+use crate::heap_size::{self, ConstantOverflowFinding, HeapOverflowFinding, SizeofMulFinding};
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -807,6 +807,15 @@ impl SecurityRulesEngine {
                     heap_size::scan_constant_overflows(code, file_path)
                         .into_iter()
                         .map(|finding| constant_overflow_to_security_finding(finding, rule)),
+                );
+            }
+        }
+        if let Some(rule) = self.rules.get("CWE-680-002") {
+            if rule.enabled {
+                out.extend(
+                    heap_size::scan_sizeof_multiplications(code, file_path)
+                        .into_iter()
+                        .map(|finding| sizeof_mul_to_security_finding(finding, rule)),
                 );
             }
         }
@@ -1791,6 +1800,37 @@ impl SecurityRulesEngine {
             tags: vec!["memory".to_string(), "integer-overflow".to_string()],
         });
 
+        // CWE-680-002: the structural sizeof(T) × variable shape.
+        // Severity is High rather than Critical because the rule
+        // fires on shape alone — it cannot tell whether the variable
+        // operand is bounded by a prior check, so a non-trivial false
+        // positive rate is intrinsic.
+        self.add_rule(SecurityRule {
+            id: "CWE-680-002".to_string(),
+            name: "Integer Overflow in Allocator Size (variable × sizeof)".to_string(),
+            severity: Severity::High,
+            cwe: vec!["CWE-680".to_string()],
+            owasp: vec![],
+            rule_type: RuleType::Pattern {
+                patterns: vec![],
+                safe_patterns: vec![],
+            },
+            languages: vec!["c".to_string(), "cpp".to_string()],
+            message: "Allocator size is a variable count multiplied by sizeof(T) — \
+                      if the count is attacker-controlled and large, the \
+                      multiplication wraps before reaching the allocator. \
+                      Note: this rule is a PARTIAL check — it fires on shape \
+                      alone and may miss bugs hidden behind helper functions or \
+                      flag safe call sites whose bounds-checking happens \
+                      elsewhere. Verify the operand is bounded."
+                .to_string(),
+            remediation: "Cap the variable operand against a maximum, or use a checked \
+                 multiplication helper before passing the product to the allocator"
+                .to_string(),
+            enabled: true,
+            tags: vec!["memory".to_string(), "integer-overflow".to_string()],
+        });
+
         // CWE-79: XSS (already covered in OWASP A03)
 
         // CWE-89: SQL Injection (already covered in OWASP A03)
@@ -2311,6 +2351,37 @@ fn constant_overflow_to_security_finding(
         rule_name: rule.name.clone(),
         severity: rule.severity,
         confidence: Confidence::High,
+        file_path: finding.file_path,
+        line: finding.line,
+        column: finding.column,
+        end_line: finding.end_line,
+        end_column: finding.end_column,
+        snippet: finding.snippet,
+        message,
+        remediation: rule.remediation.clone(),
+        cwe: rule.cwe.clone(),
+        owasp: rule.owasp.clone(),
+        context: HashMap::new(),
+    }
+}
+
+/// Project a sizeof-multiplication finding into a [`SecurityFinding`].
+/// Confidence is Medium because the rule fires on shape alone; the
+/// "PARTIAL check" caveat in the rule's message stays verbatim so AI
+/// callers see it on every emitted finding.
+fn sizeof_mul_to_security_finding(
+    finding: SizeofMulFinding,
+    rule: &SecurityRule,
+) -> SecurityFinding {
+    let message = format!(
+        "{} in {}: '{}' × {} — bound the variable operand or use a checked multiply",
+        rule.message, finding.allocator, finding.variable_operand, finding.sizeof_operand,
+    );
+    SecurityFinding {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        severity: rule.severity,
+        confidence: Confidence::Medium,
         file_path: finding.file_path,
         line: finding.line,
         column: finding.column,
@@ -3044,6 +3115,24 @@ strcpy(dest, src);
                     }";
         let findings = engine.scan_cwe_top25(code, "overflow.c", "c");
         assert!(findings.iter().any(|f| f.rule_id == "CWE-122-001"));
+    }
+
+    /// CWE-680-002 must fire on the canonical `n * sizeof(T)`
+    /// shape and the message must carry the partial-coverage caveat.
+    #[test]
+    fn test_scan_emits_cwe_680_002_with_caveat() {
+        let engine = SecurityRulesEngine::new();
+        let code = "void *malloc(unsigned long);\n\
+                    struct foo { int x; };\n\
+                    void f(unsigned long n) {\n\
+                        void *p = malloc(n * sizeof(struct foo));\n\
+                    }";
+        let findings = engine.scan(code, "vuln.c", "c");
+        let finding = findings
+            .iter()
+            .find(|f| f.rule_id == "CWE-680-002")
+            .expect("CWE-680-002 must fire on n * sizeof(T)");
+        assert!(finding.message.contains("PARTIAL check"));
     }
 
     /// CWE-680-001 must fire on calloc with a wrapping literal
