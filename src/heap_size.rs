@@ -9,6 +9,7 @@
 //! under-sized-allocation-plus-sprintf overflow shape this module
 //! exists to catch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -729,14 +730,13 @@ pub fn scan_heap_overflows(code: &str, file_path: &str) -> Vec<HeapOverflowFindi
 }
 
 /// Like [`scan_heap_overflows`] but consults `ctx` when the
-/// translation-unit-local summary cache misses a callee. The context
-/// is not used yet — this entry point exists so the security-rules
-/// engine can thread it through; the cross-TU resolution itself
-/// lands in a later patch.
+/// translation-unit-local summary cache misses a callee — closes the
+/// gap that left allocations in a helper TU paired with writes in a
+/// caller TU invisible to the analyser.
 pub fn scan_heap_overflows_with_context(
     code: &str,
     file_path: &str,
-    _ctx: &dyn CrossFileContext,
+    ctx: &dyn CrossFileContext,
 ) -> Vec<HeapOverflowFinding> {
     let mut parser = tree_sitter::Parser::new();
     if parser
@@ -750,13 +750,15 @@ pub fn scan_heap_overflows_with_context(
     };
 
     let cache = build_function_summary_cache(tree.root_node(), code);
+    let resolver = CrossFileResolver::new(file_path, ctx);
 
     let mut findings = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_definition" {
             if let Some(body) = node.child_by_field_name("body") {
-                let allocations = collect_allocation_sizes_with_cache(body, code, &cache);
+                let allocations =
+                    collect_allocation_sizes_with_xfile(body, code, &cache, &resolver);
                 let write_sites = collect_write_sites(body, code);
                 findings.extend(detect_overflows(&allocations, &write_sites, file_path));
             }
@@ -769,6 +771,96 @@ pub fn scan_heap_overflows_with_context(
         }
     }
     findings
+}
+
+/// Per-scan state for cross-translation-unit allocator resolution.
+/// Built once per `scan_heap_overflows_with_context` call and threaded
+/// down to [`recognise_allocator_call_with_cache`]. The memo prevents
+/// re-parsing the same external file for repeat lookups and breaks
+/// recursion by treating an in-progress entry as `Unresolvable`.
+struct CrossFileResolver<'a> {
+    current_file: &'a str,
+    ctx: &'a dyn CrossFileContext,
+    memo: RefCell<HashMap<String, MaybeSummary>>,
+}
+
+#[derive(Clone)]
+enum MaybeSummary {
+    InProgress,
+    Resolved(FunctionAllocationSummary),
+    Unresolvable,
+}
+
+impl<'a> CrossFileResolver<'a> {
+    fn new(current_file: &'a str, ctx: &'a dyn CrossFileContext) -> Self {
+        Self {
+            current_file,
+            ctx,
+            memo: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve a callee name to its function-allocation summary by
+    /// asking the context and then summarising the returned source.
+    /// Returns `None` when the context cannot disambiguate the name,
+    /// when the resolved file fails to parse, or when the callee has
+    /// no recognisable allocation shape (i.e. its summary would be
+    /// `Unknown` anyway).
+    fn resolve(&self, function_name: &str) -> Option<FunctionAllocationSummary> {
+        let location = self.ctx.locate_function(function_name, self.current_file)?;
+        let cache_key = format!("{}::{}", location.file_path, function_name);
+
+        if let Some(existing) = self.memo.borrow().get(&cache_key).cloned() {
+            return match existing {
+                MaybeSummary::Resolved(summary) => Some(summary),
+                MaybeSummary::InProgress | MaybeSummary::Unresolvable => None,
+            };
+        }
+        self.memo
+            .borrow_mut()
+            .insert(cache_key.clone(), MaybeSummary::InProgress);
+
+        let summary = parse_and_summarise_function(&location.source, function_name);
+        let outcome = match &summary {
+            Some(s) => MaybeSummary::Resolved(s.clone()),
+            None => MaybeSummary::Unresolvable,
+        };
+        self.memo.borrow_mut().insert(cache_key, outcome);
+        summary
+    }
+}
+
+/// Parse `source` as C and return the allocation summary of the
+/// function named `function_name`, or `None` when the file does not
+/// parse or the function is absent / has no recognisable allocation.
+fn parse_and_summarise_function(
+    source: &str,
+    function_name: &str,
+) -> Option<FunctionAllocationSummary> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let cache = build_function_summary_cache(tree.root_node(), source);
+    let summary = cache.get(function_name)?.clone();
+    if matches!(summary.return_size, SizeExpr::Unknown) {
+        return None;
+    }
+    Some(summary)
+}
+
+/// Cross-file-aware variant of [`collect_allocation_sizes_with_cache`].
+/// Used only by [`scan_heap_overflows_with_context`]; the public
+/// cache-aware entry stays per-TU so direct callers (tests, single-file
+/// scans) get the predictable per-TU semantics they always had.
+fn collect_allocation_sizes_with_xfile(
+    function_body: Node<'_>,
+    source: &str,
+    cache: &HashMap<String, FunctionAllocationSummary>,
+    resolver: &CrossFileResolver<'_>,
+) -> HashMap<String, SizeExpr> {
+    let mut out = HashMap::new();
+    collect_into(function_body, source, cache, &mut out, Some(resolver));
+    out
 }
 
 /// Split a [`SizeExpr`] into its multiset of `StrlenOf` arguments and
@@ -886,7 +978,7 @@ pub fn collect_allocation_sizes_with_cache(
     cache: &HashMap<String, FunctionAllocationSummary>,
 ) -> HashMap<String, SizeExpr> {
     let mut out = HashMap::new();
-    collect_into(function_body, source, cache, &mut out);
+    collect_into(function_body, source, cache, &mut out, None);
     out
 }
 
@@ -968,6 +1060,7 @@ fn collect_into(
     source: &str,
     cache: &HashMap<String, FunctionAllocationSummary>,
     out: &mut HashMap<String, SizeExpr>,
+    resolver: Option<&CrossFileResolver<'_>>,
 ) {
     match node.kind() {
         "call_expression" => {
@@ -984,7 +1077,7 @@ fn collect_into(
                     if let (Some(decl), Some(rhs)) = (declarator, value) {
                         if let Some(name) = extract_lhs_name(decl, source) {
                             if let Some(size) =
-                                recognise_allocator_call_with_cache(rhs, source, cache)
+                                recognise_allocator_call_with_cache(rhs, source, cache, resolver)
                             {
                                 out.insert(name, size);
                             }
@@ -998,7 +1091,9 @@ fn collect_into(
             let rhs = node.child_by_field_name("right");
             if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
                 if let Some(name) = extract_lhs_name(lhs, source) {
-                    if let Some(size) = recognise_allocator_call_with_cache(rhs, source, cache) {
+                    if let Some(size) =
+                        recognise_allocator_call_with_cache(rhs, source, cache, resolver)
+                    {
                         out.insert(name, size);
                     }
                 }
@@ -1009,7 +1104,7 @@ fn collect_into(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_into(child, source, cache, out);
+        collect_into(child, source, cache, out, resolver);
     }
 }
 
@@ -1232,18 +1327,19 @@ pub fn substitute_parameters(
 }
 
 /// Cache-aware variant of [`recognise_allocator_call`]. Falls through
-/// to the direct allocator recognition first; if that fails and the
-/// call's function name is in the cache, returns the cached return
-/// size with parameter substitution applied.
+/// to the direct allocator recognition first; if that fails, tries the
+/// per-TU `cache`; if that also misses and a `resolver` is supplied,
+/// asks the resolver for a cross-translation-unit definition.
 fn recognise_allocator_call_with_cache(
     node: Node<'_>,
     source: &str,
     cache: &HashMap<String, FunctionAllocationSummary>,
+    resolver: Option<&CrossFileResolver<'_>>,
 ) -> Option<SizeExpr> {
     if let Some(direct) = recognise_allocator_call(node, source) {
         return Some(direct);
     }
-    if cache.is_empty() {
+    if cache.is_empty() && resolver.is_none() {
         return None;
     }
     let call = unwrap_to_call(node)?;
@@ -1251,7 +1347,10 @@ fn recognise_allocator_call_with_cache(
         .child_by_field_name("function")?
         .utf8_text(source.as_bytes())
         .ok()?;
-    let summary = cache.get(function_name)?;
+    let summary = match cache.get(function_name) {
+        Some(local) => local.clone(),
+        None => resolver?.resolve(function_name)?,
+    };
     let arguments = call.child_by_field_name("arguments")?;
     let argument_texts: Vec<String> = (0..(arguments.named_child_count() as u32))
         .filter_map(|idx| arguments.named_child(idx))
@@ -2738,5 +2837,88 @@ mod tests {
         let ctx = NullContext;
         assert!(ctx.locate_function("anything", "caller.c").is_none());
         assert!(ctx.locate_function("", "").is_none());
+    }
+
+    /// Test-only resolver: returns a fixed `(file_path, source)` for
+    /// every name listed in its `entries`. Used to drive
+    /// [`scan_heap_overflows_with_context`] across synthetic file
+    /// boundaries without standing up a full call graph.
+    struct MockContext {
+        entries: std::collections::HashMap<String, (String, String)>,
+    }
+
+    impl MockContext {
+        fn with(name: &str, file_path: &str, source: &str) -> Self {
+            let mut entries = std::collections::HashMap::new();
+            entries.insert(
+                name.to_string(),
+                (file_path.to_string(), source.to_string()),
+            );
+            MockContext { entries }
+        }
+    }
+
+    impl CrossFileContext for MockContext {
+        fn locate_function(&self, name: &str, _caller_file: &str) -> Option<FunctionLocation> {
+            self.entries
+                .get(name)
+                .map(|(file_path, source)| FunctionLocation {
+                    file_path: file_path.clone(),
+                    source: source.clone(),
+                })
+        }
+    }
+
+    #[test]
+    fn scan_heap_overflows_with_context_detects_cross_translation_unit_overflow() {
+        // The whole point of this patch series: an allocator helper in
+        // one .c file paired with an over-sized write in another must
+        // surface as a CWE-122 finding. With per-TU-only resolution
+        // (NullContext) the same scan returns nothing — captured by
+        // the second half of this test.
+        let helper_source = "char *small_buf(void) {\n    return malloc(4);\n}\n";
+        let caller_source =
+            "void use(void) {\n    char *p = small_buf();\n    strcpy(p, \"hello world\");\n}\n";
+
+        let ctx = MockContext::with("small_buf", "lib/helper.c", helper_source);
+        let cross_findings = scan_heap_overflows_with_context(caller_source, "util/caller.c", &ctx);
+        assert_eq!(
+            cross_findings.len(),
+            1,
+            "exactly one cross-TU CWE-122 finding expected, got {:?}",
+            cross_findings,
+        );
+        assert_eq!(cross_findings[0].file_path, "util/caller.c");
+
+        // Baseline: with NullContext the analyser cannot see the helper
+        // and so emits no finding. Guards against the resolver
+        // accidentally becoming a no-op in future refactors.
+        let baseline =
+            scan_heap_overflows_with_context(caller_source, "util/caller.c", &NullContext);
+        assert!(
+            baseline.is_empty(),
+            "NullContext path must remain per-TU only, got {:?}",
+            baseline,
+        );
+    }
+
+    #[test]
+    fn cross_file_resolver_does_not_infinite_loop_on_recursive_helper() {
+        // A helper that calls itself must not send the resolver into a
+        // cycle. The InProgress marker turns the recursive lookup into
+        // an Unresolvable result; compute_return_size then sees a
+        // mixed-shape return set and yields Unknown, so the caller
+        // ends up with no resolved allocation size — no finding, no
+        // hang, no panic.
+        let helper_source = "char *loops(int n) {\n    if (n == 0) return malloc(1);\n    return loops(n - 1);\n}\n";
+        let caller_source = "void use(void) {\n    char *p = loops(3);\n    strcpy(p, \"x\");\n}\n";
+
+        let ctx = MockContext::with("loops", "lib/helper.c", helper_source);
+        let findings = scan_heap_overflows_with_context(caller_source, "util/caller.c", &ctx);
+        assert!(
+            findings.is_empty(),
+            "recursive helper must short-circuit to Unknown, got {:?}",
+            findings,
+        );
     }
 }
