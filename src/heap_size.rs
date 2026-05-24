@@ -318,12 +318,14 @@ pub fn scan_heap_overflows(code: &str, file_path: &str) -> Vec<HeapOverflowFindi
         return Vec::new();
     };
 
+    let cache = build_function_summary_cache(tree.root_node(), code);
+
     let mut findings = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_definition" {
             if let Some(body) = node.child_by_field_name("body") {
-                let allocations = collect_allocation_sizes(body, code);
+                let allocations = collect_allocation_sizes_with_cache(body, code, &cache);
                 let write_sites = collect_write_sites(body, code);
                 findings.extend(detect_overflows(&allocations, &write_sites, file_path));
             }
@@ -439,8 +441,21 @@ pub fn collect_allocation_sizes(
     function_body: Node<'_>,
     source: &str,
 ) -> HashMap<String, SizeExpr> {
+    collect_allocation_sizes_with_cache(function_body, source, &HashMap::new())
+}
+
+/// Cache-aware variant of [`collect_allocation_sizes`]. Resolves
+/// `char *buf = helper();` shapes when `helper` appears in the
+/// translation-unit cache built by
+/// [`build_function_summary_cache`]. The cache lets the analyser see
+/// the allocation through one call hop without losing precision.
+pub fn collect_allocation_sizes_with_cache(
+    function_body: Node<'_>,
+    source: &str,
+    cache: &HashMap<String, FunctionAllocationSummary>,
+) -> HashMap<String, SizeExpr> {
     let mut out = HashMap::new();
-    collect_into(function_body, source, &mut out);
+    collect_into(function_body, source, cache, &mut out);
     out
 }
 
@@ -517,7 +532,12 @@ fn extract_function_name(function_definition: Node<'_>, source: &str) -> Option<
     }
 }
 
-fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr>) {
+fn collect_into(
+    node: Node<'_>,
+    source: &str,
+    cache: &HashMap<String, FunctionAllocationSummary>,
+    out: &mut HashMap<String, SizeExpr>,
+) {
     match node.kind() {
         "call_expression" => {
             if let Some((destination, size)) = recognise_asprintf_call(node, source) {
@@ -532,7 +552,9 @@ fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr
                     let value = child.child_by_field_name("value");
                     if let (Some(decl), Some(rhs)) = (declarator, value) {
                         if let Some(name) = extract_lhs_name(decl, source) {
-                            if let Some(size) = recognise_allocator_call(rhs, source) {
+                            if let Some(size) =
+                                recognise_allocator_call_with_cache(rhs, source, cache)
+                            {
                                 out.insert(name, size);
                             }
                         }
@@ -545,7 +567,7 @@ fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr
             let rhs = node.child_by_field_name("right");
             if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
                 if let Some(name) = extract_lhs_name(lhs, source) {
-                    if let Some(size) = recognise_allocator_call(rhs, source) {
+                    if let Some(size) = recognise_allocator_call_with_cache(rhs, source, cache) {
                         out.insert(name, size);
                     }
                 }
@@ -556,7 +578,7 @@ fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_into(child, source, out);
+        collect_into(child, source, cache, out);
     }
 }
 
@@ -677,6 +699,236 @@ fn extract_string_literal_content(node: Node<'_>, source: &str) -> Option<String
         }
     }
     Some(decoded)
+}
+
+/// Summary of a function's allocation behaviour usable as a one-hop
+/// substitute for an allocator call. The size is expressed in terms of
+/// the function's *parameter names*; [`substitute_parameters`] swaps
+/// those for the call-site argument expressions to produce a size
+/// scoped to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionAllocationSummary {
+    /// Parameter names in declaration order. May be empty for varargs
+    /// or unnamed parameters; in either case [`substitute_parameters`]
+    /// leaves the corresponding terms untouched.
+    pub parameter_names: Vec<String>,
+    /// Size returned by the function, in terms of the parameter names.
+    /// `Unknown` when the analyser cannot identify a single
+    /// well-defined return size across every reachable `return`.
+    pub return_size: SizeExpr,
+}
+
+/// Build a translation-unit-wide cache of return-allocation summaries
+/// for every function definition rooted under `root`. Callers that see
+/// `char *buf = helper(arg);` use this cache to resolve `buf`'s size
+/// instead of recording an Unknown.
+///
+/// A function is summarised only when every reachable `return` returns
+/// a recognised allocator call with the same symbolic size — otherwise
+/// the entry is omitted, mirroring the analyser's "miss rather than
+/// misreport" stance.
+pub fn build_function_summary_cache(
+    root: Node<'_>,
+    source: &str,
+) -> HashMap<String, FunctionAllocationSummary> {
+    let mut out = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            if let Some((name, summary)) = summarise_function_allocation(node, source) {
+                out.insert(name, summary);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Summarise a function for the cross-function cache. Returns the
+/// function's name and the [`FunctionAllocationSummary`] derived from
+/// its parameter list and return statements. Returns `None` when the
+/// function has no extractable name or no body.
+pub fn summarise_function_allocation(
+    function_definition: Node<'_>,
+    source: &str,
+) -> Option<(String, FunctionAllocationSummary)> {
+    if function_definition.kind() != "function_definition" {
+        return None;
+    }
+    let name = extract_function_name(function_definition, source)?;
+    let parameter_names = extract_parameter_names(function_definition, source);
+    let body = function_definition.child_by_field_name("body")?;
+    let return_size = compute_return_size(body, source);
+    Some((
+        name,
+        FunctionAllocationSummary {
+            parameter_names,
+            return_size,
+        },
+    ))
+}
+
+/// Substitute call-site argument expressions for the function's
+/// parameter names inside a return-size expression. `StrlenOf(p)` for
+/// a parameter `p` becomes `StrlenOf(argument_text)`; everything else
+/// is preserved verbatim.
+pub fn substitute_parameters(
+    expr: &SizeExpr,
+    parameter_names: &[String],
+    argument_texts: &[String],
+) -> SizeExpr {
+    match expr {
+        SizeExpr::Constant(value) => SizeExpr::Constant(*value),
+        SizeExpr::StrlenOf(name) => parameter_names
+            .iter()
+            .position(|param| param == name)
+            .and_then(|idx| argument_texts.get(idx).cloned())
+            .map(SizeExpr::StrlenOf)
+            .unwrap_or_else(|| SizeExpr::StrlenOf(name.clone())),
+        SizeExpr::Sum(parts) => {
+            let mut result = SizeExpr::Constant(0);
+            for part in parts {
+                result = result.add(substitute_parameters(part, parameter_names, argument_texts));
+            }
+            result
+        }
+        SizeExpr::Unknown => SizeExpr::Unknown,
+    }
+}
+
+/// Cache-aware variant of [`recognise_allocator_call`]. Falls through
+/// to the direct allocator recognition first; if that fails and the
+/// call's function name is in the cache, returns the cached return
+/// size with parameter substitution applied.
+fn recognise_allocator_call_with_cache(
+    node: Node<'_>,
+    source: &str,
+    cache: &HashMap<String, FunctionAllocationSummary>,
+) -> Option<SizeExpr> {
+    if let Some(direct) = recognise_allocator_call(node, source) {
+        return Some(direct);
+    }
+    if cache.is_empty() {
+        return None;
+    }
+    let call = unwrap_to_call(node)?;
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    let summary = cache.get(function_name)?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_texts: Vec<String> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+        .collect();
+    Some(substitute_parameters(
+        &summary.return_size,
+        &summary.parameter_names,
+        &argument_texts,
+    ))
+}
+
+/// Extract parameter identifier names from a `function_definition` in
+/// declaration order. Parameters whose declarator cannot be resolved
+/// to a plain identifier are emitted as empty strings — that keeps
+/// positional indices aligned for [`substitute_parameters`], so an
+/// untyped or pointer-typed parameter does not silently shift later
+/// arguments' substitution mapping.
+fn extract_parameter_names(function_definition: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = find_parameter_list(function_definition) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.children(&mut cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let declarator = child.child_by_field_name("declarator");
+        let name = declarator
+            .and_then(|node| extract_innermost_identifier(node, source))
+            .unwrap_or_default();
+        names.push(name);
+    }
+    names
+}
+
+fn find_parameter_list<'a>(function_definition: Node<'a>) -> Option<Node<'a>> {
+    let mut declarator = function_definition.child_by_field_name("declarator")?;
+    loop {
+        match declarator.kind() {
+            "function_declarator" => {
+                return declarator.child_by_field_name("parameters");
+            }
+            "pointer_declarator" | "parenthesized_declarator" => {
+                declarator = declarator.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn extract_innermost_identifier(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source.as_bytes()).ok().map(str::to_string),
+        "pointer_declarator"
+        | "parenthesized_declarator"
+        | "array_declarator"
+        | "function_declarator" => {
+            let inner = node.child_by_field_name("declarator")?;
+            extract_innermost_identifier(inner, source)
+        }
+        _ => None,
+    }
+}
+
+/// Walk a function body and compute the single symbolic return-size
+/// every reachable `return <allocator>` agrees on, or `Unknown` if any
+/// return path disagrees, returns a non-allocator expression, or no
+/// return exists.
+fn compute_return_size(body: Node<'_>, source: &str) -> SizeExpr {
+    let return_expressions = collect_return_expressions(body);
+    if return_expressions.is_empty() {
+        return SizeExpr::Unknown;
+    }
+    let mut sizes_iter = return_expressions
+        .into_iter()
+        .map(|expr| recognise_allocator_call(expr, source).unwrap_or(SizeExpr::Unknown));
+    let first_size = sizes_iter.next().unwrap_or(SizeExpr::Unknown);
+    if matches!(first_size, SizeExpr::Unknown) {
+        return SizeExpr::Unknown;
+    }
+    for size in sizes_iter {
+        if size != first_size {
+            return SizeExpr::Unknown;
+        }
+    }
+    first_size
+}
+
+fn collect_return_expressions<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    walk_returns(node, &mut out);
+    out
+}
+
+fn walk_returns<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    if node.kind() == "return_statement" {
+        for idx in 0..(node.named_child_count() as u32) {
+            if let Some(child) = node.named_child(idx) {
+                out.push(child);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_returns(child, out);
+    }
 }
 
 fn recognise_allocator_call(node: Node<'_>, source: &str) -> Option<SizeExpr> {
@@ -1781,6 +2033,132 @@ mod tests {
         let findings = run_scan(code);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].snippet.contains("longer"), true);
+    }
+
+    #[test]
+    fn substitute_parameters_swaps_strlen_argument() {
+        let template = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        let result = substitute_parameters(
+            &template,
+            &["name".to_string()],
+            &["caller_name".to_string()],
+        );
+        let expected = SizeExpr::StrlenOf("caller_name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn substitute_parameters_preserves_unrelated_strlen_terms() {
+        // strlen(other) is not a parameter of the function — leave it
+        // alone rather than mis-substituting.
+        let template = SizeExpr::StrlenOf("other".into()).add(SizeExpr::Constant(1));
+        let result = substitute_parameters(
+            &template,
+            &["name".to_string()],
+            &["caller_arg".to_string()],
+        );
+        let expected = SizeExpr::StrlenOf("other".into()).add(SizeExpr::Constant(1));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn build_function_summary_cache_records_returned_allocation() {
+        let code = "char *malloc(unsigned long);\n\
+                    unsigned long strlen(const char *);\n\
+                    char *helper(const char *name) {\n\
+                        return malloc(strlen(name) + 1);\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("helper").expect("helper must be summarised");
+        assert_eq!(summary.parameter_names, vec!["name".to_string()]);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(summary.return_size, expected);
+    }
+
+    #[test]
+    fn build_function_summary_cache_skips_non_allocator_returns() {
+        // helper returns a non-allocator pointer — we must not invent
+        // a size, just leave its return_size Unknown.
+        let code = "char *helper(char *p) { return p; }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("helper").expect("helper summarised");
+        assert_eq!(summary.return_size, SizeExpr::Unknown);
+    }
+
+    #[test]
+    fn build_function_summary_cache_returns_unknown_for_disagreeing_returns() {
+        // Two returns of different sizes — the cache must not pick one
+        // arbitrarily.
+        let code = "char *malloc(unsigned long);\n\
+                    char *helper(int branch) {\n\
+                        if (branch) { return malloc(8); }\n\
+                        return malloc(16);\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("helper").expect("helper summarised");
+        assert_eq!(summary.return_size, SizeExpr::Unknown);
+    }
+
+    #[test]
+    fn cross_function_helper_resolves_caller_allocation_through_cache() {
+        // helper allocates strlen(name) + 1; caller passes a *different*
+        // identifier and writes a long literal that exceeds it.
+        // The substitution must rename the strlen argument to the
+        // caller's actual variable.
+        let code = "char *malloc(unsigned long);\n\
+                    unsigned long strlen(const char *);\n\
+                    char *strcpy(char *, const char *);\n\
+                    char *helper(const char *name) {\n\
+                        return malloc(strlen(name) + 1);\n\
+                    }\n\
+                    void caller(const char *user_input) {\n\
+                        char *buf = helper(user_input);\n\
+                        strcpy(buf, \"longer than user input might be\");\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("helper").unwrap();
+        let argument_texts = vec!["user_input".to_string()];
+        let resolved = substitute_parameters(
+            &summary.return_size,
+            &summary.parameter_names,
+            &argument_texts,
+        );
+        let expected = SizeExpr::StrlenOf("user_input".into()).add(SizeExpr::Constant(1));
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn scan_heap_overflows_resolves_caller_buffer_through_helper() {
+        // End-to-end: the caller's buf is sized by helper(); the
+        // strcpy with a 31-byte literal overflows strlen(user_input)+1
+        // only when constants dominate, which they do here because
+        // the write side has the same StrlenOf term plus a larger
+        // constant.
+        let code = "char *malloc(unsigned long);\n\
+                    unsigned long strlen(const char *);\n\
+                    char *strcpy(char *, const char *);\n\
+                    char *helper(const char *name) {\n\
+                        return malloc(strlen(name));\n\
+                    }\n\
+                    void caller(const char *user_input) {\n\
+                        char *buf = helper(user_input);\n\
+                        strcpy(buf, user_input);\n\
+                    }";
+        // helper returns strlen(name); caller writes strlen(user_input) + 1
+        // (the NUL). After substitution, alloc = strlen(user_input),
+        // write = strlen(user_input) + 1. write_constant > alloc_constant
+        // and strlen multisets match — overflow.
+        let findings = scan_heap_overflows(code, "cross.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].destination, "buf");
     }
 
     #[test]
