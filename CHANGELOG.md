@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Symbolic heap-overflow detection (CWE-122-001)**. A new `heap_size`
+  subsystem builds a `SizeExpr` algebra for allocator calls
+  (`malloc`/`calloc`/`realloc`/`asprintf`/`vasprintf`/`strdup`/`strndup`)
+  and string-writing calls (`sprintf`/`vsprintf`/`strcpy`/`strncpy`/
+  `strcat`/`memcpy`/`memmove`/`memset`) and emits a Critical-severity
+  CWE-122-001 finding when the write provably exceeds the allocation.
+  Detection is symbolic: `Constant(40)` vs `Constant(32)` fires,
+  `StrlenOf(name) + 2` vs `StrlenOf(name) + 1` fires, and
+  `Unknown`-tainted expressions short-circuit to "no finding" so the
+  rule never invents false positives. A per-translation-unit
+  function-summary cache resolves one-hop helper allocations like
+  `char *buf = helper(arg);` by substituting the caller's argument
+  expressions for the callee's parameter names.
+- **`scan_security` now folds taint flows into its output**. Every
+  unsanitised flow from the taint analyser surfaces as a `TAINT-*`
+  `SecurityFinding` anchored at the sink, carrying the
+  vulnerability's CWE, OWASP category, severity, and confidence
+  verbatim. Callers no longer need to chain `get_taint_sources` +
+  `trace_taint` to see source-to-sink coverage.
+- **New `security_audit` MCP tool**. A single aggregator that runs
+  every security pass the engine supports (pattern rules, symbolic
+  CWE-122 detection, taint flows) and returns one ranked report
+  prefixed with a summary panel. Use this instead of chaining
+  `scan_security` + `check_owasp_top10` + `check_cwe_top25` by hand.
+  The accompanying `/security-audit` skill documents when to reach
+  for the aggregator vs. the individual tools.
+
 ## [1.7.0] - 2026-05-12
 
 ### Fixed
