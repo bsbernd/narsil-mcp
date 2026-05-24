@@ -303,6 +303,216 @@ pub fn detect_overflows(
     findings
 }
 
+/// A literal-only arithmetic expression in an allocator argument that
+/// would wrap u64 at runtime, producing a smaller-than-intended
+/// allocation. The canonical CWE-680 shape, but limited to the
+/// fully-provable constant case — non-literal operands are out of
+/// scope (see CWE-680-002 for the sizeof-multiplication shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantOverflowFinding {
+    /// Allocator function name (`malloc`, `calloc`, `realloc`).
+    pub allocator: String,
+    /// Source text of the offending arithmetic expression.
+    pub expression: String,
+    /// Left operand value as written in source.
+    pub left_value: u64,
+    /// Right operand value as written in source.
+    pub right_value: u64,
+    /// Arithmetic operator, `*` or `+`.
+    pub operator: &'static str,
+    /// File the finding is reported against.
+    pub file_path: String,
+    /// 1-indexed line of the allocator call.
+    pub line: usize,
+    /// 1-indexed column of the allocator call.
+    pub column: usize,
+    /// 1-indexed end line of the allocator call.
+    pub end_line: usize,
+    /// 1-indexed end column of the allocator call.
+    pub end_column: usize,
+    /// Source text of the full allocator call.
+    pub snippet: String,
+}
+
+/// Scan `code` for CWE-680 constant-arithmetic wraparound in
+/// allocator size arguments. Only fires when every operand is a
+/// literal — there is no value-range analysis, no taint, and no
+/// inter-procedural reasoning. A negative result does **not** prove
+/// the file is free of integer-overflow-to-buffer bugs.
+pub fn scan_constant_overflows(code: &str, file_path: &str) -> Vec<ConstantOverflowFinding> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return Vec::new();
+    };
+
+    let mut findings = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let Some(finding) = recognise_constant_overflow(node, code, file_path) {
+                findings.push(finding);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    findings
+}
+
+fn recognise_constant_overflow(
+    call: Node<'_>,
+    source: &str,
+    file_path: &str,
+) -> Option<ConstantOverflowFinding> {
+    let function_name = call
+        .child_by_field_name("function")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let argument_nodes: Vec<Node<'_>> = (0..(arguments.named_child_count() as u32))
+        .filter_map(|idx| arguments.named_child(idx))
+        .collect();
+
+    let candidate = match function_name {
+        "malloc" => argument_nodes.first().copied().and_then(|arg| {
+            evaluate_for_overflow(arg, source).map(|(op, l, r)| {
+                let expression = arg.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                (op, l, r, expression)
+            })
+        }),
+        "realloc" => argument_nodes.get(1).copied().and_then(|arg| {
+            evaluate_for_overflow(arg, source).map(|(op, l, r)| {
+                let expression = arg.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                (op, l, r, expression)
+            })
+        }),
+        "calloc" => {
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            let nmemb = checked_evaluate(argument_nodes[0], source)?;
+            let size = checked_evaluate(argument_nodes[1], source)?;
+            let (nmemb, size) = match (nmemb, size) {
+                (CheckedValue::Constant(a), CheckedValue::Constant(b)) => (a, b),
+                _ => return None,
+            };
+            if nmemb.checked_mul(size).is_some() {
+                return None;
+            }
+            let nmemb_text = argument_nodes[0]
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            let size_text = argument_nodes[1]
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            Some(("*", nmemb, size, format!("{} * {}", nmemb_text, size_text)))
+        }
+        _ => None,
+    };
+
+    let (operator, left_value, right_value, expression) = candidate?;
+    let start = call.start_position();
+    let end = call.end_position();
+    let snippet = call.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    Some(ConstantOverflowFinding {
+        allocator: function_name.to_string(),
+        expression,
+        left_value,
+        right_value,
+        operator,
+        file_path: file_path.to_string(),
+        line: start.row + 1,
+        column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+        snippet,
+    })
+}
+
+enum CheckedValue {
+    Constant(u64),
+    NotConstant,
+}
+
+/// If `node` is a binary `*` or `+` whose two operands are integer
+/// literals and whose computed value wraps u64, return the operator
+/// and the two literal values. Otherwise `None`.
+fn evaluate_for_overflow(node: Node<'_>, source: &str) -> Option<(&'static str, u64, u64)> {
+    let unwrapped = unwrap_paren(node);
+    if unwrapped.kind() != "binary_expression" {
+        return None;
+    }
+    let operator = unwrapped
+        .child_by_field_name("operator")
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())?;
+    let operator_kind: &'static str = match operator {
+        "*" => "*",
+        "+" => "+",
+        _ => return None,
+    };
+    let left = unwrapped.child_by_field_name("left")?;
+    let right = unwrapped.child_by_field_name("right")?;
+    let CheckedValue::Constant(left_value) = checked_evaluate(left, source)? else {
+        return None;
+    };
+    let CheckedValue::Constant(right_value) = checked_evaluate(right, source)? else {
+        return None;
+    };
+    let wraps = match operator_kind {
+        "*" => left_value.checked_mul(right_value).is_none(),
+        "+" => left_value.checked_add(right_value).is_none(),
+        _ => unreachable!(),
+    };
+    if wraps {
+        Some((operator_kind, left_value, right_value))
+    } else {
+        None
+    }
+}
+
+fn unwrap_paren(node: Node<'_>) -> Node<'_> {
+    if node.kind() != "parenthesized_expression" {
+        return node;
+    }
+    for idx in 0..(node.named_child_count() as u32) {
+        if let Some(child) = node.named_child(idx) {
+            return unwrap_paren(child);
+        }
+    }
+    node
+}
+
+fn checked_evaluate(node: Node<'_>, source: &str) -> Option<CheckedValue> {
+    let node = unwrap_paren(node);
+    match node.kind() {
+        "number_literal" => {
+            let text = node.utf8_text(source.as_bytes()).ok()?;
+            match parse_c_integer(text) {
+                SizeExpr::Constant(value) => Some(CheckedValue::Constant(value)),
+                _ => Some(CheckedValue::NotConstant),
+            }
+        }
+        "binary_expression" => {
+            // Recursive evaluation deliberately skipped: deeply nested
+            // constant arithmetic is rare in real allocators and the
+            // simple flat check above handles every shape we have
+            // ever seen as a CWE-680 in practice.
+            Some(CheckedValue::NotConstant)
+        }
+        _ => Some(CheckedValue::NotConstant),
+    }
+}
+
 /// Parse `code` as C, walk every function definition, and return the
 /// heap-overflow findings the analyser can prove. Top-level entry
 /// point used by the security-rules engine for CWE-122.
@@ -2159,6 +2369,63 @@ mod tests {
         let findings = scan_heap_overflows(code, "cross.c");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].destination, "buf");
+    }
+
+    #[test]
+    fn detects_calloc_with_wrapping_literal_product() {
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(void) { void *p = calloc(0xFFFFFFFFFFFFFFFF, 2); }";
+        let findings = scan_constant_overflows(code, "wrap.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].allocator, "calloc");
+        assert_eq!(findings[0].operator, "*");
+    }
+
+    #[test]
+    fn detects_malloc_with_wrapping_literal_multiplication() {
+        let code = "void *malloc(unsigned long);\n\
+                    void f(void) { void *p = malloc(0xFFFFFFFFFFFFFFFF * 2); }";
+        let findings = scan_constant_overflows(code, "wrap.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].allocator, "malloc");
+        assert_eq!(findings[0].operator, "*");
+    }
+
+    #[test]
+    fn detects_malloc_with_wrapping_literal_addition() {
+        let code = "void *malloc(unsigned long);\n\
+                    void f(void) { void *p = malloc(0xFFFFFFFFFFFFFFFF + 1); }";
+        let findings = scan_constant_overflows(code, "wrap.c");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].operator, "+");
+    }
+
+    #[test]
+    fn does_not_fire_on_safe_constant_calloc() {
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(void) { void *p = calloc(4, 8); }";
+        let findings = scan_constant_overflows(code, "ok.c");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn does_not_fire_on_non_constant_malloc_argument() {
+        // Variable operand — out of scope for the literal-only rule.
+        let code = "void *malloc(unsigned long);\n\
+                    unsigned long strlen(const char *);\n\
+                    void f(const char *name) {\n\
+                        void *p = malloc(strlen(name) * 4);\n\
+                    }";
+        let findings = scan_constant_overflows(code, "nonconst.c");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn does_not_fire_on_realloc_with_safe_constants() {
+        let code = "void *realloc(void *, unsigned long);\n\
+                    void f(void *p) { void *q = realloc(p, 8 * 16); }";
+        let findings = scan_constant_overflows(code, "ok.c");
+        assert!(findings.is_empty());
     }
 
     #[test]

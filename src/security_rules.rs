@@ -13,7 +13,7 @@
 //! - **ControlFlow**: Required operations before sensitive calls
 //! - **Typestate**: State machine validation (future)
 
-use crate::heap_size::{self, HeapOverflowFinding};
+use crate::heap_size::{self, ConstantOverflowFinding, HeapOverflowFinding};
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -791,16 +791,26 @@ impl SecurityRulesEngine {
         if language != "c" && language != "cpp" {
             return Vec::new();
         }
-        let Some(rule) = self.rules.get("CWE-122-001") else {
-            return Vec::new();
-        };
-        if !rule.enabled {
-            return Vec::new();
+        let mut out = Vec::new();
+        if let Some(rule) = self.rules.get("CWE-122-001") {
+            if rule.enabled {
+                out.extend(
+                    heap_size::scan_heap_overflows(code, file_path)
+                        .into_iter()
+                        .map(|finding| heap_overflow_to_security_finding(finding, rule)),
+                );
+            }
         }
-        heap_size::scan_heap_overflows(code, file_path)
-            .into_iter()
-            .map(|finding| heap_overflow_to_security_finding(finding, rule))
-            .collect()
+        if let Some(rule) = self.rules.get("CWE-680-001") {
+            if rule.enabled {
+                out.extend(
+                    heap_size::scan_constant_overflows(code, file_path)
+                        .into_iter()
+                        .map(|finding| constant_overflow_to_security_finding(finding, rule)),
+                );
+            }
+        }
+        out
     }
 
     /// Scan for OWASP Top 10 issues only
@@ -1754,6 +1764,33 @@ impl SecurityRulesEngine {
             tags: vec!["memory".to_string(), "buffer".to_string()],
         });
 
+        // CWE-680: Integer Overflow to Buffer Overflow — partial
+        // coverage. Detection fires only on literal-constant
+        // wraparound; non-literal operands are not modelled.
+        self.add_rule(SecurityRule {
+            id: "CWE-680-001".to_string(),
+            name: "Integer Overflow in Allocator Size (literal)".to_string(),
+            severity: Severity::Critical,
+            cwe: vec!["CWE-680".to_string()],
+            owasp: vec![],
+            rule_type: RuleType::Pattern {
+                patterns: vec![],
+                safe_patterns: vec![],
+            },
+            languages: vec!["c".to_string(), "cpp".to_string()],
+            message: "Allocator size arithmetic wraps u64 at the literal level — \
+                      runtime allocation will be smaller than the source intent. \
+                      Note: this rule is a PARTIAL check — it catches only \
+                      literal-constant wraparound. Non-literal operands and \
+                      sizeof-multiplication shapes need separate audit."
+                .to_string(),
+            remediation: "Use checked arithmetic or a smaller integer type; ensure operands \
+                 are bounded before the multiplication or addition"
+                .to_string(),
+            enabled: true,
+            tags: vec!["memory".to_string(), "integer-overflow".to_string()],
+        });
+
         // CWE-79: XSS (already covered in OWASP A03)
 
         // CWE-89: SQL Injection (already covered in OWASP A03)
@@ -2252,13 +2289,49 @@ fn heap_overflow_to_security_finding(
     }
 }
 
+/// Project a constant-wraparound finding into a [`SecurityFinding`].
+/// The message keeps the rule's "PARTIAL check" caveat verbatim so AI
+/// callers reading the output understand a negative result does not
+/// prove the codebase free of integer-overflow-to-buffer bugs.
+fn constant_overflow_to_security_finding(
+    finding: ConstantOverflowFinding,
+    rule: &SecurityRule,
+) -> SecurityFinding {
+    let message = format!(
+        "{} in {}: {} {} {} wraps u64 (expression: {})",
+        rule.message,
+        finding.allocator,
+        finding.left_value,
+        finding.operator,
+        finding.right_value,
+        finding.expression,
+    );
+    SecurityFinding {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        severity: rule.severity,
+        confidence: Confidence::High,
+        file_path: finding.file_path,
+        line: finding.line,
+        column: finding.column,
+        end_line: finding.end_line,
+        end_column: finding.end_column,
+        snippet: finding.snippet,
+        message,
+        remediation: rule.remediation.clone(),
+        cwe: rule.cwe.clone(),
+        owasp: rule.owasp.clone(),
+        context: HashMap::new(),
+    }
+}
+
 /// Check if a CWE is in the Top 25
 fn is_cwe_top25(cwe: &str) -> bool {
     const CWE_TOP25: &[&str] = &[
         "CWE-787", "CWE-79", "CWE-89", "CWE-416", "CWE-78", "CWE-20", "CWE-125", "CWE-22",
         "CWE-352", "CWE-434", "CWE-862", "CWE-476", "CWE-287", "CWE-190", "CWE-502", "CWE-77",
         "CWE-119", "CWE-798", "CWE-918", "CWE-306", "CWE-362", "CWE-269", "CWE-94", "CWE-863",
-        "CWE-276", "CWE-122",
+        "CWE-276", "CWE-122", "CWE-680",
     ];
     CWE_TOP25.contains(&cwe)
 }
@@ -2971,6 +3044,39 @@ strcpy(dest, src);
                     }";
         let findings = engine.scan_cwe_top25(code, "overflow.c", "c");
         assert!(findings.iter().any(|f| f.rule_id == "CWE-122-001"));
+    }
+
+    /// CWE-680-001 must fire on calloc with a wrapping literal
+    /// product, and the message must carry the partial-coverage
+    /// caveat so an AI caller reading the output knows a negative
+    /// scan does NOT prove the file safe.
+    #[test]
+    fn test_scan_emits_cwe_680_with_partial_coverage_message() {
+        let engine = SecurityRulesEngine::new();
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(void) { void *p = calloc(0xFFFFFFFFFFFFFFFF, 2); }";
+        let findings = engine.scan(code, "wrap.c", "c");
+        let finding = findings
+            .iter()
+            .find(|f| f.rule_id == "CWE-680-001")
+            .expect("CWE-680-001 must fire on the wrapping calloc");
+        assert!(
+            finding.message.contains("PARTIAL check"),
+            "AI callers need the partial-coverage caveat verbatim; got: {}",
+            finding.message,
+        );
+    }
+
+    /// Negative test — a clean allocation must not produce a
+    /// CWE-680-001 false positive, even though the rule is partial.
+    /// The "miss rather than misreport" stance applies here too.
+    #[test]
+    fn test_scan_does_not_flag_safe_constant_calloc() {
+        let engine = SecurityRulesEngine::new();
+        let code = "void *calloc(unsigned long, unsigned long);\n\
+                    void f(void) { void *p = calloc(4, 8); }";
+        let findings = engine.scan(code, "ok.c", "c");
+        assert!(!findings.iter().any(|f| f.rule_id == "CWE-680-001"));
     }
 
     /// The heap-overflow pass must not fire on a clean allocation.
