@@ -103,6 +103,79 @@ pub fn collect_allocation_sizes(
     out
 }
 
+/// Summarise a single function: return its source-level name together
+/// with the allocation map produced for its body.
+///
+/// Accepts a `function_definition` node. Returns `None` if `node` is
+/// not a function definition, if the function has no extractable
+/// identifier (e.g. an unnamed declarator shape we do not recognise),
+/// or if the body is missing.
+pub fn summarise_function<'a>(
+    function_definition: Node<'a>,
+    source: &str,
+) -> Option<(String, HashMap<String, SizeExpr>)> {
+    if function_definition.kind() != "function_definition" {
+        return None;
+    }
+    let name = extract_function_name(function_definition, source)?;
+    let body = function_definition.child_by_field_name("body")?;
+    Some((name, collect_allocation_sizes(body, source)))
+}
+
+/// Walk a translation-unit root node and return one allocation map per
+/// function definition keyed by function name. Used by the
+/// cross-function cache: callers that see `char *buf = helper();`
+/// need to know what `helper` allocated to size `buf`.
+///
+/// Skips nameless or duplicate definitions silently — duplicates
+/// resolve to the last one encountered, mirroring how the linker would
+/// see the translation unit.
+pub fn summarise_translation_unit(
+    root: Node<'_>,
+    source: &str,
+) -> HashMap<String, HashMap<String, SizeExpr>> {
+    let mut out = HashMap::new();
+    summarise_into(root, source, &mut out);
+    out
+}
+
+fn summarise_into(
+    node: Node<'_>,
+    source: &str,
+    out: &mut HashMap<String, HashMap<String, SizeExpr>>,
+) {
+    if node.kind() == "function_definition" {
+        if let Some((name, allocations)) = summarise_function(node, source) {
+            out.insert(name, allocations);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        summarise_into(child, source, out);
+    }
+}
+
+/// Extract the source-level identifier of a `function_definition` node
+/// by descending the declarator chain. Handles the common shapes:
+/// plain `name(...)`, `*name(...)`, and any number of nested pointer
+/// declarators.
+fn extract_function_name(function_definition: Node<'_>, source: &str) -> Option<String> {
+    let mut declarator = function_definition.child_by_field_name("declarator")?;
+    loop {
+        match declarator.kind() {
+            "function_declarator" => {
+                let inner = declarator.child_by_field_name("declarator")?;
+                return inner.utf8_text(source.as_bytes()).ok().map(str::to_string);
+            }
+            "pointer_declarator" | "parenthesized_declarator" => {
+                declarator = declarator.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn collect_into(node: Node<'_>, source: &str, out: &mut HashMap<String, SizeExpr>) {
     match node.kind() {
         "call_expression" => {
@@ -290,6 +363,33 @@ fn recognise_allocator_call(node: Node<'_>, source: &str) -> Option<SizeExpr> {
         "realloc" => argument_nodes
             .get(1)
             .map(|node| parse_size_expression(*node, source)),
+        "strdup" => {
+            // strdup(s) allocates exactly strlen(s) + 1 bytes. We can
+            // model the size symbolically when s is a plain identifier
+            // or field reference; otherwise the strlen target has no
+            // stable name and we record Unknown.
+            let arg = argument_nodes.first()?;
+            let text = arg.utf8_text(source.as_bytes()).ok()?;
+            match arg.kind() {
+                "identifier" | "field_expression" => {
+                    Some(SizeExpr::StrlenOf(text.to_string()).plus_constant(1))
+                }
+                _ => Some(SizeExpr::Unknown),
+            }
+        }
+        "strndup" => {
+            // strndup(s, n) allocates at most n + 1 bytes. Use the
+            // upper bound — over-reporting is the conservative choice
+            // for overflow detection (under-reporting would yield
+            // false positives).
+            if argument_nodes.len() < 2 {
+                return None;
+            }
+            match parse_size_expression(argument_nodes[1], source) {
+                SizeExpr::Constant(limit) => Some(SizeExpr::Constant(limit).plus_constant(1)),
+                _ => Some(SizeExpr::Unknown),
+            }
+        }
         _ => None,
     }
 }
@@ -898,6 +998,108 @@ mod tests {
         // strlen(x) + 1 byte newline + 1 byte NUL
         let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(2));
         assert_eq!(allocations.get("result"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_strdup_yields_strlen_plus_nul() {
+        let code = "char *strdup(const char *);\n\
+                    void f(const char *name) { char *p = strdup(name); }";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("p"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_strdup_into_struct_field_keyed_by_full_lhs() {
+        let code = "char *strdup(const char *);\n\
+                    struct dst { char *buf; };\n\
+                    void f(struct dst *dst, const char *x) {\n\
+                        dst->buf = strdup(x);\n\
+                    }";
+        let allocations = allocations_in(code);
+        let expected = SizeExpr::StrlenOf("x".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("dst->buf"), Some(&expected));
+    }
+
+    #[test]
+    fn recognise_strndup_with_literal_limit_yields_constant_plus_nul() {
+        let code = "char *strndup(const char *, unsigned long);\n\
+                    void f(const char *x) { char *p = strndup(x, 16); }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Constant(17)));
+    }
+
+    #[test]
+    fn strndup_with_variable_limit_is_unknown() {
+        // Without a literal for the limit, the upper bound is not
+        // expressible — record Unknown so the comparison short-circuits.
+        let code = "char *strndup(const char *, unsigned long);\n\
+                    void f(const char *x, unsigned long n) {\n\
+                        char *p = strndup(x, n);\n\
+                    }";
+        let allocations = allocations_in(code);
+        assert_eq!(allocations.get("p"), Some(&SizeExpr::Unknown));
+    }
+
+    fn parse_full(parser: &mut tree_sitter::Parser, source: &str) -> tree_sitter::Tree {
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn find_first_function_definition<'a>(tree: &'a tree_sitter::Tree) -> tree_sitter::Node<'a> {
+        fn walk<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if node.kind() == "function_definition" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = walk(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(tree.root_node()).expect("test source must contain a function definition")
+    }
+
+    #[test]
+    fn summarise_function_returns_name_and_allocations() {
+        let code = "void format_into(const char *name) {\n\
+                        char *buf = malloc(strlen(name) + 1);\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let function_definition = find_first_function_definition(&tree);
+        let (name, allocations) =
+            summarise_function(function_definition, code).expect("function recognised");
+        assert_eq!(name, "format_into");
+        let expected = SizeExpr::StrlenOf("name".into()).add(SizeExpr::Constant(1));
+        assert_eq!(allocations.get("buf"), Some(&expected));
+    }
+
+    #[test]
+    fn summarise_translation_unit_collects_every_function() {
+        // Two functions in one TU — the cache wants to see both so a
+        // future caller of `helper` can resolve its return size.
+        let code = "char *helper(const char *name) {\n\
+                        return malloc(strlen(name) + 1);\n\
+                    }\n\
+                    void caller(const char *name) {\n\
+                        char *buf = malloc(42);\n\
+                        (void)buf;\n\
+                        (void)name;\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let summary = summarise_translation_unit(tree.root_node(), code);
+        assert!(summary.contains_key("helper"));
+        assert!(summary.contains_key("caller"));
+        assert_eq!(
+            summary.get("caller").unwrap().get("buf"),
+            Some(&SizeExpr::Constant(42))
+        );
     }
 
     #[test]
