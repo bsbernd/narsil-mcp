@@ -67,6 +67,44 @@ Reach for the individual tools when you need a *narrower* answer than
 the audit gives you, or when you want to drill into one specific
 finding after the audit pointed at it.
 
+## Heuristic findings — verify before reporting
+
+Most rules in narsil's output (CWE-787-001, CWE-119-001,
+CWE-125-001, CWE-89-001, ...) are regex token matches: they identify
+*call sites of dangerous patterns*, not verified vulnerabilities. A
+smaller set (e.g. CWE-476-002, CWE-122-001) are analytically
+verified via tree-sitter dataflow; the rule ID and message indicate
+which is which.
+
+**For every heuristic finding in security-sensitive code** —
+setuid/setgid binaries, parsers of untrusted input, IPC handlers,
+network protocols, anything with attacker-controllable input — you
+MUST perform the verification yourself in this pass:
+
+1. Locate the destination buffer's allocation site (may be
+   cross-file). Use `get_callers`, `find_call_path`, and
+   `go_to_definition`.
+2. Compare the allocated size to the actual write width.
+   Format-string expansion counts: `sprintf(buf, "%s#%s", a, b)`
+   writes `strlen(a) + 1 + strlen(b) + 1` bytes, not
+   `strlen(a) + 1`.
+3. State explicitly which size each side resolves to.
+
+**An audit is not complete until step 3 has been done for every
+heuristic finding in privileged code.** Phrases like "manual pass
+needed", "the scanner could not do", "warrants verification",
+"focused review", "separate pass", "follow-up audit", or any
+equivalent rephrasing are signals of incomplete work — they belong
+in narsil bug reports, not in audit output to the user. The audit
+IS the review.
+
+If you cannot complete the verification (tool limits, time,
+complexity), mark the audit **INCOMPLETE** and explain why. Do not
+produce a final priority list with deferred items.
+
+Heuristic findings in clearly non-privileged code (examples, unit
+tests, fixtures) may be dismissed at scale.
+
 ## Workflow
 
 1. **Run the audit**: call `security_audit` with optional
@@ -79,22 +117,30 @@ finding after the audit pointed at it.
    to decide whether the codebase needs deep attention or a light
    review.
 
-3. **For each Critical/High finding**: call
+3. **Verify heuristic findings in privileged code**: for each
+   heuristic finding in security-sensitive code (setuid binaries,
+   parsers of untrusted input, IPC handlers, network protocols),
+   perform the verification checklist from the "Heuristic findings —
+   verify before reporting" section above. Do not proceed to step 4
+   until verification is complete for every privileged-code heuristic
+   finding, or until the audit has been marked INCOMPLETE.
+
+4. **For each Critical/High finding**: call
    `explain_vulnerability` to surface the CWE context and
    `suggest_fix` for a concrete remediation snippet.
 
-4. **For tainted flows (TAINT-* rule ids)**: the finding already
+5. **For tainted flows (TAINT-* rule ids)**: the finding already
    names the sink; if you want the full source-to-sink path, call
    `trace_taint` with the file path and the sink line.
 
-5. **For CWE-122-001 heap-overflow findings**: the audit message
+6. **For CWE-122-001 heap-overflow findings**: the audit message
    spells out the symbolic write-vs-allocation comparison and notes
    whether cross-translation-unit resolution was available (it is,
    through the audit path; single-file callers see only per-TU
    shapes). The fix is almost always to widen the allocation, not
    narrow the write.
 
-6. **Supply-chain follow-ups**: the audit covers *code* paths only.
+7. **Supply-chain follow-ups**: the audit covers *code* paths only.
    For dependency CVEs and license issues, run `check_dependencies`
    and `check_licenses` separately — these intentionally live outside
    the code-scan aggregator since they require a different network
