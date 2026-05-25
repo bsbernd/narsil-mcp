@@ -138,6 +138,14 @@ async fn scan_security_emits_cwe_476_for_calloc_without_null_check() -> Result<(
          Full report:\n{report}"
     );
 
+    assert!(
+        report.contains("the audit IS the review"),
+        "scan_security report must include the directive heuristic-severity \
+         hint that forbids deferring verification of findings in privileged \
+         code to a 'separate review'.\n\
+         Full report:\n{report}"
+    );
+
     // Positive: missing_check should produce a CWE-476-002 finding.
     let cwe476_002 = report.contains("CWE-476-002");
     let mentions_missing = report.contains("missing_check") || report.contains("'buf'");
@@ -158,7 +166,13 @@ async fn scan_security_emits_cwe_476_for_calloc_without_null_check() -> Result<(
     // Simpler structural assertion: the rule must emit exactly one
     // CWE-476-002 line. If it emits two, the negative case is also
     // flagged and the rule is over-greedy.
-    let cwe476_002_count = report.matches("CWE-476-002").count();
+    //
+    // The report header contains a heuristic-severity hint that mentions
+    // CWE-476-002 as an example of an analytical rule; count occurrences
+    // only in the findings section (past `**Files Scanned**`) so the
+    // header mention doesn't confound the rule-emission count.
+    let findings_section = report.split("**Files Scanned**").nth(1).unwrap_or("");
+    let cwe476_002_count = findings_section.matches("CWE-476-002").count();
     assert_eq!(
         cwe476_002_count, 1,
         "expected exactly one CWE-476-002 finding (positive only); got {cwe476_002_count}.\n\

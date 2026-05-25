@@ -79,6 +79,30 @@ pub struct SecurityScanOptions<'a> {
     pub offset: Option<usize>,
 }
 
+/// Header inserted at the top of every report whose findings come from
+/// the pattern-rule engine (scan_security, check_owasp_top10,
+/// check_cwe_top25). Most rules are regex token matches and flag *call
+/// sites of potentially dangerous patterns*, not verified vulnerabilities.
+/// The hint directs the consuming LLM to verify heuristic findings in
+/// security-sensitive code in this pass, not defer them — earlier framings
+/// that said "site inventory" caused the consumer to dismiss/defer rather
+/// than investigate.
+const SECURITY_REPORT_HEURISTIC_HINT: &str = r#"> **Heuristic severities — verify before dismissing.**
+>
+> Most rules in this report (CWE-787-001, CWE-119-001, CWE-125-001, CWE-89-001, ...) are regex token matches: they identify *call sites of dangerous patterns*, not verified vulnerabilities. A smaller set (e.g. CWE-476-002) are analytically verified via tree-sitter dataflow; the rule ID and message indicate which is which.
+>
+> **For every heuristic finding in security-sensitive code** — setuid/setgid binaries, parsers of untrusted input, IPC handlers, network protocols, anything with attacker-controllable input — verification MUST happen IN THIS PASS, not in a "follow-up" or "separate review":
+>
+> 1. Locate the destination buffer's allocation site (may be cross-file). Use `get_callers`, `find_call_path`, and `go_to_definition`.
+> 2. Compare the allocated size to the actual write width. Format-string expansion counts: `sprintf(buf, "%s#%s", a, b)` writes `strlen(a) + 1 + strlen(b) + 1` bytes, not `strlen(a) + 1`.
+> 3. Conclude only after the trace. State explicitly which size each side resolves to.
+>
+> **Writing "warrants further review" or "recommend a separate pass" for a finding in privileged code is incomplete work — the audit IS the review.** Heuristic findings in clearly non-privileged code (examples, unit tests, fixtures) may be dismissed at scale.
+>
+> Absent or omitted fields mean narsil could not determine the value, NOT that the value is benign.
+
+"#;
+
 /// Options for configuring the CodeIntelEngine
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -5332,6 +5356,7 @@ impl CodeIntelEngine {
 
         // Build output
         let mut output = format!("# Security Scan: {}\n\n", repo_name);
+        output.push_str(SECURITY_REPORT_HEURISTIC_HINT);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
         output.push_str(&format!(
             "**Test Files**: {}\n",
@@ -5436,6 +5461,7 @@ impl CodeIntelEngine {
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# OWASP Top 10 2021 Scan: {}\n\n", repo_name);
+        output.push_str(SECURITY_REPORT_HEURISTIC_HINT);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
         output.push_str(&format!("**Findings**: {}\n\n", findings.len()));
 
@@ -5500,6 +5526,7 @@ impl CodeIntelEngine {
         findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
 
         let mut output = format!("# CWE Top 25 Scan: {}\n\n", repo_name);
+        output.push_str(SECURITY_REPORT_HEURISTIC_HINT);
         output.push_str(&format!("**Files Scanned**: {}\n", files.len()));
         output.push_str(&format!("**Findings**: {}\n\n", findings.len()));
 
