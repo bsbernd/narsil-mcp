@@ -8325,14 +8325,33 @@ fn load_compile_commands_filter(
             }
         };
 
+        let json_parent = full_path.parent().map(Path::to_path_buf);
         let count_before = result.len();
-        result.extend(arr.iter().filter_map(|entry| {
-            entry
-                .get("file")
-                .and_then(|f| f.as_str())
-                .map(PathBuf::from)
-                .and_then(|p| p.canonicalize().ok())
-        }));
+        let mut unresolved = 0usize;
+        for entry in arr.iter() {
+            let file_str = match entry.get("file").and_then(|f| f.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let directory: Option<&Path> = entry
+                .get("directory")
+                .and_then(|d| d.as_str())
+                .map(Path::new);
+            match resolve_compile_command_file(file_str, directory, json_parent.as_deref()) {
+                Some(canonical) => {
+                    result.insert(canonical);
+                }
+                None => {
+                    unresolved += 1;
+                }
+            }
+        }
+        if unresolved > 0 {
+            warn!(
+                "compile_commands.json at {:?}: {} entries with unresolvable paths",
+                full_path, unresolved
+            );
+        }
         info!(
             "Loaded {} compiled files from {:?}",
             result.len() - count_before,
@@ -8349,6 +8368,35 @@ fn load_compile_commands_filter(
     }
 
     result
+}
+
+/// Resolve a compile_commands.json `file` field to a canonical absolute path.
+///
+/// Per the clang spec, when `file` is relative it must be resolved against
+/// the entry's `directory` field. We also fall back to resolving against
+/// the JSON's containing directory, which lets us tolerate JSONs generated
+/// on another machine where `directory` points at a path that doesn't exist
+/// on this filesystem.
+fn resolve_compile_command_file(
+    file: &str,
+    directory: Option<&Path>,
+    json_parent: Option<&Path>,
+) -> Option<PathBuf> {
+    let file_path = Path::new(file);
+    if file_path.is_absolute() {
+        return file_path.canonicalize().ok();
+    }
+    if let Some(dir) = directory {
+        if let Ok(canonical) = dir.join(file_path).canonicalize() {
+            return Some(canonical);
+        }
+    }
+    if let Some(parent) = json_parent {
+        if let Ok(canonical) = parent.join(file_path).canonicalize() {
+            return Some(canonical);
+        }
+    }
+    None
 }
 
 fn compile_include_patterns(patterns: &[String]) -> Vec<glob::Pattern> {
@@ -8953,4 +9001,118 @@ fn get_language_from_path(path: &str) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn resolve_relative_file_via_directory_field() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let src = repo.join("src/foo.c");
+        write_file(&src, "int foo(void) { return 0; }\n");
+        let build = repo.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+
+        let resolved = resolve_compile_command_file("../src/foo.c", Some(&build), None)
+            .expect("relative file with valid directory must resolve");
+
+        assert_eq!(resolved, src.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_absolute_file_is_used_as_is() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let src = repo.join("src/foo.c");
+        write_file(&src, "");
+
+        let abs = src.canonicalize().unwrap();
+        let abs_str = abs.to_string_lossy();
+
+        let resolved =
+            resolve_compile_command_file(&abs_str, Some(Path::new("/nonexistent/build")), None)
+                .expect("absolute file path must resolve regardless of directory");
+
+        assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_json_parent_when_directory_is_stale() {
+        // Simulates a compile_commands.json generated on another machine:
+        // `directory` points at a path that does not exist on this
+        // filesystem, but the JSON itself sits in the real build dir, so
+        // resolving against the JSON's parent yields the correct file.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let src = repo.join("src/foo.c");
+        write_file(&src, "");
+        let build = repo.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+
+        let stale = Path::new("/this/path/does/not/exist/build");
+        let resolved = resolve_compile_command_file("../src/foo.c", Some(stale), Some(&build))
+            .expect("json-parent fallback must resolve when directory is stale");
+
+        assert_eq!(resolved, src.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_strategy_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let build = tmp.path().join("build");
+        std::fs::create_dir_all(&build).unwrap();
+
+        let resolved = resolve_compile_command_file(
+            "no_such_file.c",
+            Some(Path::new("/nonexistent/build")),
+            Some(&build),
+        );
+
+        assert!(
+            resolved.is_none(),
+            "must return None when neither directory nor json-parent resolves"
+        );
+    }
+
+    #[test]
+    fn load_filter_resolves_meson_style_relative_paths() {
+        // End-to-end: a meson-shaped compile_commands.json with `directory`
+        // pointing at <repo>/build and `file` as `../lib/foo.c`. Confirms
+        // that load_compile_commands_filter populates the set with the
+        // canonical path that the walker would also emit — closing the
+        // empty-set failure mode that drops every C source at the retain
+        // filter.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let foo = repo.join("lib/foo.c");
+        write_file(&foo, "");
+        let build = repo.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let json_path = build.join("compile_commands.json");
+        let json = format!(
+            r#"[{{"directory": "{}", "command": "cc -c ../lib/foo.c", "file": "../lib/foo.c"}}]"#,
+            build.canonicalize().unwrap().display()
+        );
+        std::fs::write(&json_path, json).unwrap();
+
+        let set = load_compile_commands_filter(repo, &[Path::new("build/compile_commands.json")]);
+
+        assert_eq!(set.len(), 1, "must load exactly one entry");
+        assert!(
+            set.contains(&foo.canonicalize().unwrap()),
+            "set must contain canonical path to lib/foo.c, got: {:?}",
+            set
+        );
+    }
 }

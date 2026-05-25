@@ -55,11 +55,16 @@ void has_check(const char *src) {
 /// used by the MCP server when launched without `--call-graph`, which is the
 /// failure mode the 2026-05-25 coverage report reproduces.
 async fn build_engine(repo_path: PathBuf) -> Result<(CodeIntelEngine, TempDir)> {
+    build_engine_with(repo_path, EngineOptions::default()).await
+}
+
+async fn build_engine_with(
+    repo_path: PathBuf,
+    opts: EngineOptions,
+) -> Result<(CodeIntelEngine, TempDir)> {
     let index_tmp = TempDir::new()?;
     let index_path = index_tmp.path().to_path_buf();
-    let engine =
-        CodeIntelEngine::with_options(index_path, vec![repo_path], EngineOptions::default())
-            .await?;
+    let engine = CodeIntelEngine::with_options(index_path, vec![repo_path], opts).await?;
     engine.complete_initialization().await?;
     Ok((engine, index_tmp))
 }
@@ -157,6 +162,62 @@ async fn scan_security_emits_cwe_476_for_calloc_without_null_check() -> Result<(
     assert_eq!(
         cwe476_002_count, 1,
         "expected exactly one CWE-476-002 finding (positive only); got {cwe476_002_count}.\n\
+         Full report:\n{report}"
+    );
+
+    Ok(())
+}
+
+/// End-to-end regression for the `compile_commands.json` `file`-field
+/// resolution bug. When `use_compile_commands: true` and the JSON's `file`
+/// entries are *relative* (meson- and out-of-tree-CMake-shaped), the
+/// indexer previously called `PathBuf::from(file).canonicalize()` — which
+/// resolves relative to the process CWD, not the entry's `directory`
+/// field — and produced an empty set. With an empty set, `index_repo`'s
+/// `retain` filter at index.rs:695-708 drops every C source because
+/// `compiled.contains(...)` is always false, so the file_cache for the
+/// repo ends up with zero `.c` files and `scan_security` finds nothing
+/// in C.
+#[tokio::test]
+async fn scan_security_with_compile_commands_resolves_relative_file_paths() -> Result<()> {
+    let repo_tmp = TempDir::new()?;
+    let repo_path = repo_tmp.path().to_path_buf();
+    std::fs::create_dir_all(repo_path.join("lib"))?;
+    std::fs::create_dir_all(repo_path.join("build"))?;
+    std::fs::write(repo_path.join("lib/single_tu.c"), SINGLE_TU_C)?;
+
+    let build_canonical = repo_path.join("build").canonicalize()?;
+    let cc_json = format!(
+        r#"[{{"directory": "{}", "command": "cc -c ../lib/single_tu.c", "file": "../lib/single_tu.c"}}]"#,
+        build_canonical.display()
+    );
+    std::fs::write(repo_path.join("build/compile_commands.json"), cc_json)?;
+
+    let opts = EngineOptions {
+        use_compile_commands: true,
+        ..Default::default()
+    };
+    let (engine, _index_tmp) = build_engine_with(repo_path.clone(), opts).await?;
+    let repo_name = repo_path.to_str().unwrap();
+
+    let report = engine
+        .scan_security(repo_name, SecurityScanOptions::default())
+        .await?;
+
+    let scanned_zero = report.contains("**Files Scanned**: 0\n");
+    assert!(
+        !scanned_zero,
+        "scan_security reported zero files scanned — compile_commands filter \
+         dropped every C source. Full report:\n{report}"
+    );
+
+    let mentions_single_tu = report.contains("single_tu.c");
+    let mentions_cwe = report.contains("CWE-476-002") || report.contains("CWE-122");
+    assert!(
+        mentions_single_tu && mentions_cwe,
+        "expected a CWE finding referencing single_tu.c.\n\
+         single_tu.c mentioned: {mentions_single_tu}\n\
+         CWE-122 or CWE-476-002 present: {mentions_cwe}\n\
          Full report:\n{report}"
     );
 
