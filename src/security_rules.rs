@@ -1888,7 +1888,14 @@ impl SecurityRulesEngine {
                 safe_patterns: vec![],
             },
             languages: vec!["c".to_string(), "cpp".to_string()],
-            message: "Write provably exceeds allocation size on this heap buffer".to_string(),
+            message: "Write provably exceeds allocation size on this heap buffer. \
+                      Note: cross-translation-unit allocator helpers are resolved \
+                      when the scan runs through security_audit (or any path that \
+                      supplies a CallGraph-backed cross-file context). Direct \
+                      single-file scans without a project context see per-TU \
+                      shapes only and may miss overflows where the allocator and \
+                      write live in different .c files."
+                .to_string(),
             remediation: "Size the allocation to include every byte sprintf/strcpy/memcpy writes, \
                  including the trailing NUL"
                 .to_string(),

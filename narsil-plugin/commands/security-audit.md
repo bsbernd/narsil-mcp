@@ -28,7 +28,11 @@ repositories and ask which one to audit.
 `security_audit` already includes:
 
 - Pattern rules (CWE Top 25 + OWASP Top 10 + any custom ruleset YAML)
-- Symbolic heap-overflow detection (CWE-122) for C and C++
+- Symbolic heap-overflow detection (CWE-122) for C and C++, including
+  cross-translation-unit resolution: allocator helpers defined in one
+  `.c` file are followed via the project call graph to writes in
+  another, so under-sized buffers passed across TU boundaries are
+  caught (not only intra-file shapes)
 - Partial integer-overflow-to-buffer detection (CWE-680) for C and C++
 - Taint-flow analysis with unsanitised source-to-sink flows folded into
   the unified findings list
@@ -48,6 +52,12 @@ the limitations up front when you summarise the output to a user:
   helper calls. May miss bugs where bounds checking happens in a
   caller or via a wrapper; may false-flag safe code whose bounds
   check happens elsewhere.
+- **CWE-122-001** (heap overflow): the audit path follows allocator
+  helpers across translation units via the project call graph. The
+  per-file `scan_security`/`check_cwe_top25` path does **not** —
+  those callers are intentionally per-TU so single-file scans stay
+  predictable. If a user runs a single-file scan and gets nothing,
+  re-run via `security_audit` for the full picture.
 
 When you report a clean CWE-680 result to a user, say so explicitly:
 "no CWE-680 findings — but the rule is partial; a separate audit is
@@ -78,8 +88,11 @@ finding after the audit pointed at it.
    `trace_taint` with the file path and the sink line.
 
 5. **For CWE-122-001 heap-overflow findings**: the audit message
-   spells out the symbolic write-vs-allocation comparison. The fix is
-   almost always to widen the allocation, not narrow the write.
+   spells out the symbolic write-vs-allocation comparison and notes
+   whether cross-translation-unit resolution was available (it is,
+   through the audit path; single-file callers see only per-TU
+   shapes). The fix is almost always to widen the allocation, not
+   narrow the write.
 
 6. **Supply-chain follow-ups**: the audit covers *code* paths only.
    For dependency CVEs and license issues, run `check_dependencies`

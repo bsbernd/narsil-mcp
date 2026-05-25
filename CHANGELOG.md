@@ -18,10 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Detection is symbolic: `Constant(40)` vs `Constant(32)` fires,
   `StrlenOf(name) + 2` vs `StrlenOf(name) + 1` fires, and
   `Unknown`-tainted expressions short-circuit to "no finding" so the
-  rule never invents false positives. A per-translation-unit
-  function-summary cache resolves one-hop helper allocations like
-  `char *buf = helper(arg);` by substituting the caller's argument
-  expressions for the callee's parameter names.
+  rule never invents false positives. A function-summary cache
+  resolves one-hop helper allocations like `char *buf = helper(arg);`
+  by substituting the caller's argument expressions for the callee's
+  parameter names. The cache is translation-unit-local by default;
+  when the analyser is invoked through `scan_security` /
+  `security_audit` it is augmented by a `CallGraphContext` that
+  follows the project call graph across translation-unit boundaries,
+  so an allocator helper in one `.c` file paired with an over-sized
+  write in another is detected. Disambiguation for `static`-symbol
+  collisions: prefer the definition in the caller's own file;
+  otherwise accept a unique external definition; otherwise
+  short-circuit to `Unknown` rather than guess.
 - **`scan_security` now folds taint flows into its output**. Every
   unsanitised flow from the taint analyser surfaces as a `TAINT-*`
   `SecurityFinding` anchored at the sink, carrying the
