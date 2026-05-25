@@ -8,3 +8,4 @@ mod integration;
 pub use integration::editor_tests;
 pub use integration::full_flow_tests;
 pub use integration::mcp_flow_tests;
+pub use integration::scan_security_reproducer_test;

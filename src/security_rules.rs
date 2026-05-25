@@ -15,8 +15,8 @@
 
 use crate::callgraph::CallGraph;
 use crate::heap_size::{
-    self, ConstantOverflowFinding, CrossFileContext, FunctionLocation, HeapOverflowFinding,
-    SizeofMulFinding,
+    self, build_function_summary_cache, ConstantOverflowFinding, CrossFileContext,
+    FunctionLocation, HeapOverflowFinding, SizeofMulFinding,
 };
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use dashmap::DashMap;
@@ -112,6 +112,120 @@ impl<'a> CrossFileContext for CallGraphContext<'a> {
             source,
         })
     }
+}
+
+/// A [`CrossFileContext`] backed only by the engine's file cache.
+///
+/// Used as a fallback when no project call graph is available — i.e.
+/// when `EngineOptions::call_graph_enabled` is false, which is the
+/// MCP server's default. Without this fallback the heap-overflow
+/// analyser would silently lose cross-translation-unit resolution for
+/// every user who runs `scan_security` without first enabling the
+/// call graph, even though the file_cache holds every source line the
+/// resolver needs.
+///
+/// The context parses every C/C++ source in the file cache once at
+/// construction time, building a function-name -> (relative path,
+/// source) map via [`build_function_summary_cache`]. Lookups apply
+/// the same disambiguation as [`CallGraphContext`]: prefer the
+/// caller's own file, accept a unique external definition, otherwise
+/// return `None`.
+pub struct FileCacheContext<'a> {
+    repo_root: &'a Path,
+    name_index: HashMap<String, Vec<(String, Arc<String>)>>,
+}
+
+impl<'a> FileCacheContext<'a> {
+    pub fn new(file_cache: &'a DashMap<PathBuf, Arc<String>>, repo_root: &'a Path) -> Self {
+        let name_index = build_file_cache_name_index(file_cache, repo_root);
+        Self {
+            repo_root,
+            name_index,
+        }
+    }
+}
+
+impl<'a> CrossFileContext for FileCacheContext<'a> {
+    fn locate_function(&self, name: &str, caller_file: &str) -> Option<FunctionLocation> {
+        let candidates = self.name_index.get(name)?;
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let caller_rel: Option<String> = Path::new(caller_file)
+            .strip_prefix(self.repo_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        // Prefer the caller's own file.
+        if let Some(caller_rel) = caller_rel.as_deref() {
+            if let Some((rel, source)) = candidates.iter().find(|(r, _)| r == caller_rel) {
+                return Some(FunctionLocation {
+                    file_path: rel.clone(),
+                    source: source.as_ref().clone(),
+                });
+            }
+        }
+
+        // Accept a unique external definition.
+        if candidates.len() == 1 {
+            let (rel, source) = &candidates[0];
+            return Some(FunctionLocation {
+                file_path: rel.clone(),
+                source: source.as_ref().clone(),
+            });
+        }
+
+        // Ambiguous — refuse to guess; the caller falls back to Unknown.
+        None
+    }
+}
+
+fn is_c_or_cpp_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("c" | "cc" | "cpp" | "cxx" | "C" | "h" | "hh" | "hpp" | "hxx" | "H")
+    )
+}
+
+fn build_file_cache_name_index(
+    file_cache: &DashMap<PathBuf, Arc<String>>,
+    repo_root: &Path,
+) -> HashMap<String, Vec<(String, Arc<String>)>> {
+    let mut index: HashMap<String, Vec<(String, Arc<String>)>> = HashMap::new();
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return index;
+    }
+
+    for entry in file_cache.iter() {
+        let path = entry.key();
+        if !path.starts_with(repo_root) {
+            continue;
+        }
+        if !is_c_or_cpp_source(path) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(repo_root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().into_owned();
+        let source = entry.value().clone();
+        let Some(tree) = parser.parse(source.as_str(), None) else {
+            continue;
+        };
+        let summary_cache = build_function_summary_cache(tree.root_node(), source.as_str());
+        for fn_name in summary_cache.into_keys() {
+            index
+                .entry(fn_name)
+                .or_default()
+                .push((rel_str.clone(), source.clone()));
+        }
+    }
+    index
 }
 
 /// Check if a file path appears to be a test file.

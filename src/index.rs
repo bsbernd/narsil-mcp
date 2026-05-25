@@ -5172,7 +5172,7 @@ impl CodeIntelEngine {
         use crate::heap_size;
         use crate::security_rules::{
             is_security_exemplar_file, is_test_file, strip_inline_test_code, CallGraphContext,
-            SecurityRulesEngine,
+            FileCacheContext, SecurityRulesEngine,
         };
 
         let path = opts.path;
@@ -5236,19 +5236,27 @@ impl CodeIntelEngine {
         let ruleset_tags: Option<Vec<&str>> =
             ruleset.map(|r| r.split(',').map(str::trim).collect());
 
-        // Build a cross-file context backed by the project call graph
-        // so the symbolic heap-overflow pass can resolve allocator
-        // helpers defined in a different translation unit from their
-        // write site. When the call graph is disabled or this repo has
-        // none, fall back to NullContext (per-TU-only behaviour).
+        // Build a cross-file context so the symbolic heap-overflow pass
+        // can resolve allocator helpers defined in a different
+        // translation unit from their write site. Prefer the project
+        // call graph when available; otherwise fall back to a
+        // file_cache-backed context so cross-TU resolution still works
+        // when the user runs scan_security without --call-graph (which
+        // is the default). Without this fallback every CWE-122 finding
+        // that requires a cross-TU helper would silently disappear.
         let graph_ref_opt = self.call_graphs.get(&repo_name);
-        let null_ctx = heap_size::NullContext;
         let cg_ctx = graph_ref_opt
             .as_ref()
             .map(|g| CallGraphContext::new(g.value(), &self.file_cache, &repo_path));
-        let cross_file_ctx: &dyn heap_size::CrossFileContext = match &cg_ctx {
-            Some(c) => c,
-            None => &null_ctx,
+        let fc_ctx = if cg_ctx.is_none() {
+            Some(FileCacheContext::new(&self.file_cache, &repo_path))
+        } else {
+            None
+        };
+        let cross_file_ctx: &dyn heap_size::CrossFileContext = match (&cg_ctx, &fc_ctx) {
+            (Some(c), _) => c,
+            (None, Some(c)) => c,
+            (None, None) => unreachable!("fc_ctx is set whenever cg_ctx is None"),
         };
 
         // Scan all files and filter by severity
