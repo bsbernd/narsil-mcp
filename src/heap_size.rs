@@ -1420,25 +1420,205 @@ fn extract_innermost_identifier(node: Node<'_>, source: &str) -> Option<String> 
 /// Walk a function body and compute the single symbolic return-size
 /// every reachable `return <allocator>` agrees on, or `Unknown` if any
 /// return path disagrees, returns a non-allocator expression, or no
-/// return exists.
+/// return exists. `return NULL` / `return 0` are treated as error
+/// paths and excluded from the disagreement check — they are not
+/// allocations and would otherwise force the common
+/// `if (err) return 0;` plus `return out;` shape to collapse to
+/// Unknown.
 fn compute_return_size(body: Node<'_>, source: &str) -> SizeExpr {
     let return_expressions = collect_return_expressions(body);
     if return_expressions.is_empty() {
         return SizeExpr::Unknown;
     }
-    let mut sizes_iter = return_expressions
-        .into_iter()
-        .map(|expr| recognise_allocator_call(expr, source).unwrap_or(SizeExpr::Unknown));
-    let first_size = sizes_iter.next().unwrap_or(SizeExpr::Unknown);
+    let mut resolved_sizes: Vec<SizeExpr> = Vec::new();
+    for expr in return_expressions {
+        if is_null_return(expr, source) {
+            continue;
+        }
+        if let Some(size) = recognise_allocator_call(expr, source) {
+            resolved_sizes.push(size);
+            continue;
+        }
+        if expr.kind() == "identifier" {
+            let name = expr.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+            let cutoff = expr
+                .parent()
+                .map(|stmt| stmt.start_byte())
+                .unwrap_or(usize::MAX);
+            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let size = resolve_identifier_size(body, &name, cutoff, source, &mut visited);
+            resolved_sizes.push(size);
+            continue;
+        }
+        resolved_sizes.push(SizeExpr::Unknown);
+    }
+    let mut iter = resolved_sizes.into_iter();
+    let first_size = match iter.next() {
+        Some(size) => size,
+        None => return SizeExpr::Unknown,
+    };
     if matches!(first_size, SizeExpr::Unknown) {
         return SizeExpr::Unknown;
     }
-    for size in sizes_iter {
+    for size in iter {
         if size != first_size {
             return SizeExpr::Unknown;
         }
     }
     first_size
+}
+
+/// True for return expressions that represent an error path — `0`,
+/// `NULL`, or `nullptr`. These do not allocate and must not enter the
+/// disagreement check.
+fn is_null_return(node: Node<'_>, source: &str) -> bool {
+    let text = node.utf8_text(source.as_bytes()).unwrap_or("").trim();
+    text == "0" || text == "NULL" || text == "nullptr"
+}
+
+/// A populating site found by [`walk_populating_sites`]: where in the
+/// body it ends, and either a resolved allocation size or the name of
+/// another identifier whose size we still need to chase down.
+enum PopulatingKind {
+    Resolved(SizeExpr),
+    PointerCopy(String),
+}
+
+struct PopulatingSite {
+    end_byte: usize,
+    kind: PopulatingKind,
+}
+
+/// Resolve the symbolic size of an identifier `name` by collecting every
+/// statement that populates it before `cutoff_byte` and folding them
+/// the same way [`compute_return_size`] folds returns: all sites must
+/// agree, otherwise Unknown. Pointer-copy chains (`name = other`) are
+/// followed recursively, with `visited` guarding against cycles.
+fn resolve_identifier_size(
+    body: Node<'_>,
+    name: &str,
+    cutoff_byte: usize,
+    source: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> SizeExpr {
+    if !visited.insert(name.to_string()) {
+        return SizeExpr::Unknown;
+    }
+    let mut sites: Vec<PopulatingSite> = Vec::new();
+    walk_populating_sites(body, name, source, &mut sites);
+    sites.retain(|site| site.end_byte <= cutoff_byte);
+    if sites.is_empty() {
+        return SizeExpr::Unknown;
+    }
+    let mut folded: Option<SizeExpr> = None;
+    for site in sites {
+        let size = match site.kind {
+            PopulatingKind::Resolved(size) => size,
+            PopulatingKind::PointerCopy(other) => {
+                resolve_identifier_size(body, &other, site.end_byte, source, visited)
+            }
+        };
+        if matches!(size, SizeExpr::Unknown) {
+            return SizeExpr::Unknown;
+        }
+        match folded {
+            None => folded = Some(size),
+            Some(ref prev) if *prev != size => return SizeExpr::Unknown,
+            Some(_) => {}
+        }
+    }
+    folded.unwrap_or(SizeExpr::Unknown)
+}
+
+/// Walk the function body and record every statement that populates
+/// `name`. Recognised shapes:
+/// * `name = <allocator-call>` (assignment_expression)
+/// * `T name = <allocator-call>` (init_declarator with initialiser)
+/// * `asprintf(&name, …)` / `vasprintf(&name, …)` (out-parameter)
+/// * `name = other_ident` (pointer copy — recorded for recursive resolve)
+fn walk_populating_sites(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+    sites: &mut Vec<PopulatingSite>,
+) {
+    match node.kind() {
+        "assignment_expression" => {
+            if let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) {
+                if left.kind() == "identifier"
+                    && left.utf8_text(source.as_bytes()).unwrap_or("") == name
+                {
+                    if let Some(size) = recognise_allocator_call(right, source) {
+                        sites.push(PopulatingSite {
+                            end_byte: node.end_byte(),
+                            kind: PopulatingKind::Resolved(size),
+                        });
+                    } else if right.kind() == "identifier" {
+                        let other = right.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                        if !other.is_empty() && other != name {
+                            sites.push(PopulatingSite {
+                                end_byte: node.end_byte(),
+                                kind: PopulatingKind::PointerCopy(other),
+                            });
+                        } else {
+                            sites.push(PopulatingSite {
+                                end_byte: node.end_byte(),
+                                kind: PopulatingKind::Resolved(SizeExpr::Unknown),
+                            });
+                        }
+                    } else {
+                        sites.push(PopulatingSite {
+                            end_byte: node.end_byte(),
+                            kind: PopulatingKind::Resolved(SizeExpr::Unknown),
+                        });
+                    }
+                }
+            }
+        }
+        "init_declarator" => {
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                if let Some(decl_name) = extract_innermost_identifier(declarator, source) {
+                    if decl_name == name {
+                        if let Some(value) = node.child_by_field_name("value") {
+                            if let Some(size) = recognise_allocator_call(value, source) {
+                                sites.push(PopulatingSite {
+                                    end_byte: node.end_byte(),
+                                    kind: PopulatingKind::Resolved(size),
+                                });
+                            } else if value.kind() == "identifier" {
+                                let other =
+                                    value.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                if !other.is_empty() && other != name {
+                                    sites.push(PopulatingSite {
+                                        end_byte: node.end_byte(),
+                                        kind: PopulatingKind::PointerCopy(other),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "call_expression" => {
+            if let Some((destination, size)) = recognise_asprintf_call(node, source) {
+                if destination == name {
+                    sites.push(PopulatingSite {
+                        end_byte: node.end_byte(),
+                        kind: PopulatingKind::Resolved(size),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_populating_sites(child, name, source, sites);
+    }
 }
 
 fn collect_return_expressions<'a>(node: Node<'a>) -> Vec<Node<'a>> {
@@ -2636,6 +2816,63 @@ mod tests {
     }
 
     #[test]
+    fn summarise_function_recognises_return_via_assignment_from_asprintf() {
+        // Trigger shape: `out` is declared without initialiser, populated
+        // by asprintf as an out-parameter, then returned. The error path
+        // `return 0` must not collapse the result to Unknown.
+        let code = "int asprintf(char **, const char *, ...);\n\
+                    char *make_name(const char *base) {\n\
+                        char *out;\n\
+                        int ret = asprintf(&out, \"%s\", base);\n\
+                        if (ret < 0) return 0;\n\
+                        return out;\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("make_name").expect("make_name summarised");
+        let expected = SizeExpr::StrlenOf("base".into()).add(SizeExpr::Constant(1));
+        assert_eq!(summary.return_size, expected);
+    }
+
+    #[test]
+    fn summarise_function_recognises_return_via_assignment_from_malloc() {
+        // Variant of the trigger shape: the populating site is a direct
+        // assignment `out = malloc(...)` rather than an out-parameter.
+        let code = "char *malloc(unsigned long);\n\
+                    unsigned long strlen(const char *);\n\
+                    char *make_buf(const char *base) {\n\
+                        char *out;\n\
+                        out = malloc(strlen(base) + 1);\n\
+                        return out;\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("make_buf").expect("make_buf summarised");
+        let expected = SizeExpr::StrlenOf("base".into()).add(SizeExpr::Constant(1));
+        assert_eq!(summary.return_size, expected);
+    }
+
+    #[test]
+    fn summarise_function_unknown_when_assignment_disagrees() {
+        // Two non-error populating sites with different sizes must
+        // collapse to Unknown — "miss rather than misreport".
+        let code = "char *malloc(unsigned long);\n\
+                    char *pick(int branch) {\n\
+                        char *out;\n\
+                        out = malloc(4);\n\
+                        out = malloc(8);\n\
+                        return out;\n\
+                    }";
+        let mut parser = tree_sitter::Parser::new();
+        let tree = parse_full(&mut parser, code);
+        let cache = build_function_summary_cache(tree.root_node(), code);
+        let summary = cache.get("pick").expect("pick summarised");
+        assert_eq!(summary.return_size, SizeExpr::Unknown);
+    }
+
+    #[test]
     fn cross_function_helper_resolves_caller_allocation_through_cache() {
         // helper allocates strlen(name) + 1; caller passes a *different*
         // identifier and writes a long literal that exceeds it.
@@ -2919,6 +3156,50 @@ mod tests {
             findings.is_empty(),
             "recursive helper must short-circuit to Unknown, got {:?}",
             findings,
+        );
+    }
+
+    #[test]
+    fn engine_scan_with_context_emits_cwe_122_for_return_via_assignment_shape() {
+        // End-to-end: the helper allocates via `asprintf(&out, "%s", base)`
+        // and returns `out`; the caller builds `"%s#%s"` into that buffer,
+        // overflowing by the prefix plus the separator. Until patch 26 the
+        // helper summarised as Unknown — the cross-TU pipeline ran but had
+        // no size to compare against. This test guards that the resolver
+        // now sees through the assignment.
+        let helper_source = "int asprintf(char **, const char *, ...);\n\
+                             char *make_name(const char *base) {\n\
+                                 char *out;\n\
+                                 int ret = asprintf(&out, \"%s\", base);\n\
+                                 if (ret < 0) return 0;\n\
+                                 return out;\n\
+                             }\n";
+        let caller_source = "char *make_name(const char *);\n\
+                             int sprintf(char *, const char *, ...);\n\
+                             void use(const char *base, const char *prefix) {\n\
+                                 char *name = make_name(base);\n\
+                                 sprintf(name, \"%s#%s\", prefix, base);\n\
+                             }\n";
+
+        let ctx = MockContext::with("make_name", "lib/helper.c", helper_source);
+        let cross_findings = scan_heap_overflows_with_context(caller_source, "util/caller.c", &ctx);
+        assert!(
+            cross_findings
+                .iter()
+                .any(|f| f.file_path == "util/caller.c"),
+            "expected at least one CWE-122 finding for util/caller.c, got {:?}",
+            cross_findings,
+        );
+
+        // Baseline: per-TU only (NullContext) cannot see the helper, so
+        // the shape must remain undetectable without context. Guards the
+        // resolver from accidentally becoming a no-op.
+        let baseline =
+            scan_heap_overflows_with_context(caller_source, "util/caller.c", &NullContext);
+        assert!(
+            !baseline.iter().any(|f| f.file_path == "util/caller.c"),
+            "NullContext path must not fire for return-via-assignment shape, got {:?}",
+            baseline,
         );
     }
 }
