@@ -32,6 +32,25 @@ void use(const char *base, const char *prefix) {
 }
 ";
 
+const SINGLE_TU_C: &str = "\
+unsigned long strlen(const char *);
+void *calloc(unsigned long, unsigned long);
+char *strcpy(char *, const char *);
+
+void missing_check(const char *src) {
+    unsigned long opts_len = strlen(src) + 1;
+    char *buf = calloc(1, opts_len);
+    strcpy(buf, src);
+}
+
+void has_check(const char *src) {
+    unsigned long opts_len = strlen(src) + 1;
+    char *buf = calloc(1, opts_len);
+    if (!buf) return;
+    strcpy(buf, src);
+}
+";
+
 /// Builds an engine with `EngineOptions::default()` — the exact configuration
 /// used by the MCP server when launched without `--call-graph`, which is the
 /// failure mode the 2026-05-25 coverage report reproduces.
@@ -89,6 +108,56 @@ async fn scan_security_emits_cwe_122_for_cross_tu_asprintf_then_sprintf_overflow
         !(helper_only.contains("caller.c") && helper_only.contains("CWE-122")),
         "scanning only helper.c must not emit CWE-122 for caller.c (confirms cross-TU dependency).\n\
          Report:\n{helper_only}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_security_emits_cwe_476_for_calloc_without_null_check() -> Result<()> {
+    let repo_tmp = TempDir::new()?;
+    let repo_path = repo_tmp.path().to_path_buf();
+    std::fs::write(repo_path.join("single_tu.c"), SINGLE_TU_C)?;
+
+    let (engine, _index_tmp) = build_engine(repo_path.clone()).await?;
+    let repo_name = repo_path.to_str().unwrap();
+
+    let report = engine
+        .scan_security(repo_name, SecurityScanOptions::default())
+        .await?;
+
+    let scanned_zero = report.contains("**Files Scanned**: 0\n");
+    assert!(
+        !scanned_zero,
+        "scan_security reported zero C files scanned.\n\
+         Full report:\n{report}"
+    );
+
+    // Positive: missing_check should produce a CWE-476-002 finding.
+    let cwe476_002 = report.contains("CWE-476-002");
+    let mentions_missing = report.contains("missing_check") || report.contains("'buf'");
+    assert!(
+        cwe476_002 && mentions_missing,
+        "expected a CWE-476-002 finding referencing missing_check / 'buf'.\n\
+         CWE-476-002 present: {cwe476_002}\n\
+         missing_check/'buf' present: {mentions_missing}\n\
+         Full report:\n{report}"
+    );
+
+    // Negative: has_check must not produce a CWE-476-002 finding.
+    // The finding message format is "'<pointer>' from <allocator>() used
+    // without NULL check"; both functions name their pointer `buf`, so we
+    // disambiguate by line number — has_check's strcpy is on a different
+    // line than missing_check's.
+    //
+    // Simpler structural assertion: the rule must emit exactly one
+    // CWE-476-002 line. If it emits two, the negative case is also
+    // flagged and the rule is over-greedy.
+    let cwe476_002_count = report.matches("CWE-476-002").count();
+    assert_eq!(
+        cwe476_002_count, 1,
+        "expected exactly one CWE-476-002 finding (positive only); got {cwe476_002_count}.\n\
+         Full report:\n{report}"
     );
 
     Ok(())

@@ -676,6 +676,511 @@ fn text_of(node: Node<'_>, source: &str) -> String {
     node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
 }
 
+/// A potential NULL-pointer dereference: a local pointer initialised
+/// by an allocator that may return NULL is dereferenced (or passed to
+/// a function known to dereference its argument) without an
+/// intervening NULL check that leaves the function on the NULL branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NullDerefFinding {
+    /// Name of the pointer variable.
+    pub pointer: String,
+    /// Allocator function whose result was assigned to the pointer.
+    pub allocator: String,
+    /// File the finding is reported against.
+    pub file_path: String,
+    /// 1-indexed line/column of the offending use.
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    /// Source text of the offending use.
+    pub snippet: String,
+}
+
+/// Scan C/C++ source for the CWE-476 pattern: local pointer assigned
+/// from an allocator (`malloc` / `calloc` / `realloc` / `strdup` /
+/// `strndup` / `aligned_alloc`) and then used before any NULL check
+/// that diverts the function on the NULL branch.
+///
+/// Soundness: "miss rather than misreport". A use is only flagged when
+/// no recognised early-leave NULL check (`if (!p) return …`,
+/// `if (p == NULL) return …`, `if (NULL == p) return …`) precedes it
+/// in source order, and the use is not inside an `if (p)` /
+/// `if (p != NULL)` guarded block. Any intervening shape the analyser
+/// does not recognise causes the alloc site to be silently dropped.
+pub fn scan_null_deref_after_alloc(code: &str, file_path: &str) -> Vec<NullDerefFinding> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return Vec::new();
+    };
+
+    let mut findings = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            if let Some(body) = node.child_by_field_name("body") {
+                collect_null_deref_findings(body, code, file_path, &mut findings);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    findings
+}
+
+#[derive(Debug, Clone)]
+struct AllocSite {
+    name: String,
+    allocator: String,
+    alloc_end_byte: usize,
+}
+
+fn collect_null_deref_findings(
+    body: Node<'_>,
+    source: &str,
+    file_path: &str,
+    out: &mut Vec<NullDerefFinding>,
+) {
+    let alloc_sites = collect_alloc_sites(body, source);
+    let null_checks = collect_null_check_positions(body, source);
+    let safe_blocks = collect_safe_blocks(body, source);
+
+    for site in alloc_sites {
+        if let Some(use_node) = first_unchecked_use(body, &site, source, &null_checks, &safe_blocks)
+        {
+            let start = use_node.start_position();
+            let end = use_node.end_position();
+            let snippet = use_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            out.push(NullDerefFinding {
+                pointer: site.name,
+                allocator: site.allocator,
+                file_path: file_path.to_string(),
+                line: start.row + 1,
+                column: start.column + 1,
+                end_line: end.row + 1,
+                end_column: end.column + 1,
+                snippet,
+            });
+        }
+    }
+}
+
+fn collect_alloc_sites(body: Node<'_>, source: &str) -> Vec<AllocSite> {
+    let mut sites = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "declaration" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "init_declarator" {
+                        if let (Some(decl), Some(value)) = (
+                            child.child_by_field_name("declarator"),
+                            child.child_by_field_name("value"),
+                        ) {
+                            if let (Some(name), Some(allocator)) = (
+                                extract_pointer_decl_name(decl, source),
+                                recognise_allocator_function_name(value, source),
+                            ) {
+                                sites.push(AllocSite {
+                                    name,
+                                    allocator,
+                                    alloc_end_byte: child.end_byte(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "assignment_expression" => {
+                if let (Some(lhs), Some(rhs)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if lhs.kind() == "identifier" {
+                        if let Ok(name) = lhs.utf8_text(source.as_bytes()) {
+                            if let Some(allocator) = recognise_allocator_function_name(rhs, source)
+                            {
+                                sites.push(AllocSite {
+                                    name: name.to_string(),
+                                    allocator,
+                                    alloc_end_byte: node.end_byte(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    sites
+}
+
+fn extract_pointer_decl_name(decl: Node<'_>, source: &str) -> Option<String> {
+    match decl.kind() {
+        "pointer_declarator" | "parenthesized_declarator" => {
+            let inner = decl.child_by_field_name("declarator")?;
+            extract_pointer_decl_name(inner, source)
+        }
+        "identifier" => decl.utf8_text(source.as_bytes()).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn recognise_allocator_function_name(node: Node<'_>, source: &str) -> Option<String> {
+    let call = unwrap_to_call(node)?;
+    let function = call.child_by_field_name("function")?;
+    let name = function.utf8_text(source.as_bytes()).ok()?;
+    match name {
+        "malloc" | "calloc" | "realloc" | "strdup" | "strndup" | "aligned_alloc" => {
+            Some(name.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Map of pointer name -> sorted byte positions of `if`-statements that
+/// recognise the pointer as NULL and divert the function on that branch
+/// (return / goto / break with the NULL branch active).
+type NullCheckMap = std::collections::HashMap<String, Vec<usize>>;
+
+/// Map of pointer name -> list of (start_byte, end_byte) ranges of
+/// `if (p)` / `if (p != NULL)` blocks. Uses of `p` inside one of these
+/// ranges are guarded.
+type SafeBlockMap = std::collections::HashMap<String, Vec<(usize, usize)>>;
+
+fn collect_null_check_positions(body: Node<'_>, source: &str) -> NullCheckMap {
+    let mut out: NullCheckMap = std::collections::HashMap::new();
+    walk_for_null_checks(body, source, &mut out);
+    for positions in out.values_mut() {
+        positions.sort_unstable();
+    }
+    out
+}
+
+fn walk_for_null_checks(node: Node<'_>, source: &str, out: &mut NullCheckMap) {
+    if node.kind() == "if_statement" {
+        if let Some((name, kind)) = classify_null_check(node, source) {
+            if matches!(kind, NullCheckKind::EarlyLeaveOnNull) {
+                out.entry(name).or_default().push(node.start_byte());
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_null_checks(child, source, out);
+    }
+}
+
+fn collect_safe_blocks(body: Node<'_>, source: &str) -> SafeBlockMap {
+    let mut out: SafeBlockMap = std::collections::HashMap::new();
+    walk_for_safe_blocks(body, source, &mut out);
+    out
+}
+
+fn walk_for_safe_blocks(node: Node<'_>, source: &str, out: &mut SafeBlockMap) {
+    if node.kind() == "if_statement" {
+        if let Some((name, kind)) = classify_null_check(node, source) {
+            if matches!(kind, NullCheckKind::TruthyGuardedBlock) {
+                if let Some(consequence) = node.child_by_field_name("consequence") {
+                    out.entry(name)
+                        .or_default()
+                        .push((consequence.start_byte(), consequence.end_byte()));
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_safe_blocks(child, source, out);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NullCheckKind {
+    /// `if (!p) return …` / `if (p == NULL) return …` — divert on NULL.
+    EarlyLeaveOnNull,
+    /// `if (p)` / `if (p != NULL)` — uses inside the consequence body
+    /// are guarded.
+    TruthyGuardedBlock,
+}
+
+fn classify_null_check(if_stmt: Node<'_>, source: &str) -> Option<(String, NullCheckKind)> {
+    let condition = if_stmt.child_by_field_name("condition")?;
+    // condition is typically `parenthesized_expression` wrapping the actual test
+    let inner = strip_parens(condition);
+    let consequence = if_stmt.child_by_field_name("consequence");
+    if let Some((name, polarity)) = match_null_condition(inner, source) {
+        return Some(match polarity {
+            NullPolarity::TrueIfNull => {
+                if consequence
+                    .map(|c| branch_leaves_function(c))
+                    .unwrap_or(false)
+                {
+                    (name, NullCheckKind::EarlyLeaveOnNull)
+                } else {
+                    return None;
+                }
+            }
+            NullPolarity::TrueIfNonNull => (name, NullCheckKind::TruthyGuardedBlock),
+        });
+    }
+    None
+}
+
+fn strip_parens(node: Node<'_>) -> Node<'_> {
+    match node.kind() {
+        "parenthesized_expression" => (0..(node.named_child_count() as u32))
+            .filter_map(|idx| node.named_child(idx))
+            .next()
+            .map(strip_parens)
+            .unwrap_or(node),
+        _ => node,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NullPolarity {
+    /// Condition is true when the pointer is NULL: `!p`, `p == NULL`,
+    /// `p == 0`, `NULL == p`, `0 == p`.
+    TrueIfNull,
+    /// Condition is true when the pointer is non-NULL: `p`,
+    /// `p != NULL`, `p != 0`, `NULL != p`, `0 != p`.
+    TrueIfNonNull,
+}
+
+fn match_null_condition(node: Node<'_>, source: &str) -> Option<(String, NullPolarity)> {
+    match node.kind() {
+        "unary_expression" => {
+            let op = node.child_by_field_name("operator")?;
+            let op_text = op.utf8_text(source.as_bytes()).ok()?;
+            if op_text == "!" {
+                let arg = node.child_by_field_name("argument")?;
+                if arg.kind() == "identifier" {
+                    let name = arg.utf8_text(source.as_bytes()).ok()?;
+                    return Some((name.to_string(), NullPolarity::TrueIfNull));
+                }
+            }
+            None
+        }
+        "binary_expression" => {
+            let op = node.child_by_field_name("operator")?;
+            let op_text = op.utf8_text(source.as_bytes()).ok()?;
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let (name, _other) = pick_identifier_and_null(left, right, source)?;
+            match op_text {
+                "==" => Some((name, NullPolarity::TrueIfNull)),
+                "!=" => Some((name, NullPolarity::TrueIfNonNull)),
+                _ => None,
+            }
+        }
+        "identifier" => {
+            // bare `if (p)` — truthy means non-NULL
+            let name = node.utf8_text(source.as_bytes()).ok()?;
+            Some((name.to_string(), NullPolarity::TrueIfNonNull))
+        }
+        _ => None,
+    }
+}
+
+fn pick_identifier_and_null<'a>(
+    a: Node<'a>,
+    b: Node<'a>,
+    source: &str,
+) -> Option<(String, Node<'a>)> {
+    if is_null_literal(a, source) && b.kind() == "identifier" {
+        Some((b.utf8_text(source.as_bytes()).ok()?.to_string(), a))
+    } else if is_null_literal(b, source) && a.kind() == "identifier" {
+        Some((a.utf8_text(source.as_bytes()).ok()?.to_string(), b))
+    } else {
+        None
+    }
+}
+
+fn is_null_literal(node: Node<'_>, source: &str) -> bool {
+    let text = node.utf8_text(source.as_bytes()).unwrap_or("").trim();
+    matches!(text, "NULL" | "nullptr" | "0" | "((void *)0)" | "(void *)0")
+}
+
+fn branch_leaves_function(node: Node<'_>) -> bool {
+    match node.kind() {
+        "return_statement" | "goto_statement" => true,
+        "compound_statement" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if branch_leaves_function(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn first_unchecked_use<'a>(
+    body: Node<'a>,
+    site: &AllocSite,
+    source: &str,
+    null_checks: &NullCheckMap,
+    safe_blocks: &SafeBlockMap,
+) -> Option<Node<'a>> {
+    let checks_for_name = null_checks.get(&site.name);
+    let safe_for_name = safe_blocks.get(&site.name);
+    let mut stack = vec![body];
+    let mut candidates: Vec<Node<'a>> = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= site.alloc_end_byte {
+            continue;
+        }
+        if is_pointer_use_of(node, &site.name, source) {
+            candidates.push(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    candidates.sort_by_key(|node| node.start_byte());
+    for use_node in candidates {
+        let use_start = use_node.start_byte();
+        if use_start <= site.alloc_end_byte {
+            continue;
+        }
+        // Guarded inside `if (p)` block?
+        if let Some(blocks) = safe_for_name {
+            if blocks
+                .iter()
+                .any(|(start, end)| use_start >= *start && use_node.end_byte() <= *end)
+            {
+                continue;
+            }
+        }
+        // Preceded by an early-leave NULL check?
+        if let Some(check_positions) = checks_for_name {
+            if check_positions
+                .iter()
+                .any(|pos| *pos > site.alloc_end_byte && *pos < use_start)
+            {
+                continue;
+            }
+        }
+        return Some(use_node);
+    }
+    None
+}
+
+/// Functions in the C standard library known to dereference their
+/// first pointer argument. The list is deliberately conservative —
+/// `printf`, `fprintf`, `free` and similar are excluded because
+/// `free(NULL)` is defined and `printf` with `%s NULL` does not always
+/// deref. Keep the set small to satisfy the "miss rather than misreport"
+/// rule.
+const POINTER_DEREF_FUNCTIONS: &[&str] = &[
+    "strcpy",
+    "strncpy",
+    "strcat",
+    "strncat",
+    "strlen",
+    "strnlen",
+    "strcmp",
+    "strncmp",
+    "strcasecmp",
+    "strncasecmp",
+    "strchr",
+    "strrchr",
+    "strstr",
+    "memcpy",
+    "memmove",
+    "memset",
+    "mempcpy",
+    "memcmp",
+    "memchr",
+    "sprintf",
+    "snprintf",
+    "vsprintf",
+    "vsnprintf",
+];
+
+fn is_pointer_use_of(node: Node<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "pointer_expression" | "unary_expression" => {
+            // `*p`. tree-sitter-c parses dereferences as
+            // `pointer_expression` and the logical-not / arithmetic
+            // negation forms as `unary_expression`. Both expose
+            // `operator` and `argument` fields, so we accept either
+            // node kind here and gate on the actual operator text.
+            let Some(op) = node.child_by_field_name("operator") else {
+                return false;
+            };
+            if op.utf8_text(source.as_bytes()).ok() != Some("*") {
+                return false;
+            }
+            let Some(arg) = node.child_by_field_name("argument") else {
+                return false;
+            };
+            arg.kind() == "identifier" && arg.utf8_text(source.as_bytes()).ok() == Some(name)
+        }
+        "subscript_expression" => {
+            // `p[i]`
+            let Some(arg) = node.child_by_field_name("argument") else {
+                return false;
+            };
+            arg.kind() == "identifier" && arg.utf8_text(source.as_bytes()).ok() == Some(name)
+        }
+        "field_expression" => {
+            // `p->x` — operator is `->`
+            let Some(arg) = node.child_by_field_name("argument") else {
+                return false;
+            };
+            let Some(op) = node.child_by_field_name("operator") else {
+                return false;
+            };
+            if op.utf8_text(source.as_bytes()).ok() != Some("->") {
+                return false;
+            }
+            arg.kind() == "identifier" && arg.utf8_text(source.as_bytes()).ok() == Some(name)
+        }
+        "call_expression" => {
+            let Some(function) = node.child_by_field_name("function") else {
+                return false;
+            };
+            let Some(fname) = function.utf8_text(source.as_bytes()).ok() else {
+                return false;
+            };
+            if !POINTER_DEREF_FUNCTIONS.contains(&fname) {
+                return false;
+            }
+            let Some(arguments) = node.child_by_field_name("arguments") else {
+                return false;
+            };
+            let Some(first) = arguments.named_child(0) else {
+                return false;
+            };
+            first.kind() == "identifier" && first.utf8_text(source.as_bytes()).ok() == Some(name)
+        }
+        _ => false,
+    }
+}
+
 /// A request to find a function definition outside of the current
 /// translation unit. The heap-overflow analyser consults the context
 /// when its per-TU summary cache misses a callee — without it, an
@@ -3200,6 +3705,155 @@ mod tests {
             !baseline.iter().any(|f| f.file_path == "util/caller.c"),
             "NullContext path must not fire for return-via-assignment shape, got {:?}",
             baseline,
+        );
+    }
+
+    #[test]
+    fn null_deref_calloc_then_strcpy_without_check_is_flagged() {
+        let code = "\
+unsigned long strlen(const char *);
+void *calloc(unsigned long, unsigned long);
+char *strcpy(char *, const char *);
+
+void missing_check(const char *src) {
+    unsigned long n = strlen(src) + 1;
+    char *buf = calloc(1, n);
+    strcpy(buf, src);
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "missing.c");
+        assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.pointer, "buf");
+        assert_eq!(finding.allocator, "calloc");
+    }
+
+    #[test]
+    fn null_deref_malloc_then_check_then_strcpy_is_not_flagged() {
+        let code = "\
+void *malloc(unsigned long);
+char *strcpy(char *, const char *);
+
+void has_check(unsigned long n, const char *src) {
+    char *buf = malloc(n);
+    if (!buf) return;
+    strcpy(buf, src);
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "checked.c");
+        assert!(
+            findings.is_empty(),
+            "expected no findings (early-leave guards use), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn null_deref_eq_null_check_then_use_is_not_flagged() {
+        let code = "\
+void *malloc(unsigned long);
+char *strcpy(char *, const char *);
+
+void has_check(unsigned long n, const char *src) {
+    char *buf = malloc(n);
+    if (buf == NULL) return;
+    strcpy(buf, src);
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "eq_null.c");
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn null_deref_use_inside_truthy_block_is_not_flagged() {
+        let code = "\
+void *malloc(unsigned long);
+char *strcpy(char *, const char *);
+
+void guarded_block(unsigned long n, const char *src) {
+    char *buf = malloc(n);
+    if (buf) {
+        strcpy(buf, src);
+    }
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "guarded.c");
+        assert!(
+            findings.is_empty(),
+            "expected no findings (use inside if(buf) block is guarded), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn null_deref_strdup_without_check_is_flagged() {
+        let code = "\
+char *strdup(const char *);
+unsigned long strlen(const char *);
+
+void leak(const char *src) {
+    char *copy = strdup(src);
+    unsigned long len = strlen(copy);
+    (void)len;
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "leak.c");
+        assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
+        assert_eq!(findings[0].allocator, "strdup");
+        assert_eq!(findings[0].pointer, "copy");
+    }
+
+    #[test]
+    fn null_deref_alloc_in_assignment_then_deref_is_flagged() {
+        let code = "\
+void *malloc(unsigned long);
+
+void via_assignment(char *out, unsigned long n) {
+    out = malloc(n);
+    *out = 0;
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "assign.c");
+        assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
+        assert_eq!(findings[0].allocator, "malloc");
+        assert_eq!(findings[0].pointer, "out");
+    }
+
+    #[test]
+    fn null_deref_no_allocator_emits_nothing() {
+        let code = "\
+char *strcpy(char *, const char *);
+
+void no_alloc(char *buf, const char *src) {
+    strcpy(buf, src);
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "noalloc.c");
+        assert!(
+            findings.is_empty(),
+            "expected no findings (no allocator call), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn null_deref_goto_cleanup_is_a_recognised_leave() {
+        let code = "\
+void *malloc(unsigned long);
+char *strcpy(char *, const char *);
+
+void with_goto(unsigned long n, const char *src) {
+    char *buf = malloc(n);
+    if (!buf) goto fail;
+    strcpy(buf, src);
+fail:
+    return;
+}
+";
+        let findings = scan_null_deref_after_alloc(code, "goto.c");
+        assert!(
+            findings.is_empty(),
+            "expected no findings (goto cleanup counts as leave), got {findings:?}"
         );
     }
 }

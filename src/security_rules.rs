@@ -16,7 +16,7 @@
 use crate::callgraph::CallGraph;
 use crate::heap_size::{
     self, build_function_summary_cache, ConstantOverflowFinding, CrossFileContext,
-    FunctionLocation, HeapOverflowFinding, SizeofMulFinding,
+    FunctionLocation, HeapOverflowFinding, NullDerefFinding, SizeofMulFinding,
 };
 use crate::taint::{self, Confidence, Severity, VulnerabilityKind};
 use dashmap::DashMap;
@@ -1048,6 +1048,15 @@ impl SecurityRulesEngine {
                     heap_size::scan_sizeof_multiplications(code, file_path)
                         .into_iter()
                         .map(|finding| sizeof_mul_to_security_finding(finding, rule)),
+                );
+            }
+        }
+        if let Some(rule) = self.rules.get("CWE-476-002") {
+            if rule.enabled {
+                out.extend(
+                    heap_size::scan_null_deref_after_alloc(code, file_path)
+                        .into_iter()
+                        .map(|finding| null_deref_to_security_finding(finding, rule)),
                 );
             }
         }
@@ -2589,6 +2598,34 @@ fn constant_overflow_to_security_finding(
         finding.operator,
         finding.right_value,
         finding.expression,
+    );
+    SecurityFinding {
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        severity: rule.severity,
+        confidence: Confidence::High,
+        file_path: finding.file_path,
+        line: finding.line,
+        column: finding.column,
+        end_line: finding.end_line,
+        end_column: finding.end_column,
+        snippet: finding.snippet,
+        message,
+        remediation: rule.remediation.clone(),
+        cwe: rule.cwe.clone(),
+        owasp: rule.owasp.clone(),
+        context: HashMap::new(),
+    }
+}
+
+/// Project a null-deref-after-alloc finding into a [`SecurityFinding`].
+fn null_deref_to_security_finding(
+    finding: NullDerefFinding,
+    rule: &SecurityRule,
+) -> SecurityFinding {
+    let message = format!(
+        "{}: '{}' from {}() used without NULL check",
+        rule.message, finding.pointer, finding.allocator
     );
     SecurityFinding {
         rule_id: rule.id.clone(),

@@ -197,6 +197,22 @@ rules:
     enabled: true
     tags: ["memory", "null"]
 
+  # CWE-476: NULL deref after allocator return (tree-sitter-backed; sound)
+  - id: CWE-476-002
+    name: Allocator return used without NULL check
+    severity: High
+    cwe: ["CWE-476"]
+    owasp: []
+    rule_type:
+      type: pattern
+      patterns: []
+      safe_patterns: []
+    languages: ["c", "cpp"]
+    message: Allocator return used without NULL check
+    remediation: Check the allocator's return for NULL before any use; on NULL, return or goto a cleanup label.
+    enabled: true
+    tags: ["memory", "null"]
+
   # CWE-287: Improper Authentication (Rank 13)
   - id: CWE-287-001
     name: Weak Authentication
