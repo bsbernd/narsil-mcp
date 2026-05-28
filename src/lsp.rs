@@ -546,41 +546,52 @@ impl LspManager {
         }
     }
 
+    /// Gracefully stop one server: shutdown request followed by exit notification.
+    async fn shutdown_one_server(&self, language: &str, process: &LspProcess) {
+        info!("Shutting down LSP server for {}", language);
+
+        let _ = self
+            .send_request(process, "shutdown", serde_json::json!({}))
+            .await;
+
+        let notification = LspMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some("exit".to_string()),
+            params: None,
+            result: None,
+            error: None,
+        };
+
+        if let Ok(json) = serde_json::to_string(&notification) {
+            let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+            let mut stdin = process.stdin.lock().await;
+            let _ = stdin.write_all(content.as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
+    }
+
     /// Shutdown all LSP servers
     pub async fn shutdown_all(&self) -> Result<()> {
         for entry in self.servers.iter() {
-            let language = entry.key();
-            let process = entry.value();
-
-            info!("Shutting down LSP server for {}", language);
-
-            // Send shutdown request
-            let _ = self
-                .send_request(process, "shutdown", serde_json::json!({}))
-                .await;
-
-            // Send exit notification
-            let notification = LspMessage {
-                jsonrpc: "2.0".to_string(),
-                id: None,
-                method: Some("exit".to_string()),
-                params: None,
-                result: None,
-                error: None,
-            };
-
-            let json = serde_json::to_string(&notification)?;
-            let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
-
-            {
-                let mut stdin = process.stdin.lock().await;
-                let _ = stdin.write_all(content.as_bytes()).await;
-                let _ = stdin.flush().await;
-            }
+            self.shutdown_one_server(entry.key(), entry.value()).await;
         }
 
         self.servers.clear();
         Ok(())
+    }
+
+    /// Evict and gracefully shut down the LSP server for `language`.
+    /// The next request will start a fresh server process. Called when
+    /// compile_commands.json changes so clangd picks up the new flags.
+    pub async fn restart_server(&self, language: &str) {
+        if let Some((_, process)) = self.servers.remove(language) {
+            info!(
+                "Restarting LSP server for {} (compile_commands.json changed)",
+                language
+            );
+            self.shutdown_one_server(language, &process).await;
+        }
     }
 }
 
