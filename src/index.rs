@@ -1990,6 +1990,50 @@ impl CodeIntelEngine {
         ))
     }
 
+    /// Resolved compile_commands.json paths that watch mode must cover, mirroring
+    /// the resolution in `index_repo` so the watch set and the load set agree.
+    /// Empty when compile_commands filtering is disabled.
+    #[cfg(feature = "native")]
+    fn compile_commands_watch_paths(&self) -> Vec<PathBuf> {
+        if !self.options.use_compile_commands {
+            return Vec::new();
+        }
+        let mut paths = Vec::new();
+        match &self.options.compile_commands_path {
+            Some(explicit) if explicit.is_absolute() => paths.push(explicit.clone()),
+            Some(explicit) => {
+                for repo in &self.repo_paths {
+                    paths.push(repo.join(explicit));
+                }
+            }
+            None => {
+                for repo in &self.repo_paths {
+                    paths.push(repo.join("compile_commands.json"));
+                    paths.push(repo.join("build/compile_commands.json"));
+                }
+            }
+        }
+        paths
+    }
+
+    /// Parent directories of out-of-tree compile_commands paths that the watcher
+    /// must cover. Watch the directory, not the file: an atomic write-and-rename
+    /// replaces the inode and would break a file-level watch. Sibling files that
+    /// leak through are dropped later by the repo lookup in `process_file_changes`.
+    #[cfg(feature = "native")]
+    fn compile_commands_watch_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        for cc_path in self.compile_commands_watch_paths() {
+            if let Some(dir) = cc_path.parent() {
+                let already_watched = self.repo_paths.iter().any(|r| dir.starts_with(r));
+                if dir.exists() && !already_watched && !dirs.contains(&dir.to_path_buf()) {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+        }
+        dirs
+    }
+
     /// Create a file watcher for the indexed repositories.
     /// The caller is responsible for managing the watcher lifecycle.
     /// Returns None if watch mode is not enabled.
@@ -2006,6 +2050,11 @@ impl CodeIntelEngine {
                         if let Err(e) = watcher.watch(repo_path) {
                             warn!("Failed to watch {:?}: {}", repo_path, e);
                         }
+                    }
+                }
+                for dir in self.compile_commands_watch_dirs() {
+                    if let Err(e) = watcher.watch(&dir) {
+                        warn!("Failed to watch compile_commands dir {:?}: {}", dir, e);
                     }
                 }
                 Some(watcher)
@@ -2040,6 +2089,11 @@ impl CodeIntelEngine {
                         }
                     }
                 }
+                for dir in self.compile_commands_watch_dirs() {
+                    if let Err(e) = watcher.watch(&dir) {
+                        warn!("Failed to watch compile_commands dir {:?}: {}", dir, e);
+                    }
+                }
                 Some((watcher, rx))
             }
             Err(e) => {
@@ -2060,6 +2114,24 @@ impl CodeIntelEngine {
         let mut count = 0;
 
         for change in changes {
+            // compile_commands.json regenerated → clangd holds stale flags. Restart
+            // the C/C++ servers and skip normal re-indexing (it is not a source
+            // file). Checked before the repo lookup so an out-of-tree build dir is
+            // also handled. Deliberately does not bump `count`: nothing was
+            // re-indexed, so the save_index below must not fire for this alone.
+            if change
+                .path
+                .file_name()
+                .is_some_and(|n| n == "compile_commands.json")
+            {
+                if let Some(lsp) = &self.lsp_manager {
+                    for lang in ["c", "cpp"] {
+                        lsp.restart_server(lang).await;
+                    }
+                }
+                continue;
+            }
+
             // Find which repo this file belongs to. Notify may emit canonical
             // paths even when the user supplied a symlinked path (for example
             // `/private/var/...` vs `/var/...` on macOS), so compare both raw
