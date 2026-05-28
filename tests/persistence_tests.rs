@@ -592,6 +592,67 @@ async fn test_async_watcher_filters_non_source_files() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_async_watcher_passes_compile_commands() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+    use std::time::Duration;
+
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "pub fn test() {}")?;
+
+    let index_dir = TempDir::new()?;
+
+    let options = EngineOptions {
+        git_enabled: false,
+        call_graph_enabled: false,
+        persist_enabled: false,
+        watch_enabled: true,
+        streaming_config: StreamingConfig::default(),
+        lsp_config: LspConfig::default(),
+        neural_config: NeuralConfig::default(),
+        ..Default::default()
+    };
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo.path().to_path_buf()],
+        options,
+    )
+    .await?;
+
+    let (_watcher, mut rx) = engine.create_async_file_watcher().unwrap();
+
+    // Wait for watcher to initialize (generous for slow CI)
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // compile_commands.json must survive the source-extension filter so that
+    // clangd can be restarted with the regenerated flags.
+    let cc_path = repo.path().join("compile_commands.json");
+    std::fs::write(&cc_path, "[]")?;
+
+    // Wait for debounce (generous for slow CI)
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let mut saw_compile_commands = false;
+    while let Ok(Some(changes)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        if changes.iter().any(|c| {
+            c.path
+                .file_name()
+                .is_some_and(|n| n == "compile_commands.json")
+        }) {
+            saw_compile_commands = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_compile_commands,
+        "compile_commands.json change must not be filtered out"
+    );
+
+    Ok(())
+}
+
 /// Issue #26 regression: when the caller holds the shutdown `Sender`, the
 /// watcher must keep running and re-index files that change on disk. The
 /// original `main.rs` wiring dropped the `Sender` immediately, which made the

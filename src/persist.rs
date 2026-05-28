@@ -521,6 +521,14 @@ fn is_source_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A compile_commands.json change must restart clangd, so it has to survive the
+/// source-extension filter that would otherwise drop the .json file.
+fn is_compile_commands_file(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n == "compile_commands.json")
+        .unwrap_or(false)
+}
+
 /// Convert a notify path into source-file changes.
 ///
 /// Some platforms, especially macOS FSEvents and network/container mounts,
@@ -528,7 +536,7 @@ fn is_source_file(path: &Path) -> bool {
 /// happens, scan the reported directory for source files so watch mode does
 /// not silently miss the change.
 fn source_changes_for_path(path: &Path, change_type: ChangeType) -> Vec<FileChange> {
-    if is_source_file(path) {
+    if is_source_file(path) || is_compile_commands_file(path) {
         return vec![FileChange {
             path: path.to_path_buf(),
             change_type,
