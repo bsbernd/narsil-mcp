@@ -357,3 +357,222 @@ pub fn start() {
         path
     );
 }
+
+#[test]
+fn test_c_static_function_call_graph() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // Reproduces the niova-block bug: static C functions in the same TU
+    // with a 3-step call chain. find_call_path returned "No path found"
+    // and get_callees/get_callers both returned 0 for all three functions.
+    let c_code = r#"
+static int leaf_func(int x, int y);
+
+static int
+mid_func(int x)
+{
+    return leaf_func(x, x + 1);
+}
+
+static int
+top_func(void)
+{
+    return mid_func(42);
+}
+
+static int
+leaf_func(int x, int y)
+{
+    return x + y;
+}
+"#;
+
+    let tree = parser.parse_to_tree(Path::new("test.c"), c_code).unwrap();
+    let files = vec![("test.c".to_string(), c_code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    // top_func should call mid_func
+    let top_callees = call_graph.get_callees("top_func");
+    assert!(
+        !top_callees.is_empty(),
+        "top_func should have callees (found 0)"
+    );
+    assert!(
+        top_callees.iter().any(|e| e.target.ends_with("::mid_func")),
+        "top_func should call mid_func, got: {:?}",
+        top_callees.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+
+    // mid_func should call leaf_func
+    let mid_callees = call_graph.get_callees("mid_func");
+    assert!(
+        !mid_callees.is_empty(),
+        "mid_func should have callees (found 0)"
+    );
+    assert!(
+        mid_callees
+            .iter()
+            .any(|e| e.target.ends_with("::leaf_func")),
+        "mid_func should call leaf_func, got: {:?}",
+        mid_callees.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+
+    // leaf_func should have mid_func as caller
+    let leaf_callers = call_graph.get_callers("leaf_func");
+    assert!(
+        !leaf_callers.is_empty(),
+        "leaf_func should have callers (found 0)"
+    );
+
+    // find_call_path should resolve the 3-step chain
+    let path = call_graph.find_call_path("top_func", "leaf_func");
+    assert!(
+        path.is_some(),
+        "find_call_path(top_func -> leaf_func) returned None"
+    );
+    let path = path.unwrap();
+    assert_eq!(path.len(), 3, "expected 3-step path, got: {:?}", path);
+}
+
+#[test]
+fn test_c_cross_file_static_call_graph() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    // Simulates the niop_co_submit_and_wait pattern: function defined in
+    // another file, called from a static function in nclient.c-style file.
+    let nclient_code = r#"
+static int
+rchunk_func(int *niops, int n)
+{
+    return submit_and_wait(niops, n);
+}
+
+static int
+iterate_func(int x)
+{
+    return rchunk_func(&x, 1);
+}
+
+static void
+top_co(void)
+{
+    iterate_func(99);
+}
+"#;
+
+    let niop_code = r#"
+int submit_and_wait(int *niops, int n)
+{
+    return n;
+}
+"#;
+
+    let tree1 = parser
+        .parse_to_tree(Path::new("src/nclient.c"), nclient_code)
+        .unwrap();
+    let tree2 = parser
+        .parse_to_tree(Path::new("src/niop.c"), niop_code)
+        .unwrap();
+
+    let files = vec![
+        ("src/nclient.c".to_string(), nclient_code.to_string(), tree1),
+        ("src/niop.c".to_string(), niop_code.to_string(), tree2),
+    ];
+    call_graph.build_from_files(&files).unwrap();
+
+    // The 3-step cross-file path must be found
+    let path = call_graph.find_call_path("top_co", "submit_and_wait");
+    assert!(
+        path.is_some(),
+        "find_call_path(top_co -> submit_and_wait) returned None"
+    );
+
+    // submit_and_wait must show rchunk_func as a caller
+    let callers = call_graph.get_callers("submit_and_wait");
+    assert!(
+        !callers.is_empty(),
+        "submit_and_wait should have callers (found 0)"
+    );
+}
+
+#[test]
+fn test_c_typedef_return_type_call_graph() {
+    // Reproduces the exact niova-block pattern:
+    //   nclient_write_co        → static niova_task_co_ctx (typedef void)
+    //   niop_co_submit_and_wait → niova_task_co_int_ctx    (typedef int, no static)
+    //
+    // tree-sitter-c sees these as type_identifier (not primitive_type).
+    // If the call graph misidentifies the function_definition node due to
+    // the custom return type, get_callees and get_callers both return 0.
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let nclient_code = r#"
+typedef void    niova_task_co_ctx;
+typedef int     niova_task_co_int_ctx;
+
+static niova_task_co_int_ctx
+rchunk_submit(int *niops, int n)
+{
+    return niop_co_submit_and_wait(niops, n);
+}
+
+static niova_task_co_int_ctx
+iterate_and_submit(int x)
+{
+    return rchunk_submit(&x, 1);
+}
+
+static niova_task_co_ctx
+write_co(void)
+{
+    iterate_and_submit(99);
+}
+"#;
+
+    let niop_code = r#"
+typedef int     niova_task_co_int_ctx;
+
+niova_task_co_int_ctx
+niop_co_submit_and_wait(int *niops, int n)
+{
+    return n;
+}
+"#;
+
+    let tree1 = parser
+        .parse_to_tree(Path::new("src/nclient.c"), nclient_code)
+        .unwrap();
+    let tree2 = parser
+        .parse_to_tree(Path::new("src/niop.c"), niop_code)
+        .unwrap();
+
+    let files = vec![
+        ("src/nclient.c".to_string(), nclient_code.to_string(), tree1),
+        ("src/niop.c".to_string(), niop_code.to_string(), tree2),
+    ];
+    call_graph.build_from_files(&files).unwrap();
+
+    // write_co (typedef void return) must have outgoing edges
+    let write_co_callees = call_graph.get_callees("write_co");
+    assert!(
+        !write_co_callees.is_empty(),
+        "write_co (typedef void return) should have callees — got 0 (static typedef return type bug?)"
+    );
+
+    // niop_co_submit_and_wait (typedef int return, no static) must have callers
+    let callers = call_graph.get_callers("niop_co_submit_and_wait");
+    assert!(
+        !callers.is_empty(),
+        "niop_co_submit_and_wait should have callers — got 0"
+    );
+
+    // The full 3-step path must be resolvable
+    let path = call_graph.find_call_path("write_co", "niop_co_submit_and_wait");
+    assert!(
+        path.is_some(),
+        "find_call_path(write_co -> niop_co_submit_and_wait) returned None"
+    );
+}

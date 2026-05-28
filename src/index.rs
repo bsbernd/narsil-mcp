@@ -961,8 +961,16 @@ impl CodeIntelEngine {
                 let path = PathBuf::from(&repo_key);
                 self.repos.remove(&repo_key);
                 self.symbols.remove(&repo_key);
-                // Invalidate caches for this repo only
+                // Reset call graph so stale nodes from a branch switch don't linger.
+                // build_from_files only inserts/overwrites — it never removes — so
+                // functions deleted on the new branch would otherwise persist.
+                if self.options.call_graph_enabled {
+                    self.call_graphs.insert(repo_key.clone(), CallGraph::new());
+                }
+                // Invalidate all caches for this repo so stale analysis results
+                // (callers, callees, paths) are not served after the rebuild.
                 self.query_cache.invalidate_for_repo(&repo_key);
+                self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
                 self.index_repo(&path).await?;
                 Ok(format!("Re-indexed repository: {}", repo_key))
             }
@@ -2890,6 +2898,13 @@ impl CodeIntelEngine {
 
         let repo = self.resolve_repo(repo)?;
 
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
+
         // Build cache key with function as discriminator
         let cache_key = AnalysisCacheKey::with_discriminator(&repo, "call_graph", function);
 
@@ -2960,6 +2975,13 @@ impl CodeIntelEngine {
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
+
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
 
         let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callers_hybrid", function);
         let repo_hash = self.compute_repo_hash(&repo);
@@ -3108,6 +3130,13 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
 
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
+
         let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callees_hybrid", function);
         let repo_hash = self.compute_repo_hash(&repo);
         if self.options.cache_enabled {
@@ -3165,6 +3194,14 @@ impl CodeIntelEngine {
     /// Find the call path between two functions
     pub async fn find_call_path(&self, repo: &str, from: &str, to: &str) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
+
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
+
         let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not found for '{}'. Is --call-graph enabled?",
@@ -3196,6 +3233,14 @@ impl CodeIntelEngine {
     /// Get complexity metrics for a function
     pub async fn get_complexity(&self, repo: &str, function: &str) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
+
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
+
         let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not found for '{}'. Is --call-graph enabled?",
@@ -3254,6 +3299,14 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         // Note: exclude_tests filtering would require call graph regeneration
         let repo = self.resolve_repo(repo)?;
+
+        if !self.is_fully_initialized() {
+            return Err(anyhow!(
+                "Call graph not yet available — initialization in progress. \
+                 Please retry in a moment."
+            ));
+        }
+
         let call_graph = self.call_graphs.get(&repo).ok_or_else(|| {
             anyhow!(
                 "Call graph not found for '{}'. Is --call-graph enabled?",
