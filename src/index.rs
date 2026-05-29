@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
@@ -397,7 +397,7 @@ impl CodeIntelEngine {
         if options.persist_enabled {
             if let Some(ref store) = engine.index_store {
                 for repo_path in &expanded_repos {
-                    if let Ok(persisted) = store.load_or_create(repo_path) {
+                    if let Ok(persisted) = store.load_repo(repo_path) {
                         if !persisted.files.is_empty() {
                             let repo_name = match canonical_repo_key(repo_path) {
                                 Ok(k) => k,
@@ -1974,14 +1974,14 @@ impl CodeIntelEngine {
                 }
             }
 
-            // Save the index
-            store.save(&persisted)?;
-            saved_count += 1;
-            info!(
-                "Saved index for {} ({} files)",
-                repo_name,
-                persisted.files.len()
-            );
+            // Save the index (full rewrite — one-time after a fresh index and
+            // for the explicit save_index tool; the watch path is incremental).
+            // A per-repo failure (e.g. redb lock held by another process) must
+            // not abort saving the remaining repos.
+            match store.save_full(&persisted) {
+                Ok(()) => saved_count += 1,
+                Err(e) => warn!("Failed to save index for {}: {}", repo_name, e),
+            }
         }
 
         Ok(format!(
@@ -2109,7 +2109,16 @@ impl CodeIntelEngine {
         &self,
         changes: &[crate::persist::FileChange],
     ) -> Result<usize> {
-        use crate::persist::ChangeType;
+        use crate::persist::{ChangeType, FileMetadata};
+
+        // Per-repo batches so each repo's redb store is updated in one write
+        // transaction, touching only changed records — never the whole repo.
+        #[derive(Default)]
+        struct RepoPending {
+            upserts: Vec<FileMetadata>,
+            deletes: Vec<PathBuf>,
+        }
+        let mut pending: HashMap<String, RepoPending> = HashMap::new();
 
         let mut count = 0;
 
@@ -2117,8 +2126,8 @@ impl CodeIntelEngine {
             // compile_commands.json regenerated → clangd holds stale flags. Restart
             // the C/C++ servers and skip normal re-indexing (it is not a source
             // file). Checked before the repo lookup so an out-of-tree build dir is
-            // also handled. Deliberately does not bump `count`: nothing was
-            // re-indexed, so the save_index below must not fire for this alone.
+            // also handled. Deliberately does not bump `count` or add to
+            // `pending`, so it does not trigger a persist on its own.
             if change
                 .path
                 .file_name()
@@ -2166,16 +2175,21 @@ impl CodeIntelEngine {
                                 .to_string_lossy()
                                 .to_string();
 
+                            // Build this file's symbols once and reuse them for
+                            // both the in-memory index and the persisted record.
+                            let file_symbols: Vec<_> = parsed
+                                .symbols
+                                .into_iter()
+                                .map(|mut symbol| {
+                                    symbol.file_path = rel_path.clone();
+                                    symbol
+                                })
+                                .collect();
+
                             // Update symbols for this file
                             if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
-                                // Remove old symbols from this file
                                 symbols.retain(|s| s.file_path != rel_path);
-
-                                // Add new symbols
-                                for mut symbol in parsed.symbols {
-                                    symbol.file_path = rel_path.clone();
-                                    symbols.push(symbol);
-                                }
+                                symbols.extend(file_symbols.iter().cloned());
                             }
 
                             // Update file cache
@@ -2188,7 +2202,37 @@ impl CodeIntelEngine {
                             // Smart cache invalidation - only invalidate entries that depend on this file
                             self.query_cache.invalidate_for_file(&rel_path);
 
-                            info!("Re-indexed file: {}", rel_path);
+                            // Persisted per-file record: hash the content already
+                            // read (no second disk read), stat for mtime/size.
+                            let content_hash = {
+                                use sha2::{Digest, Sha256};
+                                let mut hasher = Sha256::new();
+                                hasher.update(content.as_bytes());
+                                format!("{:x}", hasher.finalize())
+                            };
+                            let (modified_time, size) = std::fs::metadata(&change.path)
+                                .ok()
+                                .map(|meta| {
+                                    let mtime = meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    (mtime, meta.len())
+                                })
+                                .unwrap_or((0, 0));
+                            pending.entry(repo_name.clone()).or_default().upserts.push(
+                                FileMetadata {
+                                    path: change.path.clone(),
+                                    content_hash,
+                                    modified_time,
+                                    size,
+                                    symbols: file_symbols,
+                                },
+                            );
+
+                            debug!("Re-indexed file: {}", rel_path);
                             count += 1;
                         }
                     }
@@ -2213,14 +2257,30 @@ impl CodeIntelEngine {
                     self.query_cache.invalidate_for_file(&rel_path);
 
                     info!("Removed file from index: {}", rel_path);
+                    pending
+                        .entry(repo_name.clone())
+                        .or_default()
+                        .deletes
+                        .push(change.path.clone());
                     count += 1;
                 }
             }
         }
 
-        // Save index if persistence is enabled
-        if self.options.persist_enabled && count > 0 {
-            let _ = self.save_index().await;
+        // Persist only the repos that changed, each in a single redb write
+        // transaction. Untouched repos (e.g. the kernel tree) are never opened.
+        if self.options.persist_enabled {
+            if let Some(store) = &self.index_store {
+                for (repo_name, repo_pending) in &pending {
+                    if let Err(e) = store.apply_file_changes(
+                        &PathBuf::from(repo_name),
+                        &repo_pending.upserts,
+                        &repo_pending.deletes,
+                    ) {
+                        warn!("Failed to persist index changes for {}: {}", repo_name, e);
+                    }
+                }
+            }
         }
 
         Ok(count)
@@ -6717,7 +6777,7 @@ impl CodeIntelEngine {
 
         // Check for persisted index
         if let Some(ref store) = self.index_store {
-            let index_file = store.index_path(&repo_path);
+            let index_file = store.store_path(&repo_path);
             if index_file.exists() {
                 if let Ok(metadata) = std::fs::metadata(&index_file) {
                     output.push_str(&format!(
