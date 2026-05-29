@@ -9,11 +9,13 @@ use notify::{Config, Event, EventKind, RecursiveMode, Watcher};
 // On Linux use the kernel's inotify backend (event-driven, ~0% idle CPU).
 // On other platforms fall back to PollWatcher at compile time; pruning
 // build/.git noise from the watched tree is left as a follow-up.
+use dashmap::DashMap;
 #[cfg(all(feature = "native", target_os = "linux"))]
 use notify::INotifyWatcher as PlatformWatcher;
 #[cfg(all(feature = "native", not(target_os = "linux")))]
 use notify::PollWatcher as PlatformWatcher;
 use parking_lot::RwLock;
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -169,33 +171,92 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Index storage manager
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// redb table: file key (absolute path string) -> postcard(FileMetadata).
+const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
+/// redb table: the single key "repo" -> postcard(RepoMeta).
+const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// Repo-level header stored alongside the per-file records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoMeta {
+    version: u32,
+    repo_root: PathBuf,
+    created_at: u64,
+    updated_at: u64,
+}
+
+/// Index storage manager.
+///
+/// Each repo's index is a redb key-value store (`<hash16>.redb`), one record
+/// per file, so an edit updates a single record instead of rewriting the whole
+/// repo. The legacy single-blob `.idx` format is migrated on first load.
 pub struct IndexStore {
     index_dir: PathBuf,
+    /// Open redb handles per repo DB file. These are file handles, not the
+    /// index data — record bytes stay on disk and are read on demand.
+    dbs: DashMap<PathBuf, Arc<Database>>,
 }
 
 impl IndexStore {
     pub fn new(index_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&index_dir)?;
-        Ok(Self { index_dir })
+        Ok(Self {
+            index_dir,
+            dbs: DashMap::new(),
+        })
     }
 
-    /// Get the index file path for a repository.
-    ///
-    /// The on-disk filename is derived from the canonical absolute path of the
-    /// repository, so the same repo reached via a symlink or relative form
-    /// resolves to the same .idx file. Falls back to the input path string when
-    /// canonicalize fails (e.g. the path no longer exists on disk).
-    pub fn index_path(&self, repo_root: &Path) -> PathBuf {
+    /// Hash of the canonical absolute repo path, so the same repo reached via a
+    /// symlink or relative form maps to the same on-disk filename. Falls back to
+    /// the input path when canonicalize fails (e.g. the path no longer exists).
+    fn repo_hash(&self, repo_root: &Path) -> String {
         let canonical = repo_root
             .canonicalize()
             .unwrap_or_else(|_| repo_root.to_path_buf());
-        let hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(canonical.to_string_lossy().as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-        self.index_dir.join(format!("{}.idx", &hash[..16]))
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Legacy single-blob index path (`.idx`). Retained for migration.
+    pub fn index_path(&self, repo_root: &Path) -> PathBuf {
+        self.index_dir
+            .join(format!("{}.idx", &self.repo_hash(repo_root)[..16]))
+    }
+
+    /// redb store path for a repository (`.redb`).
+    fn db_path(&self, repo_root: &Path) -> PathBuf {
+        self.index_dir
+            .join(format!("{}.redb", &self.repo_hash(repo_root)[..16]))
+    }
+
+    /// On-disk path of a repo's persisted store, for status/size reporting.
+    pub fn store_path(&self, repo_root: &Path) -> PathBuf {
+        self.db_path(repo_root)
+    }
+
+    /// Open-or-return the cached redb handle for a repo.
+    fn db(&self, repo_root: &Path) -> Result<Arc<Database>> {
+        use dashmap::mapref::entry::Entry;
+        let path = self.db_path(repo_root);
+        match self.dbs.entry(path.clone()) {
+            Entry::Occupied(e) => Ok(Arc::clone(e.get())),
+            Entry::Vacant(e) => {
+                let db = Arc::new(
+                    Database::create(&path)
+                        .with_context(|| format!("Failed to open redb store {:?}", path))?,
+                );
+                e.insert(Arc::clone(&db));
+                Ok(db)
+            }
+        }
     }
 
     /// Load or create index for a repository.
@@ -277,11 +338,161 @@ impl IndexStore {
         Ok(index)
     }
 
-    /// Save index for a repository
+    /// Save index for a repository (legacy single-blob `.idx`; used by tests and
+    /// the unused `IncrementalIndexer`). New code uses [`save_full`].
     pub fn save(&self, index: &PersistedIndex) -> Result<()> {
         let index_path = self.index_path(&index.repo_root);
         index.save(&index_path)?;
-        info!("Saved index to {:?}", index_path);
+        debug!("Saved index to {:?}", index_path);
+        Ok(())
+    }
+
+    /// Locate and load an old single-blob `.idx` for this repo (canonical-keyed
+    /// first, then a pre-canonicalization legacy file) for one-time migration.
+    fn find_legacy_blob(&self, canonical_root: &Path) -> Option<(PathBuf, PersistedIndex)> {
+        let canonical_path = self.index_path(canonical_root);
+        let blob_path = if canonical_path.exists() {
+            canonical_path
+        } else {
+            self.find_legacy_index_for(canonical_root)?
+        };
+        match PersistedIndex::load(&blob_path) {
+            Ok(index) => Some((blob_path, index)),
+            Err(e) => {
+                warn!(
+                    "Failed to load legacy index {:?} for migration: {}",
+                    blob_path, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Load a repo's index from its redb store, reconstructing a `PersistedIndex`.
+    ///
+    /// On first use, migrates an old single-blob `.idx` into redb and removes it.
+    /// A repo with neither store returns an empty index (no file is created
+    /// until the first save).
+    pub fn load_repo(&self, repo_root: &Path) -> Result<PersistedIndex> {
+        let canonical_root = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let db_path = self.db_path(&canonical_root);
+
+        if !db_path.exists() {
+            if let Some((blob_path, mut index)) = self.find_legacy_blob(&canonical_root) {
+                index.repo_root = canonical_root.clone();
+                self.save_full(&index)?;
+                let _ = std::fs::remove_file(&blob_path);
+                info!("Migrated legacy index {:?} -> {:?}", blob_path, db_path);
+                return Ok(index);
+            }
+            return Ok(PersistedIndex::new(canonical_root));
+        }
+
+        let db = self.db(&canonical_root)?;
+        let read_txn = db.begin_read()?;
+
+        let mut index = PersistedIndex::new(canonical_root);
+        if let Ok(meta_table) = read_txn.open_table(META_TABLE) {
+            if let Some(guard) = meta_table.get("repo")? {
+                if let Ok(meta) = postcard::from_bytes::<RepoMeta>(guard.value()) {
+                    index.version = meta.version;
+                    index.created_at = meta.created_at;
+                    index.updated_at = meta.updated_at;
+                    index.repo_root = meta.repo_root;
+                }
+            }
+        }
+        if let Ok(files_table) = read_txn.open_table(FILES_TABLE) {
+            for entry in files_table.iter()? {
+                let (_key, value) = entry?;
+                if let Ok(file_meta) = postcard::from_bytes::<FileMetadata>(value.value()) {
+                    index.files.insert(file_meta.path.clone(), file_meta);
+                }
+            }
+        }
+        info!(
+            "Loaded {} file record(s) from {:?}",
+            index.files.len(),
+            db_path
+        );
+        Ok(index)
+    }
+
+    /// Rewrite a repo's entire redb store from an in-memory index. Clears stale
+    /// records so files deleted since the last full save do not linger. Used for
+    /// the initial save after a fresh index, the explicit save_index tool, and
+    /// legacy-blob migration.
+    pub fn save_full(&self, index: &PersistedIndex) -> Result<()> {
+        let db = self.db(&index.repo_root)?;
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.delete_table(FILES_TABLE);
+            let mut files_table = write_txn.open_table(FILES_TABLE)?;
+            for file_meta in index.files.values() {
+                let key = file_meta.path.to_string_lossy();
+                let bytes = postcard::to_stdvec(file_meta).context("serialize FileMetadata")?;
+                files_table.insert(key.as_ref(), bytes.as_slice())?;
+            }
+            let mut meta_table = write_txn.open_table(META_TABLE)?;
+            let meta = RepoMeta {
+                version: PersistedIndex::CURRENT_VERSION,
+                repo_root: index.repo_root.clone(),
+                created_at: index.created_at,
+                updated_at: now_secs(),
+            };
+            meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
+        }
+        write_txn.commit()?;
+        debug!(
+            "Saved {} file record(s) for {:?}",
+            index.files.len(),
+            index.repo_root
+        );
+        Ok(())
+    }
+
+    /// Apply a batch of per-file changes to a repo's redb store in one write
+    /// transaction. O(changed files) — untouched records are left in place.
+    pub fn apply_file_changes(
+        &self,
+        repo_root: &Path,
+        upserts: &[FileMetadata],
+        deletes: &[PathBuf],
+    ) -> Result<()> {
+        if upserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let db = self.db(repo_root)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut files_table = write_txn.open_table(FILES_TABLE)?;
+            for file_meta in upserts {
+                let key = file_meta.path.to_string_lossy();
+                let bytes = postcard::to_stdvec(file_meta).context("serialize FileMetadata")?;
+                files_table.insert(key.as_ref(), bytes.as_slice())?;
+            }
+            for path in deletes {
+                let key = path.to_string_lossy();
+                files_table.remove(key.as_ref())?;
+            }
+
+            let mut meta_table = write_txn.open_table(META_TABLE)?;
+            let existing: Option<RepoMeta> = match meta_table.get("repo")? {
+                Some(guard) => postcard::from_bytes::<RepoMeta>(guard.value()).ok(),
+                None => None,
+            };
+            let mut meta = existing.unwrap_or_else(|| RepoMeta {
+                version: PersistedIndex::CURRENT_VERSION,
+                repo_root: repo_root.to_path_buf(),
+                created_at: now_secs(),
+                updated_at: 0,
+            });
+            meta.updated_at = now_secs();
+            meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
@@ -703,11 +914,11 @@ pub async fn run_watch_mode(
             // Receive batched file change events
             Some(changes) = rx.recv() => {
                 if !changes.is_empty() {
-                    info!("Detected {} file change(s)", changes.len());
+                    debug!("Detected {} file change(s)", changes.len());
                     match engine.process_file_changes(&changes).await {
                         Ok(count) => {
                             if count > 0 {
-                                info!("Re-indexed {} file(s)", count);
+                                debug!("Re-indexed {} file(s)", count);
                             }
                         }
                         Err(e) => {
@@ -787,5 +998,110 @@ mod tests {
 
         let loaded = store.load_or_create(repo.path()).unwrap();
         assert_eq!(loaded.version, PersistedIndex::CURRENT_VERSION);
+    }
+
+    fn meta(path: PathBuf, hash: &str) -> FileMetadata {
+        FileMetadata {
+            path,
+            content_hash: hash.to_string(),
+            modified_time: 0,
+            size: 0,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_redb_incremental_upsert_and_delete() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // A repo with no store loads as empty and creates no file.
+        assert!(store.load_repo(&root).unwrap().files.is_empty());
+
+        // Upsert two records.
+        let upserts = [meta(root.join("a.rs"), "h1"), meta(root.join("b.rs"), "h2")];
+        store.apply_file_changes(&root, &upserts, &[]).unwrap();
+        assert_eq!(store.load_repo(&root).unwrap().files.len(), 2);
+
+        // Re-upserting a.rs replaces the record rather than duplicating it.
+        store
+            .apply_file_changes(&root, &[meta(root.join("a.rs"), "h1b")], &[])
+            .unwrap();
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.files.len(), 2);
+        assert_eq!(
+            loaded.files.get(&root.join("a.rs")).unwrap().content_hash,
+            "h1b"
+        );
+
+        // Deleting b.rs leaves a.rs untouched.
+        store
+            .apply_file_changes(&root, &[], &[root.join("b.rs")])
+            .unwrap();
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.files.contains_key(&root.join("a.rs")));
+    }
+
+    #[test]
+    fn test_redb_save_full_replaces_stale_records() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // Populate an existing files table incrementally.
+        store
+            .apply_file_changes(
+                &root,
+                &[meta(root.join("a.rs"), "h1"), meta(root.join("b.rs"), "h2")],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.load_repo(&root).unwrap().files.len(), 2);
+
+        // A full save with a different set clears stale records (exercises
+        // delete_table + reopen on an already-populated table).
+        let mut idx = PersistedIndex::new(root.clone());
+        idx.files
+            .insert(root.join("c.rs"), meta(root.join("c.rs"), "h3"));
+        store.save_full(&idx).unwrap();
+
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.files.contains_key(&root.join("c.rs")));
+    }
+
+    #[test]
+    fn test_redb_migrates_legacy_blob() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // Seed a legacy single-blob .idx.
+        let mut blob = PersistedIndex::new(root.clone());
+        blob.files
+            .insert(root.join("x.rs"), meta(root.join("x.rs"), "hx"));
+        store.save(&blob).unwrap();
+        let blob_path = store.index_path(&root);
+        assert!(blob_path.exists());
+
+        // First load migrates it into redb and removes the blob.
+        let loaded = store.load_repo(&root).unwrap();
+        assert!(loaded.files.contains_key(&root.join("x.rs")));
+        assert!(
+            !blob_path.exists(),
+            "blob should be removed after migration"
+        );
+        assert!(store.db_path(&root).exists(), "redb store should exist");
+
+        // The migrated data survives a fresh store. redb holds an exclusive file
+        // lock, so the first store must be dropped before reopening the same DB.
+        drop(store);
+        let store2 = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(store2.load_repo(&root).unwrap().files.len(), 1);
     }
 }
