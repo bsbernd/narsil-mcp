@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
+use narsil_mcp::lsp::CxxLspBackend;
 use narsil_mcp::{
     config, http_server, index, lsp, mcp, neural, persist, repo, sse_discovery, stats_cli,
     stdio_proxy, streaming,
@@ -103,6 +104,16 @@ struct ServerArgs {
     /// Enable LSP integration for enhanced code intelligence (requires language servers installed)
     #[arg(long, env = "NARSIL_LSP")]
     lsp: bool,
+
+    /// C/C++ LSP backends to start (comma-separated: clangd, ccls, or clangd,ccls).
+    /// Only takes effect when --lsp is set.
+    #[arg(long, env = "NARSIL_LSP_CXX_BACKENDS", default_value = "clangd")]
+    lsp_cxx_backends: String,
+
+    /// Enable GNU Global (gtags) as an additional C/C++ reference backend.
+    /// Requires global(1) on PATH and a GTAGS database in the repo.
+    #[arg(long, env = "NARSIL_GTAGS")]
+    gtags: bool,
 
     /// Enable streaming responses for large result sets
     #[arg(long, env = "NARSIL_STREAMING")]
@@ -293,8 +304,10 @@ async fn main() -> Result<()> {
     let graph_available = false;
 
     info!(
-        "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
-        server_args.call_graph, server_args.git, server_args.watch, server_args.persist, server_args.lsp, server_args.streaming, server_args.remote, server_args.neural, !server_args.no_cache, graph_available
+        "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, gtags={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
+        server_args.call_graph, server_args.git, server_args.watch, server_args.persist,
+        server_args.lsp, server_args.gtags, server_args.streaming, server_args.remote,
+        server_args.neural, !server_args.no_cache, graph_available
     );
 
     // Build LSP config
@@ -314,9 +327,35 @@ async fn main() -> Result<()> {
         ] {
             lsp_config.enabled_languages.insert(lang.to_string(), true);
         }
+
+        // Parse --lsp-cxx-backends (comma-separated: clangd, ccls)
+        let cxx_backends: Vec<CxxLspBackend> = server_args
+            .lsp_cxx_backends
+            .split(',')
+            .filter_map(|s| match s.trim() {
+                "clangd" => Some(CxxLspBackend::Clangd),
+                "ccls" => Some(CxxLspBackend::Ccls),
+                other => {
+                    warn!(
+                        "Unknown --lsp-cxx-backends value '{}'; ignoring (valid: clangd, ccls)",
+                        other
+                    );
+                    None
+                }
+            })
+            .collect();
+        if !cxx_backends.is_empty() {
+            lsp_config.cxx_lsp_backends = cxx_backends;
+        }
+
         info!(
-            "LSP integration enabled for: {:?}",
-            lsp_config.enabled_languages.keys().collect::<Vec<_>>()
+            "LSP integration enabled for: {:?}; C/C++ backends: {:?}",
+            lsp_config.enabled_languages.keys().collect::<Vec<_>>(),
+            lsp_config
+                .cxx_lsp_backends
+                .iter()
+                .map(|b| b.label())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -366,7 +405,7 @@ async fn main() -> Result<()> {
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
-        gtags_enabled: false, // wired to --gtags in the next patch
+        gtags_enabled: server_args.gtags,
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
@@ -778,6 +817,8 @@ mod tests {
             "NARSIL_DISCOVER",
             "NARSIL_PERSIST",
             "NARSIL_LSP",
+            "NARSIL_LSP_CXX_BACKENDS",
+            "NARSIL_GTAGS",
             "NARSIL_STREAMING",
             "NARSIL_REMOTE",
             "NARSIL_NEURAL",

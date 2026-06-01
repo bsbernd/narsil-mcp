@@ -1900,10 +1900,7 @@ impl CodeIntelEngine {
             return None;
         }
 
-        let lsp_enabled = self
-            .lsp_manager
-            .as_ref()
-            .is_some_and(|l| l.is_enabled());
+        let lsp_enabled = self.lsp_manager.as_ref().is_some_and(|l| l.is_enabled());
         let gtags_enabled = self.gtags_manager.is_some();
 
         if !lsp_enabled && !gtags_enabled {
@@ -1918,16 +1915,15 @@ impl CodeIntelEngine {
                 let symbol_entry = self.symbols.get(repo);
                 if let Some(entry) = symbol_entry {
                     for sym in entry.iter() {
-                        if sym.name != symbol
-                            && sym.qualified_name.as_deref() != Some(symbol)
-                        {
+                        if sym.name != symbol && sym.qualified_name.as_deref() != Some(symbol) {
                             continue;
                         }
                         let language = get_language_from_path(&sym.file_path);
                         if !matches!(language.as_str(), "c" | "cpp") {
                             continue;
                         }
-                        let file_path = match crate::index::validate_path(repo_path, &sym.file_path) {
+                        let file_path = match crate::index::validate_path(repo_path, &sym.file_path)
+                        {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -1941,9 +1937,7 @@ impl CodeIntelEngine {
                                     sym.end_line,
                                 )
                             })
-                            .unwrap_or_else(|| {
-                                (sym.start_line.saturating_sub(1) as u32, 0)
-                            });
+                            .unwrap_or_else(|| (sym.start_line.saturating_sub(1) as u32, 0));
 
                         let lsp_map = lsp
                             .find_cxx_references_parallel(
@@ -7128,10 +7122,7 @@ impl CodeIntelEngine {
                 std::collections::HashSet<(String, usize)>,
             > = HashMap::new();
             for (&label, refs) in backends {
-                let keys = refs
-                    .iter()
-                    .map(|(f, l, _)| (f.clone(), *l))
-                    .collect();
+                let keys = refs.iter().map(|(f, l, _)| (f.clone(), *l)).collect();
                 backend_keys.insert(label, keys);
             }
 

@@ -414,8 +414,7 @@ impl LspManager {
         character: u32,
         include_declaration: bool,
     ) -> Result<Option<Vec<Location>>> {
-        let uri =
-            Url::from_file_path(&file_path).map_err(|_| anyhow!("Invalid file path"))?;
+        let uri = Url::from_file_path(&file_path).map_err(|_| anyhow!("Invalid file path"))?;
         let text = std::fs::read_to_string(&file_path)?;
 
         Self::do_send_notification(
