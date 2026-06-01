@@ -215,10 +215,45 @@ pub struct PersistedMetrics {
     pub total_uptime_seconds: u64,
     tools: HashMap<String, PersistedCounter>,
     file_parse: PersistedCounter,
+    /// Per-backend C/C++ reference query call counts (added in v2).
+    backends: HashMap<String, u64>,
+}
+
+/// v1 on-disk layout (pre-`backends`). Kept only so `load` can migrate files
+/// written before per-backend counts existed, preserving their tool/uptime
+/// history. Field order must match the original v1 struct exactly — postcard
+/// is positional and not self-describing.
+///
+/// `Serialize` is derived only so tests can write authentic v1 byte streams;
+/// production code never serialises this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMetricsV1 {
+    version: u32,
+    index_path: String,
+    first_started_at: u64,
+    saved_at: u64,
+    total_uptime_seconds: u64,
+    tools: HashMap<String, PersistedCounter>,
+    file_parse: PersistedCounter,
+}
+
+impl PersistedMetricsV1 {
+    fn upgrade(self) -> PersistedMetrics {
+        PersistedMetrics {
+            version: PersistedMetrics::CURRENT_VERSION,
+            index_path: self.index_path,
+            first_started_at: self.first_started_at,
+            saved_at: self.saved_at,
+            total_uptime_seconds: self.total_uptime_seconds,
+            tools: self.tools,
+            file_parse: self.file_parse,
+            backends: HashMap::new(),
+        }
+    }
 }
 
 impl PersistedMetrics {
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     fn empty(index_path: String) -> Self {
         let now = now_unix_seconds();
@@ -230,23 +265,31 @@ impl PersistedMetrics {
             total_uptime_seconds: 0,
             tools: HashMap::new(),
             file_parse: empty_persisted_counter(),
+            backends: HashMap::new(),
         }
     }
 
     /// Read and decode a stats file. Returns an error for any failure
     /// (missing file, bad version, deserialisation failure).
+    ///
+    /// v1 files lack the trailing `backends` map, so the v2 decode hits EOF;
+    /// we fall back to decoding the v1 layout and upgrading it in place.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path).context("Failed to read metrics file")?;
-        let snapshot: Self =
-            postcard::from_bytes(&data).context("Failed to deserialise metrics file")?;
-        if snapshot.version != Self::CURRENT_VERSION {
-            return Err(anyhow::anyhow!(
-                "Metrics file version mismatch: {} != {}",
-                snapshot.version,
-                Self::CURRENT_VERSION
-            ));
+        match postcard::from_bytes::<Self>(&data) {
+            Ok(snapshot) if snapshot.version == Self::CURRENT_VERSION => Ok(snapshot),
+            _ => {
+                let v1: PersistedMetricsV1 = postcard::from_bytes(&data)
+                    .context("Failed to deserialise metrics file (tried v2 and v1)")?;
+                if v1.version != 1 {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported metrics file version: {}",
+                        v1.version
+                    ));
+                }
+                Ok(v1.upgrade())
+            }
         }
-        Ok(snapshot)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -333,6 +376,9 @@ fn acquire_exclusive_lock(stats_path: &Path) -> Result<File> {
 struct CounterSet {
     tools: HashMap<String, MetricStats>,
     file_parse: MetricStats,
+    /// Per-backend C/C++ reference query call counts, keyed by backend label
+    /// ("clangd", "ccls", "gtags").
+    backends: HashMap<String, u64>,
 }
 
 impl CounterSet {
@@ -343,6 +389,10 @@ impl CounterSet {
             .record(duration_units);
     }
 
+    fn record_backend_call(&mut self, label: &str) {
+        *self.backends.entry(label.to_string()).or_insert(0) += 1;
+    }
+
     fn merge_from(&mut self, other: &CounterSet) {
         for (name, stats) in &other.tools {
             self.tools
@@ -351,6 +401,9 @@ impl CounterSet {
                 .merge_from(stats);
         }
         self.file_parse.merge_from(&other.file_parse);
+        for (label, count) in &other.backends {
+            *self.backends.entry(label.clone()).or_insert(0) += count;
+        }
     }
 
     fn from_persisted(p: &PersistedMetrics) -> Result<Self> {
@@ -361,6 +414,7 @@ impl CounterSet {
         Ok(Self {
             tools,
             file_parse: MetricStats::from_persisted(&p.file_parse)?,
+            backends: p.backends.clone(),
         })
     }
 
@@ -371,6 +425,7 @@ impl CounterSet {
         }
         target.tools = tools;
         target.file_parse = self.file_parse.to_persisted()?;
+        target.backends = self.backends.clone();
         Ok(())
     }
 }
@@ -444,6 +499,9 @@ pub struct Metrics {
     /// Full list of registered tool names, used to show zero rows in reports.
     /// In-memory only; not persisted.
     known_tools: RwLock<Vec<String>>,
+    /// Session-only per-backend C/C++ reference query counts (reset on start).
+    /// The lifetime view lives in the shared `lifetime` state.
+    backend_calls: RwLock<HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -460,6 +518,7 @@ impl Metrics {
             dirty: AtomicBool::new(false),
             flush_notify: Arc::new(Notify::new()),
             known_tools: RwLock::new(Vec::new()),
+            backend_calls: RwLock::new(HashMap::new()),
         }
     }
 
@@ -503,6 +562,7 @@ impl Metrics {
             dirty: AtomicBool::new(false),
             flush_notify: Arc::new(Notify::new()),
             known_tools: RwLock::new(Vec::new()),
+            backend_calls: RwLock::new(HashMap::new()),
         }
     }
 
@@ -522,6 +582,19 @@ impl Metrics {
             .write()
             .deltas
             .record_tool(tool_name, duration_ms);
+        self.mark_dirty();
+    }
+
+    /// Record one query to a C/C++ reference backend ("clangd", "ccls" or
+    /// "gtags"). Call counts only — surfaced by `narsil-mcp stats` so a user
+    /// can see which backends are actually being exercised.
+    pub fn record_backend_call(&self, label: &str) {
+        *self
+            .backend_calls
+            .write()
+            .entry(label.to_string())
+            .or_insert(0) += 1;
+        self.lifetime.write().deltas.record_backend_call(label);
         self.mark_dirty();
     }
 
@@ -587,6 +660,16 @@ impl Metrics {
 
     pub fn get_lifetime_file_parse_stats(&self) -> MetricStats {
         self.lifetime.read().snapshot().file_parse
+    }
+
+    /// Session per-backend call counts (since process start).
+    pub fn get_session_backend_calls(&self) -> HashMap<String, u64> {
+        self.backend_calls.read().clone()
+    }
+
+    /// Lifetime per-backend call counts (baseline + pending deltas).
+    pub fn get_lifetime_backend_calls(&self) -> HashMap<String, u64> {
+        self.lifetime.read().snapshot().backends
     }
 
     /// Cumulative uptime across all runs that share this stats file.
@@ -776,6 +859,12 @@ impl Metrics {
             push_parse_table(&mut output, &parse_rows);
         }
 
+        push_backend_table(
+            &mut output,
+            &lifetime_snapshot.backends,
+            Some(&self.get_session_backend_calls()),
+        );
+
         let known = self.known_tools.read();
         let lifetime_tools = fill_known_tools(&lifetime_snapshot.tools, &known);
         let session_tools = fill_known_tools(&self.get_all_tool_stats(), &known);
@@ -826,6 +915,7 @@ impl Metrics {
                 "total_requests": self.total_requests(),
                 "file_parsing": parse_stats_to_json(&self.get_file_parse_stats()),
                 "tools": session_tools_json,
+                "cxx_backends": backend_calls_to_json(&self.get_session_backend_calls()),
             },
             "lifetime": {
                 "index_path": self.lifetime.read().index_path,
@@ -835,6 +925,7 @@ impl Metrics {
                 "total_requests": self.lifetime_total_requests(),
                 "file_parsing": parse_stats_to_json(&lifetime_snapshot.file_parse),
                 "tools": lifetime_tools_json,
+                "cxx_backends": backend_calls_to_json(&lifetime_snapshot.backends),
                 "persistent": self.is_persistent(),
             },
             "repository_indexing": repo_json,
@@ -867,6 +958,10 @@ impl Drop for Metrics {
 
 // ---------- Helpers / rendering ---------------------------------------------
 
+/// C/C++ reference backends always shown in stats output, so a backend that is
+/// enabled but never resolves appears as a `0` row rather than vanishing.
+const CXX_BACKENDS: [&str; 3] = ["clangd", "ccls", "gtags"];
+
 /// Return a copy of `recorded` extended with zero-count entries for every name
 /// in `known` that is not already present. This ensures the report table lists
 /// every registered tool even if it has never been called.
@@ -879,6 +974,67 @@ fn fill_known_tools(
         out.entry(name.clone()).or_default();
     }
     out
+}
+
+/// Build the rows for a backend-calls table: the three known backends first
+/// (zero-filled), then any other labels that were recorded, sorted.
+fn backend_rows(recorded: &HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut rows: Vec<(String, u64)> = CXX_BACKENDS
+        .iter()
+        .map(|label| {
+            (
+                label.to_string(),
+                recorded.get(*label).copied().unwrap_or(0),
+            )
+        })
+        .collect();
+    let mut extra: Vec<(String, u64)> = recorded
+        .iter()
+        .filter(|(label, _)| !CXX_BACKENDS.contains(&label.as_str()))
+        .map(|(label, count)| (label.clone(), *count))
+        .collect();
+    extra.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.extend(extra);
+    rows
+}
+
+/// Render a `## C/C++ Reference Backends` markdown section listing call counts.
+/// `lifetime`/`session` are the two scopes; pass `session = None` for the
+/// aggregate (`stats`) view which has no session.
+fn push_backend_table(
+    output: &mut String,
+    lifetime: &HashMap<String, u64>,
+    session: Option<&HashMap<String, u64>>,
+) {
+    output.push_str("## C/C++ Reference Backends\n\n");
+    let life_rows = backend_rows(lifetime);
+    match session {
+        Some(sess) => {
+            output.push_str("| Backend | Lifetime Calls | Session Calls |\n");
+            output.push_str("|---------|----------------|---------------|\n");
+            for (label, life) in &life_rows {
+                let sess_count = sess.get(label).copied().unwrap_or(0);
+                output.push_str(&format!("| {} | {} | {} |\n", label, life, sess_count));
+            }
+        }
+        None => {
+            output.push_str("| Backend | Calls |\n");
+            output.push_str("|---------|-------|\n");
+            for (label, life) in &life_rows {
+                output.push_str(&format!("| {} | {} |\n", label, life));
+            }
+        }
+    }
+    output.push('\n');
+}
+
+fn backend_calls_to_json(calls: &HashMap<String, u64>) -> serde_json::Value {
+    serde_json::Value::Object(
+        backend_rows(calls)
+            .into_iter()
+            .map(|(label, count)| (label, serde_json::Value::from(count)))
+            .collect(),
+    )
 }
 
 fn push_md_row<'a>(output: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
@@ -1096,6 +1252,8 @@ pub fn render_aggregate_markdown(snapshots: &[PersistedMetrics]) -> Result<Strin
         ));
     }
 
+    push_backend_table(&mut output, &merged.backends, None);
+
     output.push_str("## Tool Execution Times\n\n");
     if merged.tools.is_empty() {
         output.push_str("*No tool calls recorded.*\n");
@@ -1156,6 +1314,7 @@ pub fn render_aggregate_json(snapshots: &[PersistedMetrics]) -> Result<serde_jso
         "last_update_at": latest,
         "file_parsing": parse_stats_to_json(&merged.file_parse),
         "tools": tool_stats_to_json(&merged.tools),
+        "cxx_backends": backend_calls_to_json(&merged.backends),
     }))
 }
 
@@ -1443,5 +1602,98 @@ mod tests {
         let metrics = Metrics::new();
         thread::sleep(Duration::from_millis(100));
         assert!(metrics.uptime_seconds() < 10);
+    }
+
+    #[test]
+    fn test_record_backend_call_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("backends.bin");
+        {
+            let m = make_persisted_metrics(path.clone());
+            m.record_backend_call("clangd");
+            m.record_backend_call("clangd");
+            m.record_backend_call("ccls");
+            m.record_backend_call("gtags");
+            // Session view reflects calls immediately.
+            assert_eq!(m.get_session_backend_calls().get("clangd"), Some(&2));
+            m.flush().unwrap();
+        }
+        let snap = PersistedMetrics::load(&path).unwrap();
+        assert_eq!(snap.backends.get("clangd"), Some(&2));
+        assert_eq!(snap.backends.get("ccls"), Some(&1));
+        assert_eq!(snap.backends.get("gtags"), Some(&1));
+    }
+
+    #[test]
+    fn test_backend_calls_accumulate_across_writers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.bin");
+        let m1 = make_persisted_metrics(path.clone());
+        let m2 = make_persisted_metrics(path.clone());
+
+        m1.record_backend_call("ccls");
+        m1.flush().unwrap();
+        m2.record_backend_call("ccls");
+        m2.record_backend_call("gtags");
+        m2.flush().unwrap();
+
+        let snap = PersistedMetrics::load(&path).unwrap();
+        assert_eq!(snap.backends.get("ccls"), Some(&2), "ccls = 1 + 1");
+        assert_eq!(snap.backends.get("gtags"), Some(&1));
+    }
+
+    #[test]
+    fn test_v1_file_migrates_preserving_tools() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v1.bin");
+
+        // Write an authentic v1 byte stream (no trailing `backends` map).
+        let mut tool = MetricStats::new();
+        tool.record(10);
+        tool.record(20);
+        let mut tools = HashMap::new();
+        tools.insert("alpha".to_string(), tool.to_persisted().unwrap());
+        let v1 = PersistedMetricsV1 {
+            version: 1,
+            index_path: "/path/v1".to_string(),
+            first_started_at: 111,
+            saved_at: 222,
+            total_uptime_seconds: 99,
+            tools,
+            file_parse: empty_persisted_counter(),
+        };
+        std::fs::write(&path, postcard::to_stdvec(&v1).unwrap()).unwrap();
+
+        let snap = PersistedMetrics::load(&path).unwrap();
+        assert_eq!(snap.version, PersistedMetrics::CURRENT_VERSION);
+        assert_eq!(
+            snap.tools.get("alpha").unwrap().count,
+            2,
+            "tool history kept"
+        );
+        assert_eq!(snap.total_uptime_seconds, 99);
+        assert_eq!(snap.first_started_at, 111);
+        assert!(
+            snap.backends.is_empty(),
+            "migrated v1 file starts with no backend counts"
+        );
+    }
+
+    #[test]
+    fn test_render_aggregate_markdown_shows_backends() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.bin");
+        let m = make_persisted_metrics(a.clone());
+        m.record_backend_call("ccls");
+        m.record_backend_call("gtags");
+        m.flush().unwrap();
+
+        let snaps = vec![PersistedMetrics::load(&a).unwrap()];
+        let out = render_aggregate_markdown(&snaps).unwrap();
+        assert!(out.contains("C/C++ Reference Backends"));
+        // All three known backends are listed, including the never-called one.
+        assert!(out.contains("| clangd | 0 |"));
+        assert!(out.contains("| ccls | 1 |"));
+        assert!(out.contains("| gtags | 1 |"));
     }
 }
