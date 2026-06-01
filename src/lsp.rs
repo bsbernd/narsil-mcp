@@ -343,6 +343,194 @@ impl LspManager {
         Ok(())
     }
 
+    /// Send a notification without borrowing `self` — accepts an `Arc<LspProcess>`
+    /// so callers can move it into a `JoinSet` task.
+    async fn do_send_notification(
+        process: Arc<LspProcess>,
+        method: &'static str,
+        params: Value,
+    ) -> Result<()> {
+        let message = LspMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some(method.to_string()),
+            params: if params.is_null() { None } else { Some(params) },
+            result: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&message)?;
+        let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+        let mut stdin = process.stdin.lock().await;
+        stdin.write_all(content.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send a request without borrowing `self`.
+    async fn do_send_request(
+        process: Arc<LspProcess>,
+        timeout_ms: u64,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value> {
+        let id = process.next_id.fetch_add(1, Ordering::SeqCst);
+        let message = LspMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: Some(method.to_string()),
+            params: Some(params),
+            result: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&message)?;
+        let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        process.pending_requests.insert(id, tx);
+
+        {
+            let mut stdin = process.stdin.lock().await;
+            stdin.write_all(content.as_bytes()).await?;
+            stdin.flush().await?;
+        }
+
+        let response = timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .context("LSP request timeout")?
+            .context("Response channel closed")?
+            .map_err(|e| anyhow!("LSP error {}: {}", e.code, e.message))?;
+
+        Ok(response)
+    }
+
+    /// Query a single LSP process for references. Takes owned values so it
+    /// can be dispatched inside a `tokio::task::JoinSet` task.
+    async fn query_references_on_process(
+        process: Arc<LspProcess>,
+        timeout_ms: u64,
+        language: String,
+        file_path: PathBuf,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<Option<Vec<Location>>> {
+        let uri =
+            Url::from_file_path(&file_path).map_err(|_| anyhow!("Invalid file path"))?;
+        let text = std::fs::read_to_string(&file_path)?;
+
+        Self::do_send_notification(
+            Arc::clone(&process),
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": &uri,
+                    "languageId": language,
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )
+        .await
+        .ok();
+
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position { line, character },
+            },
+            context: ReferenceContext {
+                include_declaration,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let params_value = serde_json::to_value(&params)?;
+
+        let response = Self::do_send_request(
+            Arc::clone(&process),
+            timeout_ms,
+            "textDocument/references",
+            params_value,
+        )
+        .await;
+
+        Self::do_send_notification(
+            Arc::clone(&process),
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": {
+                "uri": Url::from_file_path(&file_path).unwrap()
+            }}),
+        )
+        .await
+        .ok();
+
+        let response = response?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        let locations: Vec<Location> = serde_json::from_value(response)?;
+        Ok(Some(locations))
+    }
+
+    /// Query all configured C/C++ backends in parallel and return per-backend results.
+    ///
+    /// Returns a map from backend label (`"clangd"`, `"ccls"`) to the locations
+    /// that backend found. Backends that fail or return nothing are omitted.
+    pub async fn find_cxx_references_parallel(
+        &self,
+        language: &str,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> HashMap<&'static str, Vec<Location>> {
+        let timeout_ms = self.config.timeout_ms;
+        let file_path_buf = file_path.to_path_buf();
+        let language_owned = language.to_string();
+
+        // Start all backends first (fast once servers are already warm)
+        let mut servers: Vec<(&'static str, Arc<LspProcess>)> = Vec::new();
+        for &backend in &self.config.cxx_lsp_backends {
+            let key = Self::server_key(language, backend);
+            match self.get_or_start_server_for_key(&key).await {
+                Ok(s) => servers.push((backend.label(), s)),
+                Err(e) => debug!(
+                    "Could not start {} for {}: {}",
+                    backend.label(),
+                    language,
+                    e
+                ),
+            }
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (label, server) in servers {
+            let fp = file_path_buf.clone();
+            let lang = language_owned.clone();
+            set.spawn(async move {
+                let result = Self::query_references_on_process(
+                    server,
+                    timeout_ms,
+                    lang,
+                    fp,
+                    line,
+                    character,
+                    include_declaration,
+                )
+                .await;
+                (label, result)
+            });
+        }
+
+        let mut results = HashMap::new();
+        while let Some(task_result) = set.join_next().await {
+            if let Ok((label, Ok(Some(locations)))) = task_result {
+                results.insert(label, locations);
+            }
+        }
+        results
+    }
+
     /// Open `file_path` so the server can resolve positions within it.
     ///
     /// Uses on-disk content because narsil indexes saved state — editor
