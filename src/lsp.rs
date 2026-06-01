@@ -35,6 +35,19 @@ impl CxxLspBackend {
             CxxLspBackend::Ccls => "ccls",
         }
     }
+
+    /// Backends whose binary is installed on `$PATH`, in preference order
+    /// (clangd before ccls). Empty when neither is found.
+    pub fn detect_available() -> Vec<CxxLspBackend> {
+        [
+            (CxxLspBackend::Clangd, "clangd"),
+            (CxxLspBackend::Ccls, "ccls"),
+        ]
+        .into_iter()
+        .filter(|(_, binary)| crate::validation::binary_on_path(binary))
+        .map(|(backend, _)| backend)
+        .collect()
+    }
 }
 
 /// Configuration for LSP integration

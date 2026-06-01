@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::path::Path;
 
 /// Policy for handling private/localhost IPs in URL validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +381,35 @@ pub fn validate_lsp_server_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `name` resolves to an executable file.
+///
+/// A name containing a path separator is checked as-is; a bare name is
+/// searched on `$PATH`. Used to auto-enable optional C/C++ backends
+/// (clangd, ccls, gtags) only when their binary is actually installed.
+pub(crate) fn binary_on_path(name: &str) -> bool {
+    if name.contains('/') || name.contains('\\') {
+        return is_executable_file(Path::new(name));
+    }
+    match std::env::var_os("PATH") {
+        Some(path) => std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(name))),
+        None => false,
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // Any of the execute bits (owner/group/other) qualifies as runnable.
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +674,30 @@ mod tests {
         assert!(validate_lsp_server_path("rust-analyzer").is_ok());
         assert!(validate_lsp_server_path("/usr/bin/rust-analyzer").is_ok());
         assert!(validate_lsp_server_path("clangd").is_ok());
+    }
+
+    // ========================================================================
+    // binary_on_path tests
+    // ========================================================================
+
+    #[test]
+    fn test_binary_on_path_accepts_executable_absolute_path() {
+        // The running test binary is itself an executable file. Passing its
+        // absolute path exercises the path-separator branch.
+        let exe = std::env::current_exe().unwrap();
+        assert!(binary_on_path(exe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_binary_on_path_rejects_missing_binary() {
+        // A bare name not on PATH exercises the PATH-search branch.
+        assert!(!binary_on_path("narsil-definitely-not-a-real-binary-xyzzy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_binary_on_path_rejects_non_executable_file() {
+        // A regular file without an execute bit must not count as a binary.
+        assert!(!binary_on_path("/etc/hosts"));
     }
 }

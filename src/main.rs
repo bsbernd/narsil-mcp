@@ -105,15 +105,21 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_LSP")]
     lsp: bool,
 
-    /// C/C++ LSP backends to start (comma-separated: clangd, ccls, or clangd,ccls).
-    /// Only takes effect when --lsp is set.
-    #[arg(long, env = "NARSIL_LSP_CXX_BACKENDS", default_value = "clangd")]
+    /// C/C++ LSP backends to start: "auto" probes PATH for clangd and ccls and
+    /// starts whichever are installed; a comma-separated subset (e.g. "clangd",
+    /// "ccls", "clangd,ccls") pins specific backends. Only takes effect with --lsp.
+    #[arg(long, env = "NARSIL_LSP_CXX_BACKENDS", default_value = "auto")]
     lsp_cxx_backends: String,
 
-    /// Enable GNU Global (gtags) as an additional C/C++ reference backend.
-    /// Requires global(1) on PATH and a GTAGS database in the repo.
+    /// Force-enable GNU Global (gtags) as a C/C++ reference backend, even when
+    /// global(1) is not detected. By default gtags is auto-enabled whenever
+    /// global(1) is found on PATH. Returning results still needs a GTAGS database.
     #[arg(long, env = "NARSIL_GTAGS")]
     gtags: bool,
+
+    /// Force-disable gtags even when global(1) is present on PATH.
+    #[arg(long, env = "NARSIL_NO_GTAGS")]
+    no_gtags: bool,
 
     /// Enable streaming responses for large result sets
     #[arg(long, env = "NARSIL_STREAMING")]
@@ -303,10 +309,19 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "graph"))]
     let graph_available = false;
 
+    // gtags: --gtags / --no-gtags override auto-detection of global(1).
+    let gtags_enabled = if server_args.no_gtags {
+        false
+    } else if server_args.gtags {
+        true
+    } else {
+        narsil_mcp::gtags::gtags_available()
+    };
+
     info!(
         "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, gtags={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
         server_args.call_graph, server_args.git, server_args.watch, server_args.persist,
-        server_args.lsp, server_args.gtags, server_args.streaming, server_args.remote,
+        server_args.lsp, gtags_enabled, server_args.streaming, server_args.remote,
         server_args.neural, !server_args.no_cache, graph_available
     );
 
@@ -328,24 +343,37 @@ async fn main() -> Result<()> {
             lsp_config.enabled_languages.insert(lang.to_string(), true);
         }
 
-        // Parse --lsp-cxx-backends (comma-separated: clangd, ccls)
-        let cxx_backends: Vec<CxxLspBackend> = server_args
+        // --lsp-cxx-backends: "auto" probes PATH; an explicit comma list is taken
+        // verbatim. An all-invalid explicit list keeps the default.
+        if server_args
             .lsp_cxx_backends
-            .split(',')
-            .filter_map(|s| match s.trim() {
-                "clangd" => Some(CxxLspBackend::Clangd),
-                "ccls" => Some(CxxLspBackend::Ccls),
-                other => {
-                    warn!(
-                        "Unknown --lsp-cxx-backends value '{}'; ignoring (valid: clangd, ccls)",
-                        other
-                    );
-                    None
-                }
-            })
-            .collect();
-        if !cxx_backends.is_empty() {
-            lsp_config.cxx_lsp_backends = cxx_backends;
+            .trim()
+            .eq_ignore_ascii_case("auto")
+        {
+            let detected = CxxLspBackend::detect_available();
+            if detected.is_empty() {
+                warn!("No C/C++ LSP backend found on PATH (clangd, ccls); C/C++ LSP disabled");
+            }
+            lsp_config.cxx_lsp_backends = detected;
+        } else {
+            let cxx_backends: Vec<CxxLspBackend> = server_args
+                .lsp_cxx_backends
+                .split(',')
+                .filter_map(|s| match s.trim() {
+                    "clangd" => Some(CxxLspBackend::Clangd),
+                    "ccls" => Some(CxxLspBackend::Ccls),
+                    other => {
+                        warn!(
+                            "Unknown --lsp-cxx-backends value '{}'; ignoring (valid: clangd, ccls, auto)",
+                            other
+                        );
+                        None
+                    }
+                })
+                .collect();
+            if !cxx_backends.is_empty() {
+                lsp_config.cxx_lsp_backends = cxx_backends;
+            }
         }
 
         info!(
@@ -405,7 +433,7 @@ async fn main() -> Result<()> {
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
-        gtags_enabled: server_args.gtags,
+        gtags_enabled,
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
