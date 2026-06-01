@@ -366,6 +366,7 @@ async fn main() -> Result<()> {
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
+        gtags_enabled: false, // wired to --gtags in the next patch
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]

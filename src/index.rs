@@ -20,6 +20,7 @@ use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
 use crate::git::GitRepo;
+use crate::gtags::GtagsManager;
 use crate::lsp::{LspConfig, LspManager};
 use crate::metrics::{spawn_flush_task, Metrics, DEFAULT_FLUSH_INTERVAL};
 use crate::neural::{NeuralConfig, NeuralEngine};
@@ -137,6 +138,8 @@ pub struct EngineOptions {
     pub compile_commands_path: Option<PathBuf>,
     /// Glob patterns (relative to repo root) for files to always index
     pub include: Vec<String>,
+    /// Enable GNU Global (gtags) as an additional C/C++ reference backend
+    pub gtags_enabled: bool,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -162,6 +165,7 @@ impl Default for EngineOptions {
             use_compile_commands: false,
             compile_commands_path: None,
             include: Vec::new(),
+            gtags_enabled: false,
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -202,6 +206,8 @@ pub struct CodeIntelEngine {
     index_store: Option<IndexStore>,
     /// LSP manager for enhanced code analysis (when lsp is enabled)
     lsp_manager: Option<Arc<LspManager>>,
+    /// GNU Global manager for C/C++ reference queries (when gtags is enabled)
+    gtags_manager: Option<Arc<GtagsManager>>,
     /// Remote repository manager for GitHub integration
     remote_manager: Option<Arc<tokio::sync::Mutex<RemoteRepoManager>>>,
     /// Cached security rules engine (avoids reloading rules on each scan)
@@ -274,6 +280,15 @@ impl CodeIntelEngine {
         } else {
             None
         };
+
+        // Initialize GNU Global manager if enabled
+        let gtags_manager = if options.gtags_enabled {
+            info!("GNU Global (gtags) integration enabled");
+            Some(Arc::new(GtagsManager::new(expanded_repos.clone())))
+        } else {
+            None
+        };
+
         // Initialize neural engine if enabled
         let neural_engine = if options.neural_config.enabled {
             match NeuralEngine::new(options.neural_config.clone()) {
@@ -380,6 +395,7 @@ impl CodeIntelEngine {
             index_store,
             metrics,
             lsp_manager,
+            gtags_manager,
             remote_manager: None,
             security_engine,
             analysis_cache,
@@ -1865,28 +1881,125 @@ impl CodeIntelEngine {
         None
     }
 
-    /// clangd's reference set for `symbol`, but only when its definition is
-    /// C/C++ and LSP is enabled. Returns None when cross-validation does not
-    /// apply (LSP off, non-C/C++ symbol, or clangd produced nothing), so the
-    /// caller falls back to its syntactic-only output unchanged.
-    async fn lsp_refs_for_cxx_symbol(
+    /// Query all enabled C/C++ reference backends for `symbol` and return
+    /// per-backend hit sets. Returns `None` when cross-validation does not
+    /// apply (no backends enabled, or symbol is not C/C++).
+    ///
+    /// Backend labels: `"clangd"`, `"ccls"` (from LSP), `"gtags"` (GNU Global).
+    async fn cxx_refs_for_symbol(
         &self,
         repo: &str,
         symbol: &str,
         repo_path: &Path,
         symbols: &[Symbol],
-    ) -> Option<Vec<(String, usize, String)>> {
-        let lsp = self.lsp_manager.as_ref()?;
-        if !lsp.is_enabled() {
-            return None;
-        }
+    ) -> Option<HashMap<&'static str, Vec<(String, usize, String)>>> {
         let is_cxx = symbols.iter().any(|s| {
             s.name == symbol && matches!(get_language_from_path(&s.file_path).as_str(), "c" | "cpp")
         });
         if !is_cxx {
             return None;
         }
-        self.lsp_search_references(repo, symbol, repo_path).await
+
+        let lsp_enabled = self
+            .lsp_manager
+            .as_ref()
+            .is_some_and(|l| l.is_enabled());
+        let gtags_enabled = self.gtags_manager.is_some();
+
+        if !lsp_enabled && !gtags_enabled {
+            return None;
+        }
+
+        let mut all: HashMap<&'static str, Vec<(String, usize, String)>> = HashMap::new();
+
+        // LSP backends: find the anchor position then query all backends in parallel
+        if lsp_enabled {
+            if let Some(lsp) = &self.lsp_manager {
+                let symbol_entry = self.symbols.get(repo);
+                if let Some(entry) = symbol_entry {
+                    for sym in entry.iter() {
+                        if sym.name != symbol
+                            && sym.qualified_name.as_deref() != Some(symbol)
+                        {
+                            continue;
+                        }
+                        let language = get_language_from_path(&sym.file_path);
+                        if !matches!(language.as_str(), "c" | "cpp") {
+                            continue;
+                        }
+                        let file_path = match crate::index::validate_path(repo_path, &sym.file_path) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let (anchor_line, anchor_col) = std::fs::read_to_string(&file_path)
+                            .ok()
+                            .and_then(|content| {
+                                Self::locate_name_anchor(
+                                    &content,
+                                    &sym.name,
+                                    sym.start_line,
+                                    sym.end_line,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                (sym.start_line.saturating_sub(1) as u32, 0)
+                            });
+
+                        let lsp_map = lsp
+                            .find_cxx_references_parallel(
+                                &language,
+                                &file_path,
+                                anchor_line,
+                                anchor_col,
+                                true,
+                            )
+                            .await;
+
+                        for (label, locations) in lsp_map {
+                            let mut refs: Vec<(String, usize, String)> = Vec::new();
+                            for loc in locations {
+                                if let Ok(path) = loc.uri.to_file_path() {
+                                    if let Ok(content) = std::fs::read_to_string(&path) {
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        let line_idx = loc.range.start.line as usize;
+                                        if line_idx < lines.len() {
+                                            let rel = path
+                                                .strip_prefix(repo_path)
+                                                .unwrap_or(&path)
+                                                .to_string_lossy()
+                                                .to_string();
+                                            refs.push((
+                                                rel,
+                                                line_idx + 1,
+                                                lines[line_idx].trim().to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if !refs.is_empty() {
+                                all.insert(label, refs);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // gtags backend
+        if let Some(gtags) = &self.gtags_manager {
+            let gtags_refs = gtags.find_references(symbol, repo_path).await;
+            if !gtags_refs.is_empty() {
+                all.insert("gtags", gtags_refs);
+            }
+        }
+
+        if all.is_empty() {
+            None
+        } else {
+            Some(all)
+        }
     }
 
     /// Format references into output string
@@ -6990,11 +7103,11 @@ impl CodeIntelEngine {
             }
         }
 
-        // For C/C++, clangd's precise reference set cross-validates the textual
-        // hits above. Neither is trusted alone (grep over-reports, a cold clangd
-        // index under-reports), so results are labelled, not replaced.
-        let lsp_refs = self
-            .lsp_refs_for_cxx_symbol(&repo_name, symbol_name, &repo_path, &symbols)
+        // For C/C++, query all enabled semantic backends to cross-validate
+        // textual hits. Neither source alone is trusted (grep over-reports,
+        // a cold backend under-reports), so results are labelled, not replaced.
+        let backend_refs = self
+            .cxx_refs_for_symbol(&repo_name, symbol_name, &repo_path, &symbols)
             .await;
 
         let mut output = String::new();
@@ -7008,50 +7121,76 @@ impl CodeIntelEngine {
             output.push('\n');
         }
 
-        if let Some(refs) = &lsp_refs {
-            let lsp_keys: std::collections::HashSet<(String, usize)> = refs
-                .iter()
-                .map(|(file, line, _)| (file.clone(), *line))
-                .collect();
+        if let Some(backends) = &backend_refs {
+            // Build a per-backend key set for fast membership tests
+            let mut backend_keys: HashMap<
+                &'static str,
+                std::collections::HashSet<(String, usize)>,
+            > = HashMap::new();
+            for (&label, refs) in backends {
+                let keys = refs
+                    .iter()
+                    .map(|(f, l, _)| (f.clone(), *l))
+                    .collect();
+                backend_keys.insert(label, keys);
+            }
+
             let grep_keys: std::collections::HashSet<(String, usize)> = usages
                 .iter()
                 .map(|(file, line, _)| (file.clone(), *line))
                 .collect();
 
-            // Confirmed = both; syntactic-only = grep clangd did not confirm;
-            // semantic-only = clangd refs the text search missed.
-            let mut rows: Vec<(String, usize, &'static str)> = Vec::new();
+            // Union of all backend key sets — any semantic backend confirming a
+            // textual hit marks it "confirmed"
+            let all_semantic_keys: std::collections::HashSet<(String, usize)> = backend_keys
+                .values()
+                .flat_map(|s| s.iter().cloned())
+                .collect();
+
+            let mut rows: Vec<(String, usize, String)> = Vec::new();
             for (file, line, _) in &usages {
-                let label = if lsp_keys.contains(&(file.clone(), *line)) {
-                    "confirmed"
+                let label = if all_semantic_keys.contains(&(file.clone(), *line)) {
+                    "confirmed".to_string()
                 } else {
-                    "syntactic-only"
+                    "syntactic-only".to_string()
                 };
                 rows.push((file.clone(), *line, label));
             }
-            for (file, line, _) in refs {
-                if !grep_keys.contains(&(file.clone(), *line)) {
-                    rows.push((file.clone(), *line, "semantic-only"));
+
+            // Hits found by a backend but not by text search
+            for (&blabel, refs) in backends {
+                for (file, line, _) in refs {
+                    if !grep_keys.contains(&(file.clone(), *line)) {
+                        rows.push((file.clone(), *line, format!("{}-only", blabel)));
+                    }
                 }
             }
+
             rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
             if rows.is_empty() {
                 output.push_str("## Usages\n\nNo usages found.\n");
             } else {
                 let confirmed = rows.iter().filter(|r| r.2 == "confirmed").count();
                 let syntactic = rows.iter().filter(|r| r.2 == "syntactic-only").count();
-                let semantic = rows.iter().filter(|r| r.2 == "semantic-only").count();
+                let backend_only = rows.len() - confirmed - syntactic;
+
+                // Build a sorted, deduplicated list of active backend labels
+                let mut active: Vec<&'static str> = backends.keys().copied().collect();
+                active.sort_unstable();
+                let active_str = active.join(", ");
 
                 output.push_str(&format!(
-                    "## Usages ({} total — clangd cross-validated)\n\n",
-                    rows.len()
+                    "## Usages ({} total — cross-validated by: {})\n\n",
+                    rows.len(),
+                    active_str
                 ));
                 output.push_str(&format!(
-                    "*{} confirmed, {} syntactic-only (clangd did not confirm — possible \
-                     false match or unindexed TU), {} semantic-only (clangd found, text \
-                     search missed)*\n\n",
-                    confirmed, syntactic, semantic
+                    "*{} confirmed, {} syntactic-only (no backend confirmed — possible \
+                     false match or unindexed TU), {} backend-only (backend found, \
+                     text search missed)*\n\n",
+                    confirmed, syntactic, backend_only
                 ));
                 output.push_str("| File | Line | Source |\n");
                 output.push_str("|------|------|--------|\n");
