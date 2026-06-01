@@ -1735,6 +1735,53 @@ impl CodeIntelEngine {
         references
     }
 
+    /// 0-based (line, UTF-16 column) of `name` as a whole-word token, scanning
+    /// from the definition's start line.
+    ///
+    /// clangd resolves a symbol from the identifier under the cursor, so a
+    /// reference query must anchor on the name token — column 0 sits on the
+    /// return type or a leading keyword. The name is usually on the start line
+    /// but a return type on its own line pushes it down, so a few lines are
+    /// scanned, never past the definition body.
+    fn locate_name_anchor(
+        content: &str,
+        name: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<(u32, u32)> {
+        if name.is_empty() {
+            return None;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let first = start_line.saturating_sub(1);
+        let window_end = (first + 8).min(end_line).min(lines.len());
+
+        for line_idx in first..window_end {
+            let line = lines[line_idx];
+            let mut search_from = 0;
+            while let Some(rel) = line[search_from..].find(name) {
+                let byte_idx = search_from + rel;
+                let before_ok = line[..byte_idx]
+                    .chars()
+                    .next_back()
+                    .map(|c| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(true);
+                let after_idx = byte_idx + name.len();
+                let after_ok = line[after_idx..]
+                    .chars()
+                    .next()
+                    .map(|c| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(true);
+                if before_ok && after_ok {
+                    let col = line[..byte_idx].encode_utf16().count() as u32;
+                    return Some((line_idx as u32, col));
+                }
+                search_from = after_idx;
+            }
+        }
+        None
+    }
+
     /// LSP-based reference search (can be slow, async)
     async fn lsp_search_references(
         &self,
@@ -1753,8 +1800,17 @@ impl CodeIntelEngine {
                 };
                 let language = get_language_from_path(&sym.file_path);
 
+                // Anchor on the name token (0-based); fall back to the start of
+                // the definition line when it cannot be located.
+                let (anchor_line, anchor_col) = std::fs::read_to_string(&file_path)
+                    .ok()
+                    .and_then(|content| {
+                        Self::locate_name_anchor(&content, &sym.name, sym.start_line, sym.end_line)
+                    })
+                    .unwrap_or_else(|| (sym.start_line.saturating_sub(1) as u32, 0));
+
                 if let Ok(Some(locations)) = lsp
-                    .find_references(&language, &file_path, sym.start_line as u32, 0, true)
+                    .find_references(&language, &file_path, anchor_line, anchor_col, true)
                     .await
                 {
                     let mut references = Vec::new();
@@ -9225,6 +9281,36 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn anchor_lands_on_name_not_return_type() {
+        // `foo` starts at column 4, past the `int ` return type.
+        let src = "int foo(void) { return 0; }\n";
+        let pos = CodeIntelEngine::locate_name_anchor(src, "foo", 1, 1);
+        assert_eq!(pos, Some((0, 4)));
+    }
+
+    #[test]
+    fn anchor_follows_name_onto_a_later_line() {
+        // Return type on its own line pushes the name down one line.
+        let src = "static int\nfoo(void)\n{\n}\n";
+        let pos = CodeIntelEngine::locate_name_anchor(src, "foo", 1, 4);
+        assert_eq!(pos, Some((1, 0)));
+    }
+
+    #[test]
+    fn anchor_requires_whole_word_match() {
+        // `foo` must not match inside `foobar`; the real definition is line 2.
+        let src = "int foobar(void);\nint foo(void) { return 0; }\n";
+        let pos = CodeIntelEngine::locate_name_anchor(src, "foo", 1, 2);
+        assert_eq!(pos, Some((1, 4)));
+    }
+
+    #[test]
+    fn anchor_returns_none_when_name_absent() {
+        let src = "int bar(void) { return 0; }\n";
+        assert_eq!(CodeIntelEngine::locate_name_anchor(src, "foo", 1, 1), None);
     }
 
     #[test]
