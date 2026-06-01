@@ -74,7 +74,7 @@ struct LspError {
 struct LspProcess {
     _child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    pending_requests: Arc<DashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
+    pending_requests: Arc<DashMap<i64, tokio::sync::oneshot::Sender<Result<Value, LspError>>>>,
     next_id: Arc<AtomicI64>,
     capabilities: Arc<RwLock<Option<ServerCapabilities>>>,
 }
@@ -181,7 +181,7 @@ impl LspManager {
     /// Handle responses from LSP server
     async fn handle_responses(
         stdout: ChildStdout,
-        pending_requests: Arc<DashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
+        pending_requests: Arc<DashMap<i64, tokio::sync::oneshot::Sender<Result<Value, LspError>>>>,
     ) -> Result<()> {
         let mut reader = BufReader::new(stdout);
         let mut content_length = 0;
@@ -213,10 +213,12 @@ impl LspManager {
                 // Handle response
                 if let Some(id) = message.id {
                     if let Some((_, tx)) = pending_requests.remove(&id) {
-                        if let Some(result) = message.result {
-                            let _ = tx.send(result);
-                        } else if let Some(error) = message.error {
-                            warn!("LSP error response: {:?}", error);
+                        if let Some(error) = message.error {
+                            let _ = tx.send(Err(error));
+                        } else {
+                            // No error => a result is present; a null result is a
+                            // valid "no data" answer that callers handle.
+                            let _ = tx.send(Ok(message.result.unwrap_or(Value::Null)));
                         }
                     }
                 }
@@ -263,7 +265,8 @@ impl LspManager {
         let response = timeout(Duration::from_millis(self.config.timeout_ms), rx)
             .await
             .context("LSP request timeout")?
-            .context("Response channel closed")?;
+            .context("Response channel closed")?
+            .map_err(|e| anyhow!("LSP error {}: {}", e.code, e.message))?;
 
         Ok(response)
     }
