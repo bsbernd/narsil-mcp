@@ -268,6 +268,67 @@ impl LspManager {
         Ok(response)
     }
 
+    /// Send a notification (no response expected) to the LSP server.
+    async fn send_notification(
+        &self,
+        process: &LspProcess,
+        method: &str,
+        params: Value,
+    ) -> Result<()> {
+        let message = LspMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some(method.to_string()),
+            // exit carries no params; a null value is dropped from the wire so
+            // the framing matches a parameterless notification.
+            params: if params.is_null() { None } else { Some(params) },
+            result: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&message)?;
+        let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+
+        let mut stdin = process.stdin.lock().await;
+        stdin.write_all(content.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Open `file_path` so the server can resolve positions within it.
+    ///
+    /// Uses on-disk content because narsil indexes saved state — editor
+    /// buffers are irrelevant. clangd answers textDocument/* only for open
+    /// documents, so this must precede any position query.
+    async fn did_open(&self, process: &LspProcess, language: &str, file_path: &Path) -> Result<()> {
+        let uri = Url::from_file_path(file_path).map_err(|_| anyhow!("Invalid file path"))?;
+        let text = std::fs::read_to_string(file_path)?;
+        self.send_notification(
+            process,
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language,
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )
+        .await
+    }
+
+    /// Close a document previously opened with `did_open`.
+    async fn did_close(&self, process: &LspProcess, file_path: &Path) -> Result<()> {
+        let uri = Url::from_file_path(file_path).map_err(|_| anyhow!("Invalid file path"))?;
+        self.send_notification(
+            process,
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        )
+        .await
+    }
+
     /// Initialize the LSP server
     async fn initialize_server(&self, process: &LspProcess, language: &str) -> Result<()> {
         let workspace_root = self
@@ -309,23 +370,8 @@ impl LspManager {
         info!("LSP server initialized for {}", language);
 
         // Send initialized notification
-        let notification = LspMessage {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: Some("initialized".to_string()),
-            params: Some(serde_json::json!({})),
-            result: None,
-            error: None,
-        };
-
-        let json = serde_json::to_string(&notification)?;
-        let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
-
-        {
-            let mut stdin = process.stdin.lock().await;
-            stdin.write_all(content.as_bytes()).await?;
-            stdin.flush().await?;
-        }
+        self.send_notification(process, "initialized", serde_json::json!({}))
+            .await?;
 
         Ok(())
     }
@@ -392,9 +438,12 @@ impl LspManager {
         };
 
         let params_value = serde_json::to_value(&params)?;
-        let response = self
+        self.did_open(&server, language, file_path).await.ok();
+        let result = self
             .send_request(&server, "textDocument/hover", params_value)
-            .await?;
+            .await;
+        self.did_close(&server, file_path).await.ok();
+        let response = result?;
 
         if response.is_null() {
             return Ok(None);
@@ -436,9 +485,12 @@ impl LspManager {
         };
 
         let params_value = serde_json::to_value(&params)?;
+        self.did_open(&server, language, file_path).await.ok();
         let response = self
             .send_request(&server, "textDocument/definition", params_value)
-            .await?;
+            .await;
+        self.did_close(&server, file_path).await.ok();
+        let response = response?;
 
         if response.is_null() {
             return Ok(None);
@@ -491,9 +543,12 @@ impl LspManager {
         };
 
         let params_value = serde_json::to_value(&params)?;
+        self.did_open(&server, language, file_path).await.ok();
         let response = self
             .send_request(&server, "textDocument/references", params_value)
-            .await?;
+            .await;
+        self.did_close(&server, file_path).await.ok();
+        let response = response?;
 
         if response.is_null() {
             return Ok(None);
@@ -530,9 +585,12 @@ impl LspManager {
         };
 
         let params_value = serde_json::to_value(&params)?;
+        self.did_open(&server, language, file_path).await.ok();
         let response = self
             .send_request(&server, "textDocument/documentSymbol", params_value)
-            .await?;
+            .await;
+        self.did_close(&server, file_path).await.ok();
+        let response = response?;
 
         if response.is_null() {
             return Ok(None);
@@ -554,21 +612,7 @@ impl LspManager {
             .send_request(process, "shutdown", serde_json::json!({}))
             .await;
 
-        let notification = LspMessage {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: Some("exit".to_string()),
-            params: None,
-            result: None,
-            error: None,
-        };
-
-        if let Ok(json) = serde_json::to_string(&notification) {
-            let content = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
-            let mut stdin = process.stdin.lock().await;
-            let _ = stdin.write_all(content.as_bytes()).await;
-            let _ = stdin.flush().await;
-        }
+        let _ = self.send_notification(process, "exit", Value::Null).await;
     }
 
     /// Shutdown all LSP servers
