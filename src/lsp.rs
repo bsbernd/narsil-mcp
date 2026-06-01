@@ -628,9 +628,10 @@ impl LspManager {
         Ok(())
     }
 
-    /// Evict and gracefully shut down the LSP server for `language`.
-    /// The next request will start a fresh server process. Called when
-    /// compile_commands.json changes so clangd picks up the new flags.
+    /// Restart the LSP server for `language`: evict and gracefully shut down
+    /// the current process, then immediately spawn a fresh one so it reads the
+    /// new compile_commands.json and rebuilds its background index without
+    /// waiting for the next query. Called when compile_commands.json changes.
     pub async fn restart_server(&self, language: &str) {
         if let Some((_, process)) = self.servers.remove(language) {
             info!(
@@ -638,6 +639,9 @@ impl LspManager {
                 language
             );
             self.shutdown_one_server(language, &process).await;
+            if let Err(e) = self.get_or_start_server(language).await {
+                warn!("Failed to respawn LSP server for {}: {}", language, e);
+            }
         }
     }
 }
