@@ -606,6 +606,28 @@ impl CodeIntelEngine {
             }
         }
 
+        // Warm clangd now so the cross-validation path is ready before the
+        // first C/C++ query, rather than racing a cold preamble/index build.
+        if let Some(lsp) = &self.lsp_manager {
+            let mut has_c = false;
+            let mut has_cpp = false;
+            for repo in self.repos.iter() {
+                for lang in repo.value().languages.keys() {
+                    match lang.as_str() {
+                        "C" => has_c = true,
+                        "C++" => has_cpp = true,
+                        _ => {}
+                    }
+                }
+            }
+            if has_c {
+                lsp.warm_up("c").await;
+            }
+            if has_cpp {
+                lsp.warm_up("cpp").await;
+            }
+        }
+
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
 

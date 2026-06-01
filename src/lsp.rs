@@ -644,6 +644,19 @@ impl LspManager {
             }
         }
     }
+
+    /// Eagerly start the server for `language` so it is warm — preamble built,
+    /// background index under way — before the first query. Best-effort: a
+    /// missing binary or spawn failure is logged, not fatal. No-op when LSP is
+    /// not enabled for the language.
+    pub async fn warm_up(&self, language: &str) {
+        if !self.is_enabled_for_language(language) {
+            return;
+        }
+        if let Err(e) = self.get_or_start_server(language).await {
+            warn!("Failed to warm up LSP server for {}: {}", language, e);
+        }
+    }
 }
 
 impl Drop for LspManager {
