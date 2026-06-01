@@ -26,6 +26,8 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 fi
 
+# delete first to avoid ETXTBSY if narsil-mcp is running
+rm -f "$INSTALL_DIR/narsil-mcp" 
 cp target/release/narsil-mcp "$INSTALL_DIR/"
 echo "✅ Installed to $INSTALL_DIR/narsil-mcp"
 
