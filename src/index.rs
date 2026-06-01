@@ -1950,6 +1950,7 @@ impl CodeIntelEngine {
                             .await;
 
                         for (label, locations) in lsp_map {
+                            self.metrics.record_backend_call(label);
                             let mut refs: Vec<(String, usize, String)> = Vec::new();
                             for loc in locations {
                                 if let Ok(path) = loc.uri.to_file_path() {
@@ -1984,6 +1985,7 @@ impl CodeIntelEngine {
         // gtags backend
         if let Some(gtags) = &self.gtags_manager {
             let gtags_refs = gtags.find_references(symbol, repo_path).await;
+            self.metrics.record_backend_call("gtags");
             if !gtags_refs.is_empty() {
                 all.insert("gtags", gtags_refs);
             }
