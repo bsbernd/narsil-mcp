@@ -20,6 +20,23 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+/// C/C++ LSP backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CxxLspBackend {
+    Clangd,
+    Ccls,
+}
+
+impl CxxLspBackend {
+    /// Short label used in server map keys and output strings.
+    pub fn label(self) -> &'static str {
+        match self {
+            CxxLspBackend::Clangd => "clangd",
+            CxxLspBackend::Ccls => "ccls",
+        }
+    }
+}
+
 /// Configuration for LSP integration
 #[derive(Debug, Clone)]
 pub struct LspConfig {
@@ -31,6 +48,8 @@ pub struct LspConfig {
     pub timeout_ms: u64,
     /// Enable LSP globally
     pub enabled: bool,
+    /// Which C/C++ LSP backends to start (defaults to clangd only)
+    pub cxx_lsp_backends: Vec<CxxLspBackend>,
 }
 
 impl Default for LspConfig {
@@ -42,6 +61,7 @@ impl Default for LspConfig {
             // LSP requests that don't complete within 1.5s are unlikely to complete usefully
             timeout_ms: 1500,
             enabled: false,
+            cxx_lsp_backends: vec![CxxLspBackend::Clangd],
         }
     }
 }
@@ -115,28 +135,53 @@ impl LspManager {
             .unwrap_or(false)
     }
 
-    /// Get or start an LSP server for a language
+    /// DashMap key for a C/C++ server entry: `"<lang>:<backend>"`.
+    /// Non-C/C++ languages use just the language name.
+    fn server_key(language: &str, backend: CxxLspBackend) -> String {
+        format!("{}:{}", language, backend.label())
+    }
+
+    /// Key to look up the primary (first-configured) server for `language`.
+    fn primary_server_key(&self, language: &str) -> String {
+        if matches!(language, "c" | "cpp") {
+            let backend = self
+                .config
+                .cxx_lsp_backends
+                .first()
+                .copied()
+                .unwrap_or(CxxLspBackend::Clangd);
+            Self::server_key(language, backend)
+        } else {
+            language.to_string()
+        }
+    }
+
+    /// Get or start the primary server for `language`.
     async fn get_or_start_server(&self, language: &str) -> Result<Arc<LspProcess>> {
-        // Check if server already running
-        if let Some(server) = self.servers.get(language) {
+        let key = self.primary_server_key(language);
+        self.get_or_start_server_for_key(&key).await
+    }
+
+    /// Get or start the server identified by `key`.
+    async fn get_or_start_server_for_key(&self, key: &str) -> Result<Arc<LspProcess>> {
+        if let Some(server) = self.servers.get(key) {
             return Ok(server.clone());
         }
-
-        // Start new server
-        let server = self.start_server(language).await?;
+        let server = self.start_server(key).await?;
         let server_arc = Arc::new(server);
-        self.servers
-            .insert(language.to_string(), server_arc.clone());
+        self.servers.insert(key.to_string(), server_arc.clone());
         Ok(server_arc)
     }
 
-    /// Start an LSP server process
-    async fn start_server(&self, language: &str) -> Result<LspProcess> {
-        let (command, args) = self.get_server_command(language)?;
+    /// Start an LSP server process for `server_key`.
+    /// For C/C++ the key is `"<lang>:<backend>"`; for other languages it is just the language.
+    async fn start_server(&self, server_key: &str) -> Result<LspProcess> {
+        let language = server_key.split(':').next().unwrap_or(server_key);
+        let (command, args) = self.get_server_command_for_key(server_key)?;
 
         info!(
             "Starting LSP server for {}: {} {:?}",
-            language,
+            server_key,
             command.display(),
             args
         );
@@ -172,7 +217,7 @@ impl LspManager {
             capabilities,
         };
 
-        // Initialize the server
+        // Initialize the server (use the language part of the key for LSP protocol)
         self.initialize_server(&process, language).await?;
 
         Ok(process)
@@ -349,9 +394,13 @@ impl LspManager {
                 .to_string(),
         };
 
-        // Use struct update syntax to avoid explicitly setting deprecated fields (root_uri, root_path)
+        // root_uri is deprecated in the LSP spec, but ccls rejects initialize
+        // without it (-32600 "expected rootUri"). Set it from the workspace
+        // root; clangd and the other servers accept it too.
+        #[allow(deprecated)]
         let init_params = InitializeParams {
             process_id: Some(std::process::id()),
+            root_uri: Some(Url::from_file_path(&workspace_root).unwrap()),
             capabilities: ClientCapabilities::default(),
             trace: Some(TraceValue::Off),
             workspace_folders: Some(vec![workspace_folder]),
@@ -379,9 +428,11 @@ impl LspManager {
         Ok(())
     }
 
-    /// Get the command and args to start an LSP server
-    fn get_server_command(&self, language: &str) -> Result<(PathBuf, Vec<String>)> {
-        // Check custom path first
+    /// Get the command and args to start the server identified by `server_key`.
+    /// For C/C++ the key is `"<lang>:<backend>"`; for other languages it is the language name.
+    fn get_server_command_for_key(&self, server_key: &str) -> Result<(PathBuf, Vec<String>)> {
+        // Custom path lookup uses the language part of the key
+        let language = server_key.split(':').next().unwrap_or(server_key);
         if let Some(path) = self.config.server_paths.get(language) {
             let path_str = path.to_string_lossy().to_string();
             crate::validation::validate_lsp_server_path(&path_str)
@@ -389,8 +440,7 @@ impl LspManager {
             return Ok((path.clone(), vec![]));
         }
 
-        // Auto-detect common language servers
-        match language {
+        match server_key {
             "rust" => Ok((PathBuf::from("rust-analyzer"), vec![])),
             "python" => Ok((
                 PathBuf::from("pyright-langserver"),
@@ -401,12 +451,13 @@ impl LspManager {
                 vec!["--stdio".to_string()],
             )),
             "go" => Ok((PathBuf::from("gopls"), vec![])),
-            "c" | "cpp" => Ok((PathBuf::from("clangd"), vec![])),
+            "c:clangd" | "cpp:clangd" => Ok((PathBuf::from("clangd"), vec![])),
+            "c:ccls" | "cpp:ccls" => Ok((PathBuf::from("ccls"), vec![])),
             "java" => Ok((
                 PathBuf::from("jdtls"),
                 vec!["-data".to_string(), "/tmp/jdtls-workspace".to_string()],
             )),
-            _ => Err(anyhow!("No LSP server configured for {}", language)),
+            _ => Err(anyhow!("No LSP server configured for {}", server_key)),
         }
     }
 
@@ -628,12 +679,32 @@ impl LspManager {
         Ok(())
     }
 
-    /// Restart the LSP server for `language`: evict and gracefully shut down
-    /// the current process, then immediately spawn a fresh one so it reads the
-    /// new compile_commands.json and rebuilds its background index without
-    /// waiting for the next query. Called when compile_commands.json changes.
+    /// Restart all LSP servers for `language`: evict and gracefully shut down
+    /// each process, then immediately spawn fresh ones so they read the new
+    /// compile_commands.json. For C/C++ every configured backend is restarted.
+    /// Called when compile_commands.json changes.
     pub async fn restart_server(&self, language: &str) {
-        if let Some((_, process)) = self.servers.remove(language) {
+        if matches!(language, "c" | "cpp") {
+            for &backend in &self.config.cxx_lsp_backends {
+                let key = Self::server_key(language, backend);
+                if let Some((_, process)) = self.servers.remove(&key) {
+                    info!(
+                        "Restarting {} LSP server for {} (compile_commands.json changed)",
+                        backend.label(),
+                        language
+                    );
+                    self.shutdown_one_server(&key, &process).await;
+                    if let Err(e) = self.get_or_start_server_for_key(&key).await {
+                        warn!(
+                            "Failed to respawn {} LSP server for {}: {}",
+                            backend.label(),
+                            language,
+                            e
+                        );
+                    }
+                }
+            }
+        } else if let Some((_, process)) = self.servers.remove(language) {
             info!(
                 "Restarting LSP server for {} (compile_commands.json changed)",
                 language
@@ -645,15 +716,27 @@ impl LspManager {
         }
     }
 
-    /// Eagerly start the server for `language` so it is warm — preamble built,
-    /// background index under way — before the first query. Best-effort: a
-    /// missing binary or spawn failure is logged, not fatal. No-op when LSP is
-    /// not enabled for the language.
+    /// Eagerly start all servers for `language` so they are warm before the
+    /// first query. For C/C++ this starts every configured backend. Best-effort:
+    /// a missing binary or spawn failure is logged, not fatal. No-op when LSP
+    /// is not enabled for the language.
     pub async fn warm_up(&self, language: &str) {
         if !self.is_enabled_for_language(language) {
             return;
         }
-        if let Err(e) = self.get_or_start_server(language).await {
+        if matches!(language, "c" | "cpp") {
+            for &backend in &self.config.cxx_lsp_backends {
+                let key = Self::server_key(language, backend);
+                if let Err(e) = self.get_or_start_server_for_key(&key).await {
+                    warn!(
+                        "Failed to warm up {} LSP server for {}: {}",
+                        backend.label(),
+                        language,
+                        e
+                    );
+                }
+            }
+        } else if let Err(e) = self.get_or_start_server(language).await {
             warn!("Failed to warm up LSP server for {}: {}", language, e);
         }
     }
@@ -726,11 +809,17 @@ mod tests {
         let config = LspConfig::default();
         let manager = LspManager::new(config, vec![]);
 
-        let (cmd, _) = manager.get_server_command("rust").unwrap();
+        let (cmd, _) = manager.get_server_command_for_key("rust").unwrap();
         assert_eq!(cmd, PathBuf::from("rust-analyzer"));
 
-        let (cmd, _) = manager.get_server_command("python").unwrap();
+        let (cmd, _) = manager.get_server_command_for_key("python").unwrap();
         assert_eq!(cmd, PathBuf::from("pyright-langserver"));
+
+        let (cmd, _) = manager.get_server_command_for_key("c:clangd").unwrap();
+        assert_eq!(cmd, PathBuf::from("clangd"));
+
+        let (cmd, _) = manager.get_server_command_for_key("c:ccls").unwrap();
+        assert_eq!(cmd, PathBuf::from("ccls"));
     }
 
     #[test]
@@ -803,7 +892,7 @@ mod tests {
             ..Default::default()
         };
         let manager = LspManager::new(config, vec![]);
-        let result = manager.get_server_command("rust");
+        let result = manager.get_server_command_for_key("rust");
         assert!(result.is_err(), "Should reject malicious server path");
     }
 
@@ -816,7 +905,7 @@ mod tests {
             ..Default::default()
         };
         let manager = LspManager::new(config, vec![]);
-        let result = manager.get_server_command("rust");
+        let result = manager.get_server_command_for_key("rust");
         assert!(result.is_err(), "Should reject relative traversal path");
     }
 }
