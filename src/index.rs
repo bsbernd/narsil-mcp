@@ -1865,6 +1865,30 @@ impl CodeIntelEngine {
         None
     }
 
+    /// clangd's reference set for `symbol`, but only when its definition is
+    /// C/C++ and LSP is enabled. Returns None when cross-validation does not
+    /// apply (LSP off, non-C/C++ symbol, or clangd produced nothing), so the
+    /// caller falls back to its syntactic-only output unchanged.
+    async fn lsp_refs_for_cxx_symbol(
+        &self,
+        repo: &str,
+        symbol: &str,
+        repo_path: &Path,
+        symbols: &[Symbol],
+    ) -> Option<Vec<(String, usize, String)>> {
+        let lsp = self.lsp_manager.as_ref()?;
+        if !lsp.is_enabled() {
+            return None;
+        }
+        let is_cxx = symbols.iter().any(|s| {
+            s.name == symbol && matches!(get_language_from_path(&s.file_path).as_str(), "c" | "cpp")
+        });
+        if !is_cxx {
+            return None;
+        }
+        self.lsp_search_references(repo, symbol, repo_path).await
+    }
+
     /// Format references into output string
     fn format_references(
         &self,
@@ -6966,6 +6990,13 @@ impl CodeIntelEngine {
             }
         }
 
+        // For C/C++, clangd's precise reference set cross-validates the textual
+        // hits above. Neither is trusted alone (grep over-reports, a cold clangd
+        // index under-reports), so results are labelled, not replaced.
+        let lsp_refs = self
+            .lsp_refs_for_cxx_symbol(&repo_name, symbol_name, &repo_path, &symbols)
+            .await;
+
         let mut output = String::new();
         output.push_str(&format!("# Symbol Usages: '{}'\n\n", symbol_name));
 
@@ -6977,7 +7008,61 @@ impl CodeIntelEngine {
             output.push('\n');
         }
 
-        if usages.is_empty() {
+        if let Some(refs) = &lsp_refs {
+            let lsp_keys: std::collections::HashSet<(String, usize)> = refs
+                .iter()
+                .map(|(file, line, _)| (file.clone(), *line))
+                .collect();
+            let grep_keys: std::collections::HashSet<(String, usize)> = usages
+                .iter()
+                .map(|(file, line, _)| (file.clone(), *line))
+                .collect();
+
+            // Confirmed = both; syntactic-only = grep clangd did not confirm;
+            // semantic-only = clangd refs the text search missed.
+            let mut rows: Vec<(String, usize, &'static str)> = Vec::new();
+            for (file, line, _) in &usages {
+                let label = if lsp_keys.contains(&(file.clone(), *line)) {
+                    "confirmed"
+                } else {
+                    "syntactic-only"
+                };
+                rows.push((file.clone(), *line, label));
+            }
+            for (file, line, _) in refs {
+                if !grep_keys.contains(&(file.clone(), *line)) {
+                    rows.push((file.clone(), *line, "semantic-only"));
+                }
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+            if rows.is_empty() {
+                output.push_str("## Usages\n\nNo usages found.\n");
+            } else {
+                let confirmed = rows.iter().filter(|r| r.2 == "confirmed").count();
+                let syntactic = rows.iter().filter(|r| r.2 == "syntactic-only").count();
+                let semantic = rows.iter().filter(|r| r.2 == "semantic-only").count();
+
+                output.push_str(&format!(
+                    "## Usages ({} total — clangd cross-validated)\n\n",
+                    rows.len()
+                ));
+                output.push_str(&format!(
+                    "*{} confirmed, {} syntactic-only (clangd did not confirm — possible \
+                     false match or unindexed TU), {} semantic-only (clangd found, text \
+                     search missed)*\n\n",
+                    confirmed, syntactic, semantic
+                ));
+                output.push_str("| File | Line | Source |\n");
+                output.push_str("|------|------|--------|\n");
+                for (file, line, label) in rows.iter().take(50) {
+                    output.push_str(&format!("| {} | {} | {} |\n", file, line, label));
+                }
+                if rows.len() > 50 {
+                    output.push_str(&format!("\n*... and {} more*\n", rows.len() - 50));
+                }
+            }
+        } else if usages.is_empty() {
             output.push_str("## Usages\n\nNo usages found.\n");
         } else {
             output.push_str(&format!("## Usages ({} found)\n\n", usages.len()));
