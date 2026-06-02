@@ -1275,6 +1275,7 @@ fn should_ignore(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbols::SourceSet;
     use tempfile::tempdir;
 
     #[test]
@@ -1414,6 +1415,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         index.add_symbol(symbol.clone(), PathBuf::from("test.rs"));
@@ -1451,6 +1454,8 @@ mod tests {
                 signature: None,
                 qualified_name: None,
                 doc_comment: None,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             };
             index.add_symbol(symbol, PathBuf::from("test.rs"));
         }
@@ -1475,6 +1480,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let class = Symbol {
@@ -1486,6 +1493,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         index.add_symbol(func, PathBuf::from("test.rs"));
@@ -1528,6 +1537,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let exported = ExportedSymbol {
@@ -1589,6 +1600,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let exported = ExportedSymbol {

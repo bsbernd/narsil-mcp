@@ -1933,6 +1933,8 @@ func example() int {
             signature: Some(format!("pub fn {}()", name)),
             qualified_name: Some(name.to_string()),
             doc_comment: None,
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         }
     }
 

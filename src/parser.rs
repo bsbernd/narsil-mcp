@@ -584,6 +584,8 @@ impl LanguageParser {
                     signature,
                     qualified_name: None,
                     doc_comment: None,
+                    confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 });
             }
         }

@@ -48,7 +48,9 @@ pub struct PersistedIndex {
 }
 
 impl PersistedIndex {
-    const CURRENT_VERSION: u32 = 2;
+    // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
+    // changes the postcard layout — older indexes must be rebuilt, not misread.
+    const CURRENT_VERSION: u32 = 3;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()

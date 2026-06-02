@@ -639,7 +639,7 @@ fn url_encode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::{CallType, FunctionMetrics};
+    use crate::callgraph::{CallType, EdgeSource, FunctionMetrics};
     use std::collections::HashMap;
 
     // ========================================================================
@@ -659,6 +659,8 @@ mod tests {
             signature: Some("fn main() -> Result<()>".to_string()),
             qualified_name: Some("crate::main".to_string()),
             doc_comment: Some("Entry point".to_string()),
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let iri = SymbolTransformer::transform(&graph, "test-repo", &symbol).unwrap();
@@ -703,6 +705,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let iri = SymbolTransformer::transform(&graph, "test-repo", &symbol).unwrap();
@@ -727,6 +731,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: Some("A test class".to_string()),
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let iri = SymbolTransformer::transform(&graph, "test-repo", &symbol).unwrap();
@@ -751,6 +757,8 @@ mod tests {
             signature: None,
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         let symbol_iri = SymbolTransformer::transform(&graph, "test-repo", &symbol).unwrap();
@@ -778,6 +786,8 @@ mod tests {
                 signature: None,
                 qualified_name: None,
                 doc_comment: None,
+                confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             },
             Symbol {
                 name: "func2".to_string(),
@@ -788,6 +798,8 @@ mod tests {
                 signature: None,
                 qualified_name: None,
                 doc_comment: None,
+                confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             },
         ];
 
@@ -1201,6 +1213,8 @@ mod tests {
             signature: Some("fn roundtrip_func()".to_string()),
             qualified_name: None,
             doc_comment: None,
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         SymbolTransformer::transform(&graph, "test-repo", &symbol).unwrap();
