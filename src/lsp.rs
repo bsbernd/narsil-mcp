@@ -3,6 +3,7 @@
 //! This module provides integration with Language Server Protocol servers for
 //! richer type information, hover docs, and go-to-definition capabilities.
 
+use crate::symbols::{SourceSet, Symbol, SymbolKind as NarsilSymbolKind};
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use lsp_types::*;
@@ -812,20 +813,49 @@ impl LspManager {
         Ok(Some(locations))
     }
 
-    /// Get document symbols
-    pub async fn get_document_symbols(
+    /// Single-bit `SourceSet` for each configured C/C++ LSP backend
+    /// (`SourceSet::CLANGD` and/or `SourceSet::CCLS`). Empty when LSP is
+    /// disabled. Drives the per-backend documentSymbol (Phase 2) and
+    /// callHierarchy (Phase 5) index passes; results from each are merged, not
+    /// stored separately.
+    pub fn active_cxx_backends(&self) -> Vec<SourceSet> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
+        self.config
+            .cxx_lsp_backends
+            .iter()
+            .map(|backend| match backend {
+                CxxLspBackend::Clangd => SourceSet::CLANGD,
+                CxxLspBackend::Ccls => SourceSet::CCLS,
+            })
+            .collect()
+    }
+
+    /// Map a single-bit C/C++ `SourceSet` back to its `CxxLspBackend`.
+    fn cxx_backend_for_source(source: SourceSet) -> Option<CxxLspBackend> {
+        if source == SourceSet::CLANGD {
+            Some(CxxLspBackend::Clangd)
+        } else if source == SourceSet::CCLS {
+            Some(CxxLspBackend::Ccls)
+        } else {
+            None
+        }
+    }
+
+    /// documentSymbol against the server identified by `server_key`, returning
+    /// the raw nested LSP symbols (or `None` when the server is unavailable,
+    /// returns nothing, or returns the deprecated flat shape).
+    async fn document_symbols_raw(
         &self,
+        server_key: &str,
         language: &str,
         file_path: &Path,
     ) -> Result<Option<Vec<DocumentSymbol>>> {
-        if !self.is_enabled_for_language(language) {
-            return Ok(None);
-        }
-
-        let server = match self.get_or_start_server(language).await {
+        let server = match self.get_or_start_server_for_key(server_key).await {
             Ok(s) => s,
             Err(e) => {
-                debug!("Failed to start LSP server for {}: {}", language, e);
+                debug!("Failed to start LSP server {}: {}", server_key, e);
                 return Ok(None);
             }
         };
@@ -856,6 +886,137 @@ impl LspManager {
             DocumentSymbolResponse::Flat(_) => Ok(None),
             DocumentSymbolResponse::Nested(symbols) => Ok(Some(symbols)),
         }
+    }
+
+    /// documentSymbol against one C/C++ `backend`, flattened into narsil
+    /// `Symbol`s tagged with that backend's `confirmed_by` bit. Nested members
+    /// (methods inside a class) become separate symbols. `start_line` is the
+    /// name-token row (selectionRange) to match the dedup convention; the
+    /// returned symbols carry an empty `file_path` — the caller assigns the
+    /// repo-relative path.
+    pub async fn get_document_symbols(
+        &self,
+        backend: SourceSet,
+        file_path: &Path,
+        language: &str,
+    ) -> Result<Vec<Symbol>> {
+        let cxx = match Self::cxx_backend_for_source(backend) {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let server_key = Self::server_key(language, cxx);
+        let nested = match self
+            .document_symbols_raw(&server_key, language, file_path)
+            .await?
+        {
+            Some(n) => n,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        flatten_document_symbols(&nested, backend, &mut out);
+        Ok(out)
+    }
+
+    /// Prepare a `CallHierarchyItem` for `symbol_name` (anchored on its name
+    /// token at/after the 1-based `line`) on one `backend`, then fetch its
+    /// outgoing calls. Returns (callee_name, callee_def_file, call_site_line):
+    /// `callee_def_file` is the callee's absolute definition path and
+    /// `call_site_line` is the 1-based line *in this caller* where the call
+    /// occurs (from `from_ranges`) — a `CallEdge`'s line is the call site, not
+    /// the callee's definition. Empty when the backend has no callHierarchy
+    /// support, the position cannot be anchored, or there are no outgoing calls.
+    pub async fn call_hierarchy_outgoing(
+        &self,
+        backend: SourceSet,
+        file_path: &Path,
+        symbol_name: &str,
+        line: u32,
+    ) -> Result<Vec<(String, String, u32)>> {
+        let cxx = match Self::cxx_backend_for_source(backend) {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let language = cxx_language_id(file_path);
+        let server_key = Self::server_key(language, cxx);
+        let server = match self.get_or_start_server_for_key(&server_key).await {
+            Ok(s) => s,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // prepareCallHierarchy must sit on the identifier; anchor on the name
+        // token. `line` is the symbol's 1-based definition row.
+        let content = std::fs::read_to_string(file_path).unwrap_or_default();
+        let (anchor_line, anchor_col) =
+            name_anchor(&content, symbol_name, (line.max(1) - 1) as usize)
+                .unwrap_or((line.max(1) - 1, 0));
+
+        let uri = Url::from_file_path(file_path).map_err(|_| anyhow!("Invalid file path"))?;
+        self.did_open(&server, language, file_path).await.ok();
+
+        let prepare_params = CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position {
+                    line: anchor_line,
+                    character: anchor_col,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let prepare_value = serde_json::to_value(&prepare_params)?;
+        let prepare_resp = self
+            .send_request(&server, "textDocument/prepareCallHierarchy", prepare_value)
+            .await;
+
+        let item = match prepare_resp {
+            Ok(v) if !v.is_null() => serde_json::from_value::<Vec<CallHierarchyItem>>(v)
+                .ok()
+                .and_then(|items| items.into_iter().next()),
+            _ => None,
+        };
+        let item = match item {
+            Some(i) => i,
+            None => {
+                self.did_close(&server, file_path).await.ok();
+                return Ok(Vec::new());
+            }
+        };
+
+        let out_params = CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let out_value = serde_json::to_value(&out_params)?;
+        let out_resp = self
+            .send_request(&server, "callHierarchy/outgoingCalls", out_value)
+            .await;
+        self.did_close(&server, file_path).await.ok();
+
+        let calls: Vec<CallHierarchyOutgoingCall> = match out_resp {
+            Ok(v) if !v.is_null() => serde_json::from_value(v).unwrap_or_default(),
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut result = Vec::new();
+        for call in calls {
+            let callee_file = call
+                .to
+                .uri
+                .to_file_path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // A CallEdge's line is the call site in this caller; outgoingCalls
+            // reports those in `from_ranges`. Fall back to the callee's name row
+            // only when a backend omits them.
+            let call_site_line = call
+                .from_ranges
+                .first()
+                .map(|range| range.start.line + 1)
+                .unwrap_or_else(|| call.to.selection_range.start.line + 1);
+            result.push((call.to.name, callee_file, call_site_line));
+        }
+        Ok(result)
     }
 
     /// Gracefully stop one server: shutdown request followed by exit notification.
@@ -954,6 +1115,101 @@ impl Drop for LspManager {
             }
         });
     }
+}
+
+/// LSP languageId for a C/C++ file, by extension. Defaults to "c" for plain
+/// `.h` and anything unrecognised; clangd/ccls still resolve via
+/// compile_commands.json regardless.
+fn cxx_language_id(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "cpp" | "cxx" | "cc" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "ipp" | "tpp" => "cpp",
+        _ => "c",
+    }
+}
+
+/// Map an LSP `SymbolKind` to a narsil [`NarsilSymbolKind`].
+fn lsp_kind_to_narsil(kind: SymbolKind) -> NarsilSymbolKind {
+    match kind {
+        SymbolKind::FUNCTION => NarsilSymbolKind::Function,
+        SymbolKind::METHOD => NarsilSymbolKind::Method,
+        SymbolKind::CONSTRUCTOR => NarsilSymbolKind::Constructor,
+        SymbolKind::STRUCT => NarsilSymbolKind::Struct,
+        SymbolKind::CLASS => NarsilSymbolKind::Class,
+        SymbolKind::ENUM => NarsilSymbolKind::Enum,
+        SymbolKind::ENUM_MEMBER => NarsilSymbolKind::Constant,
+        SymbolKind::INTERFACE => NarsilSymbolKind::Interface,
+        SymbolKind::NAMESPACE => NarsilSymbolKind::Namespace,
+        SymbolKind::MODULE | SymbolKind::PACKAGE => NarsilSymbolKind::Module,
+        SymbolKind::CONSTANT => NarsilSymbolKind::Constant,
+        SymbolKind::VARIABLE => NarsilSymbolKind::Variable,
+        SymbolKind::FIELD | SymbolKind::PROPERTY => NarsilSymbolKind::Field,
+        SymbolKind::TYPE_PARAMETER => NarsilSymbolKind::TypeAlias,
+        _ => NarsilSymbolKind::Unknown,
+    }
+}
+
+/// Flatten the nested documentSymbol tree into narsil `Symbol`s, recursing into
+/// children so class members become separate symbols. Each carries `backend` as
+/// its sole confirmer; `file_path` is left empty for the caller to fill.
+fn flatten_document_symbols(symbols: &[DocumentSymbol], backend: SourceSet, out: &mut Vec<Symbol>) {
+    for ds in symbols {
+        #[allow(deprecated)]
+        out.push(Symbol {
+            name: ds.name.clone(),
+            kind: lsp_kind_to_narsil(ds.kind),
+            file_path: String::new(),
+            start_line: ds.selection_range.start.line as usize + 1,
+            end_line: ds.range.end.line as usize + 1,
+            signature: ds.detail.clone(),
+            qualified_name: None,
+            doc_comment: None,
+            confirmed_by: backend,
+            line_conflicts: Vec::new(),
+        });
+        if let Some(children) = &ds.children {
+            flatten_document_symbols(children, backend, out);
+        }
+    }
+}
+
+/// 0-based (line, UTF-16 column) of `name` as a whole-word token, scanning a
+/// few lines from `start_line` (0-based). A leading return type can push the
+/// name token below the definition's first line, so a short window is scanned.
+fn name_anchor(content: &str, name: &str, start_line: usize) -> Option<(u32, u32)> {
+    if name.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let end = (start_line + 8).min(lines.len());
+    for line_idx in start_line..end {
+        let line = lines[line_idx];
+        let mut search_from = 0;
+        while let Some(rel) = line[search_from..].find(name) {
+            let byte_idx = search_from + rel;
+            let before_ok = line[..byte_idx]
+                .chars()
+                .next_back()
+                .map(|c| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(true);
+            let after_idx = byte_idx + name.len();
+            let after_ok = line[after_idx..]
+                .chars()
+                .next()
+                .map(|c| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(true);
+            if before_ok && after_ok {
+                let col = line[..byte_idx].encode_utf16().count() as u32;
+                return Some((line_idx as u32, col));
+            }
+            search_from = after_idx;
+        }
+    }
+    None
 }
 
 /// Convert LSP hover to markdown string
