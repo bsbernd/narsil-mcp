@@ -639,7 +639,7 @@ fn url_encode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::{CallType, EdgeSource, FunctionMetrics};
+    use crate::callgraph::{CallType, FunctionMetrics};
     use std::collections::HashMap;
 
     // ========================================================================
@@ -872,7 +872,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![],
             metrics: FunctionMetrics::default(),
@@ -905,7 +906,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![],
             metrics: FunctionMetrics::default(),
@@ -922,7 +924,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![],
             metrics: FunctionMetrics::default(),

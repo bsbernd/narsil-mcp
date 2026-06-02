@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::query_cache::{QueryCache, QueryCacheKey, QueryCacheStats, SearchOptions};
 use crate::cache::{AnalysisCache, AnalysisCacheKey, CacheStats};
-use crate::callgraph::{CallEdge, CallGraph, CallType, EdgeSource};
+use crate::callgraph::{CallEdge, CallGraph, CallType};
 use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
@@ -29,7 +29,7 @@ use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
 use crate::search::{build_file_doc, generate_snippet, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
-use crate::symbols::{Symbol, SymbolKind};
+use crate::symbols::{SourceSet, Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
 
 /// Metadata about an indexed repository
@@ -3385,18 +3385,26 @@ impl CodeIntelEngine {
                                             .map(|e| (e.file_path.clone(), e.line))
                                             .collect();
 
+                                    // Query-time LSP references come from the
+                                    // primary backend; tag agreement with its bit.
+                                    let lsp_bit = lsp
+                                        .active_cxx_backends()
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(SourceSet::CLANGD);
+
                                     let mut lsp_count = 0usize;
                                     let mut overlap_count = 0usize;
 
                                     for (rel_path, ref_line, _content) in &lsp_refs {
                                         let key = (rel_path.clone(), *ref_line);
                                         if ast_keys.contains(&key) {
-                                            // Both sources agree — upgrade edge source.
+                                            // Both sources agree — record the LSP confirmer.
                                             for edge in callers.iter_mut() {
                                                 if edge.file_path == *rel_path
                                                     && edge.line == *ref_line
                                                 {
-                                                    edge.source = EdgeSource::Both;
+                                                    edge.confirmed_by.insert(lsp_bit);
                                                 }
                                             }
                                             overlap_count += 1;
@@ -3415,7 +3423,8 @@ impl CodeIntelEngine {
                                                 column: 0,
                                                 call_type: CallType::Unknown,
                                                 scope_hint: None,
-                                                source: EdgeSource::Lsp,
+                                                confirmed_by: lsp_bit,
+                                                line_conflicts: Vec::new(),
                                             });
                                             lsp_count += 1;
                                         }
@@ -3423,7 +3432,7 @@ impl CodeIntelEngine {
 
                                     let ast_only = callers
                                         .iter()
-                                        .filter(|e| e.source == EdgeSource::Ast)
+                                        .filter(|e| e.confirmed_by == SourceSet::TREE_SITTER)
                                         .count();
                                     output.push_str(&format!(
                                         "*Sources: {} AST-only, {} LSP-only, {} confirmed by both*\n\n",
@@ -3438,10 +3447,15 @@ impl CodeIntelEngine {
 
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
             for caller in &callers {
-                let tag = match caller.source {
-                    EdgeSource::Lsp => " `[LSP]`",
-                    EdgeSource::Ast => " `[ast]`",
-                    EdgeSource::Both => "",
+                let tag = if caller.confirmed_by.contains(SourceSet::TREE_SITTER)
+                    && caller.confirmed_by.count() >= 2
+                {
+                    // Confirmed by tree-sitter and at least one other backend.
+                    ""
+                } else if caller.confirmed_by == SourceSet::TREE_SITTER {
+                    " `[ast]`"
+                } else {
+                    " `[LSP]`"
                 };
                 output.push_str(&format!(
                     "- `{}` at `{}:{}`{} ({:?})\n",

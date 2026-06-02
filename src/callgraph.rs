@@ -2,6 +2,7 @@
 //!
 //! This is critical for AI understanding of code flow and impact analysis.
 
+use crate::symbols::{SourceLine, SourceSet};
 use anyhow::Result;
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -26,18 +27,6 @@ pub struct CallNode {
     pub metrics: FunctionMetrics,
 }
 
-/// Which analysis source produced a call edge.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub enum EdgeSource {
-    /// Extracted from the tree-sitter AST (always available).
-    #[default]
-    Ast,
-    /// Resolved by the LSP server (clangd/rust-analyzer/…).
-    Lsp,
-    /// Confirmed by both AST and LSP — highest confidence.
-    Both,
-}
-
 /// An edge in the call graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEdge {
@@ -45,7 +34,7 @@ pub struct CallEdge {
     pub target: String,
     /// File containing the call
     pub file_path: String,
-    /// Line of the call site
+    /// Line of the call site (canonical — from the highest-priority confirmer)
     pub line: usize,
     /// Column of the call site
     pub column: usize,
@@ -54,9 +43,13 @@ pub struct CallEdge {
     /// Scope qualifier from the call site (e.g. "App" from `App::run()`)
     #[serde(default)]
     pub scope_hint: Option<String>,
-    /// Which analysis source produced this edge.
+    /// Backends that confirmed this edge (tree-sitter, clangd, ccls, gtags).
+    #[serde(default = "SourceSet::tree_sitter_default")]
+    pub confirmed_by: SourceSet,
+    /// Confirmers whose reported call-site line differs from `line`. Empty when
+    /// all agree. Retained so a disagreement reaches the consumer.
     #[serde(default)]
-    pub source: EdgeSource,
+    pub line_conflicts: Vec<SourceLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,8 +129,98 @@ impl CallGraph {
         Ok(())
     }
 
-    /// Create a qualified key for the DashMap: "file_path::function_name"
-    fn qualified_key(file_path: &str, name: &str) -> String {
+    /// Merge edges from one backend into the graph. Each input pairs a resolved
+    /// caller key with an outgoing `CallEdge` whose `target` is the callee's
+    /// bare name (resolved here against the existing nodes). For each
+    /// (caller, callee) pair:
+    ///   - `confirmed_by` accumulates `source`;
+    ///   - if `source` outranks the current canonical confirmer it wins the
+    ///     call-site line/column, demoting the old line into `line_conflicts`;
+    ///   - otherwise a differing line is recorded in `line_conflicts`.
+    /// A pair not already present is inserted with `confirmed_by = {source}`.
+    /// Only existing caller/callee nodes are touched — tree-sitter provides the
+    /// node baseline.
+    pub fn merge_edges(&self, edges: Vec<(String, CallEdge)>, source: SourceSet) {
+        for (caller_key, mut new_edge) in edges {
+            let callee_key = self.resolve_callee(
+                &new_edge.target,
+                &new_edge.file_path,
+                new_edge.scope_hint.as_deref(),
+            );
+            new_edge.target = callee_key.clone();
+
+            // Outgoing edge on the caller.
+            if let Some(mut caller_node) = self.nodes.get_mut(&caller_key) {
+                match caller_node
+                    .calls
+                    .iter_mut()
+                    .find(|e| e.target == callee_key)
+                {
+                    Some(existing) => {
+                        Self::fold_edge(existing, source, new_edge.line, new_edge.column)
+                    }
+                    None => {
+                        new_edge.confirmed_by = source;
+                        new_edge.line_conflicts = Vec::new();
+                        caller_node.calls.push(new_edge.clone());
+                    }
+                }
+            }
+
+            // Incoming edge on the callee (keyed by the caller).
+            if let Some(mut callee_node) = self.nodes.get_mut(callee_key.as_str()) {
+                match callee_node
+                    .called_by
+                    .iter_mut()
+                    .find(|e| e.target == caller_key)
+                {
+                    Some(existing) => {
+                        Self::fold_edge(existing, source, new_edge.line, new_edge.column)
+                    }
+                    None => {
+                        callee_node.called_by.push(CallEdge {
+                            target: caller_key.clone(),
+                            file_path: new_edge.file_path.clone(),
+                            line: new_edge.line,
+                            column: new_edge.column,
+                            call_type: new_edge.call_type.clone(),
+                            scope_hint: None,
+                            confirmed_by: source,
+                            line_conflicts: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fold a `source` confirmation into an existing edge: record the confirmer,
+    /// and let priority decide the canonical call-site line — the loser's line
+    /// is retained in `line_conflicts`.
+    fn fold_edge(edge: &mut CallEdge, source: SourceSet, new_line: usize, new_column: usize) {
+        let old_canonical = edge.confirmed_by.highest();
+        edge.confirmed_by.insert(source);
+        if source.rank() > old_canonical.rank() {
+            if edge.line != new_line {
+                edge.line_conflicts.push(SourceLine {
+                    source: old_canonical,
+                    line: edge.line,
+                });
+            }
+            edge.line = new_line;
+            edge.column = new_column;
+        } else if new_line != edge.line {
+            edge.line_conflicts.push(SourceLine {
+                source,
+                line: new_line,
+            });
+        }
+    }
+
+    /// Create a qualified key for the DashMap: "file_path::function_name".
+    /// `pub(crate)` so index-time edge augmentation can build the resolved
+    /// caller key that [`CallGraph::merge_edges`] expects.
+    pub(crate) fn qualified_key(file_path: &str, name: &str) -> String {
         format!("{}::{}", file_path, name)
     }
 
@@ -335,7 +418,8 @@ impl CallGraph {
                                 column: edge.column,
                                 call_type: edge.call_type,
                                 scope_hint: None,
-                                source: EdgeSource::Ast,
+                                confirmed_by: SourceSet::TREE_SITTER,
+                                line_conflicts: Vec::new(),
                             });
                         }
                     }
@@ -452,7 +536,8 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
-                            source: EdgeSource::Ast,
+                            confirmed_by: SourceSet::TREE_SITTER,
+                            line_conflicts: Vec::new(),
                         });
                     }
                 }
@@ -471,7 +556,8 @@ impl CallGraph {
                             column: 0,
                             call_type: CallType::Direct,
                             scope_hint: None,
-                            source: EdgeSource::Ast,
+                            confirmed_by: SourceSet::TREE_SITTER,
+                            line_conflicts: Vec::new(),
                         });
                     }
                 }
@@ -613,7 +699,8 @@ impl CallGraph {
             column: node.start_position().column + 1,
             call_type,
             scope_hint,
-            source: EdgeSource::Ast,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         })
     }
 
@@ -1460,7 +1547,8 @@ mod tests {
             column: 5,
             call_type: CallType::Direct,
             scope_hint: None,
-            source: EdgeSource::Ast,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         graph
@@ -1477,7 +1565,8 @@ mod tests {
             column: edge.column,
             call_type: edge.call_type.clone(),
             scope_hint: None,
-            source: EdgeSource::Ast,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         graph
@@ -1515,7 +1604,8 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -1524,7 +1614,8 @@ mod tests {
                     column: 8,
                     call_type: CallType::Method,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -1584,7 +1675,8 @@ mod tests {
                     column: 5,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
                 CallEdge {
                     target: "callee2".to_string(),
@@ -1593,7 +1685,8 @@ mod tests {
                     column: 10,
                     call_type: CallType::StaticMethod,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
             ],
             called_by: Vec::new(),
@@ -1696,7 +1789,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1713,7 +1807,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1722,7 +1817,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1738,7 +1834,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1747,7 +1844,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1764,7 +1862,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1805,7 +1904,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1814,7 +1914,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1831,7 +1932,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1864,7 +1966,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1881,7 +1984,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "a".to_string(),
@@ -1890,7 +1994,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1906,7 +2011,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "b".to_string(),
@@ -1915,7 +2021,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1932,7 +2039,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics::default(),
         };
@@ -1973,7 +2081,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -1990,7 +2099,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -2062,7 +2172,8 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
                 CallEdge {
                     target: "f2".to_string(),
@@ -2071,7 +2182,8 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
             ],
             called_by: vec![
@@ -2082,7 +2194,8 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
                 CallEdge {
                     target: "caller2".to_string(),
@@ -2091,7 +2204,8 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
                 CallEdge {
                     target: "caller3".to_string(),
@@ -2100,7 +2214,8 @@ mod tests {
                     column: 1,
                     call_type: CallType::Direct,
                     scope_hint: None,
-                    source: EdgeSource::Ast,
+                    confirmed_by: SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
                 },
             ],
             metrics: FunctionMetrics::default(),
@@ -2118,7 +2233,8 @@ mod tests {
                 column: 1,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics::default(),
@@ -2178,7 +2294,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: vec![CallEdge {
                 target: "main".to_string(),
@@ -2187,7 +2304,8 @@ mod tests {
                 column: 3,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             metrics: FunctionMetrics {
                 loc: 10,
@@ -2265,7 +2383,8 @@ mod tests {
                 column: 5,
                 call_type: CallType::Direct,
                 scope_hint: None,
-                source: EdgeSource::Ast,
+                confirmed_by: SourceSet::TREE_SITTER,
+                line_conflicts: Vec::new(),
             }],
             called_by: Vec::new(),
             metrics: FunctionMetrics {
@@ -2298,7 +2417,8 @@ mod tests {
             column: 10,
             call_type: CallType::Method,
             scope_hint: None,
-            source: EdgeSource::Ast,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
         };
 
         assert_eq!(edge.target, "target_func");

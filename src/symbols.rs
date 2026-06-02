@@ -28,7 +28,7 @@ impl SourceSet {
     }
 
     /// serde default for the legacy on-disk format that predates provenance.
-    fn tree_sitter_default() -> Self {
+    pub(crate) fn tree_sitter_default() -> Self {
         Self::TREE_SITTER
     }
 
