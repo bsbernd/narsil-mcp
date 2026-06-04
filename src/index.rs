@@ -29,7 +29,7 @@ use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
 use crate::search::{build_file_doc, generate_snippet, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
-use crate::symbols::{SourceSet, Symbol, SymbolKind};
+use crate::symbols::{SourceLine, SourceSet, Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
 
 /// Metadata about an indexed repository
@@ -686,6 +686,39 @@ impl CodeIntelEngine {
         status
     }
 
+    /// Index one symbol's signature into the embedding engine and, when neural
+    /// search is enabled, queue it for batch neural indexing. Skips symbols
+    /// without a signature (nothing to embed). `symbol.file_path` must already
+    /// be the repo-relative path.
+    fn index_symbol_embeddings(
+        &self,
+        symbol: &Symbol,
+        neural_docs: &mut Vec<crate::neural::NeuralDocument>,
+    ) {
+        let sig = match symbol.signature {
+            Some(ref sig) => sig,
+            None => return,
+        };
+        let symbol_id = format!("{}::{}", symbol.file_path, symbol.name);
+        self.embedding_engine.index_snippet(
+            symbol_id.clone(),
+            symbol.file_path.clone(),
+            sig.clone(),
+            symbol.start_line,
+            symbol.end_line,
+        );
+        if self.neural_engine.is_some() {
+            neural_docs.push(crate::neural::NeuralDocument {
+                id: symbol_id,
+                file_path: symbol.file_path.clone(),
+                content: sig.clone(),
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+                symbol_name: Some(symbol.name.clone()),
+            });
+        }
+    }
+
     async fn index_repos(&self) -> Result<()> {
         for repo_path in &self.repo_paths {
             if repo_path.exists() {
@@ -708,6 +741,15 @@ impl CodeIntelEngine {
         // expensive per-symbol embedding indexing — BM25 and call graph still
         // get rebuilt from the parsed files below.
         let symbols_cached = self.symbols.contains_key(&repo_name);
+
+        // C/C++ symbol augmentation (Phases 2/3): clangd/ccls documentSymbol and
+        // gtags definitions are folded into the tree-sitter baseline. Gated simply
+        // on the backends being enabled here — per-repo auto-enable lands in a
+        // later patch. Cached repos skip it with the rest of the re-index work.
+        let lsp = self.lsp_manager.clone().filter(|l| l.is_enabled());
+        let gtags = self.gtags_manager.clone();
+        let cxx_augment = !symbols_cached && (lsp.is_some() || gtags.is_some());
+        let mut cxx_groups: Vec<CxxFileSymbols> = Vec::new();
 
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
@@ -817,34 +859,24 @@ impl CodeIntelEngine {
                 .to_string();
 
             if !symbols_cached {
-                for mut symbol in parsed.symbols {
-                    symbol.file_path = relative_path.clone();
-
-                    // Index symbol into embedding engine for similarity search
-                    if let Some(ref sig) = symbol.signature {
-                        let symbol_id = format!("{}::{}", relative_path, symbol.name);
-                        self.embedding_engine.index_snippet(
-                            symbol_id.clone(),
-                            relative_path.clone(),
-                            sig.clone(),
-                            symbol.start_line,
-                            symbol.end_line,
-                        );
-
-                        // Collect for neural batch indexing if enabled
-                        if self.neural_engine.is_some() {
-                            neural_docs.push(crate::neural::NeuralDocument {
-                                id: symbol_id,
-                                file_path: relative_path.clone(),
-                                content: sig.clone(),
-                                start_line: symbol.start_line,
-                                end_line: symbol.end_line,
-                                symbol_name: Some(symbol.name.clone()),
-                            });
-                        }
+                if cxx_augment && matches!(parsed.language.as_str(), "C" | "C++") {
+                    // Queue the tree-sitter baseline for the async LSP/gtags pass
+                    // below; embeddings happen there once the symbols are merged.
+                    let mut symbols = parsed.symbols;
+                    for symbol in &mut symbols {
+                        symbol.file_path = relative_path.clone();
                     }
-
-                    symbols_vec.push(symbol);
+                    cxx_groups.push(CxxFileSymbols {
+                        abs_path: file_path.clone(),
+                        relative_path: relative_path.clone(),
+                        symbols,
+                    });
+                } else {
+                    for mut symbol in parsed.symbols {
+                        symbol.file_path = relative_path.clone();
+                        self.index_symbol_embeddings(&symbol, &mut neural_docs);
+                        symbols_vec.push(symbol);
+                    }
                 }
             }
 
@@ -856,6 +888,83 @@ impl CodeIntelEngine {
             if self.options.call_graph_enabled {
                 if let Some(tree) = parsed.tree {
                     trees_for_callgraph.push((relative_path, content, tree));
+                }
+            }
+        }
+
+        // Phases 2/3: augment the queued C/C++ files with clangd/ccls
+        // documentSymbol and gtags definitions. The LSP/gtags calls are async and
+        // cannot run inside the rayon parse closure, so they run here, after it.
+        // A small semaphore bounds in-flight files to overlap the servers and
+        // subprocesses without flooding a single LSP process. Runs before
+        // embedding finalisation so the merged symbols are embedded.
+        if !cxx_groups.is_empty() {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
+            let mut tasks = tokio::task::JoinSet::new();
+            for group in cxx_groups {
+                let permit = semaphore.clone().acquire_owned().await?;
+                let lsp = lsp.clone();
+                let gtags = gtags.clone();
+                let repo_path = path.to_path_buf();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let CxxFileSymbols {
+                        abs_path,
+                        relative_path,
+                        mut symbols,
+                    } = group;
+                    let lang = get_language_from_path(&abs_path.to_string_lossy());
+
+                    if let Some(lsp) = &lsp {
+                        for backend in lsp.active_cxx_backends() {
+                            match lsp.get_document_symbols(backend, &abs_path, &lang).await {
+                                Ok(mut lsp_symbols) => {
+                                    for symbol in &mut lsp_symbols {
+                                        symbol.file_path = relative_path.clone();
+                                    }
+                                    merge_symbols(&mut symbols, lsp_symbols, backend);
+                                }
+                                Err(e) => {
+                                    debug!("LSP documentSymbol failed for {:?}: {}", abs_path, e)
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(gtags) = &gtags {
+                        let gtags_symbols: Vec<Symbol> = gtags
+                            .list_file_symbols(&abs_path, &repo_path)
+                            .await
+                            .into_iter()
+                            .map(|(name, line)| Symbol {
+                                name,
+                                kind: SymbolKind::Unknown,
+                                file_path: relative_path.clone(),
+                                start_line: line,
+                                end_line: line,
+                                signature: None,
+                                qualified_name: None,
+                                doc_comment: None,
+                                confirmed_by: SourceSet::GTAGS,
+                                line_conflicts: Vec::new(),
+                            })
+                            .collect();
+                        merge_symbols(&mut symbols, gtags_symbols, SourceSet::GTAGS);
+                    }
+
+                    symbols
+                });
+            }
+
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok(file_symbols) => {
+                        for symbol in &file_symbols {
+                            self.index_symbol_embeddings(symbol, &mut neural_docs);
+                        }
+                        symbols_vec.extend(file_symbols);
+                    }
+                    Err(e) => warn!("C/C++ symbol augmentation task failed: {}", e),
                 }
             }
         }
@@ -9508,6 +9617,93 @@ mod dirs {
     }
 }
 
+/// Maximum line distance at which same-name symbols from different backends are
+/// treated as the same definition. Backends report different rows for one
+/// definition (tree-sitter = definition node, LSP = name token, gtags = tag
+/// line); a small window pairs them while leaving genuine overloads — which sit
+/// further apart — as separate symbols. Too wide merges adjacent overloads, too
+/// narrow duplicates one symbol.
+const SYMBOL_MATCH_WINDOW: usize = 3;
+
+/// Concurrent in-flight C/C++ files during the LSP/gtags augmentation pass.
+/// Kept small to overlap subprocesses and server round-trips without flooding a
+/// single clangd/ccls process.
+const CXX_AUGMENT_CONCURRENCY: usize = 6;
+
+/// One C/C++ file's tree-sitter baseline symbols, queued for the async LSP/gtags
+/// augmentation pass that cannot run inside the rayon parse closure.
+struct CxxFileSymbols {
+    abs_path: PathBuf,
+    relative_path: String,
+    symbols: Vec<Symbol>,
+}
+
+/// Merge one backend's `incoming` symbols into `existing`, keyed by (name, file)
+/// with nearest-line matching inside [`SYMBOL_MATCH_WINDOW`]. Mirrors
+/// `callgraph::CallGraph::fold_edge`: `confirmed_by` accumulates, priority
+/// ([`SourceSet::rank`]) wins the canonical location and metadata, and divergent
+/// lines are retained in `line_conflicts`. A symbol no prior backend saw is
+/// inserted standalone (genuine overloads stay separate).
+fn merge_symbols(existing: &mut Vec<Symbol>, incoming: Vec<Symbol>, source: SourceSet) {
+    for inc in incoming {
+        let best = existing
+            .iter_mut()
+            .filter(|sym| sym.name == inc.name && sym.file_path == inc.file_path)
+            .filter(|sym| sym.start_line.abs_diff(inc.start_line) <= SYMBOL_MATCH_WINDOW)
+            .min_by_key(|sym| sym.start_line.abs_diff(inc.start_line));
+
+        match best {
+            Some(sym) => fold_symbol(sym, inc, source),
+            None => {
+                let mut sym = inc;
+                sym.confirmed_by = source;
+                sym.line_conflicts = Vec::new();
+                existing.push(sym);
+            }
+        }
+    }
+}
+
+/// Fold a `source` confirmation into an existing symbol. Priority decides the
+/// canonical location and which source's metadata is kept; the loser's line is
+/// retained in `line_conflicts`. A lower-priority source never erases richer
+/// metadata (e.g. gtags supplies only name+line), so its fields are taken only
+/// when it outranks the current confirmer and actually carries them.
+fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
+    let old_canonical = existing.confirmed_by.highest();
+    existing.confirmed_by.insert(source);
+
+    if source.rank() > old_canonical.rank() {
+        if existing.start_line != incoming.start_line {
+            existing.line_conflicts.push(SourceLine {
+                source: old_canonical,
+                line: existing.start_line,
+            });
+        }
+        existing.start_line = incoming.start_line;
+        existing.end_line = incoming.end_line;
+
+        // Metadata follows the highest-priority source that supplies it.
+        if incoming.kind != SymbolKind::Unknown {
+            existing.kind = incoming.kind;
+        }
+        if incoming.signature.is_some() {
+            existing.signature = incoming.signature;
+        }
+        if incoming.qualified_name.is_some() {
+            existing.qualified_name = incoming.qualified_name;
+        }
+        if incoming.doc_comment.is_some() {
+            existing.doc_comment = incoming.doc_comment;
+        }
+    } else if incoming.start_line != existing.start_line {
+        existing.line_conflicts.push(SourceLine {
+            source,
+            line: incoming.start_line,
+        });
+    }
+}
+
 fn get_language_from_path(path: &str) -> String {
     match path.rsplit('.').next() {
         Some("rs") => "rust",
@@ -9534,6 +9730,100 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    fn sym(name: &str, line: usize, source: SourceSet) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: if source == SourceSet::GTAGS {
+                SymbolKind::Unknown
+            } else {
+                SymbolKind::Function
+            },
+            file_path: "a.c".to_string(),
+            start_line: line,
+            end_line: line,
+            signature: (source != SourceSet::GTAGS).then(|| format!("sig@{}", line)),
+            qualified_name: None,
+            doc_comment: None,
+            confirmed_by: source,
+            line_conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_higher_priority_wins_line_and_records_conflict() {
+        // tree-sitter at 10, clangd at 11 within the window: clangd wins the
+        // canonical line, tree-sitter's line is retained as a conflict.
+        let mut existing = vec![sym("foo", 10, SourceSet::TREE_SITTER)];
+        merge_symbols(
+            &mut existing,
+            vec![sym("foo", 11, SourceSet::CLANGD)],
+            SourceSet::CLANGD,
+        );
+
+        assert_eq!(existing.len(), 1);
+        let foo = &existing[0];
+        assert_eq!(foo.start_line, 11);
+        assert!(foo.confirmed_by.contains(SourceSet::TREE_SITTER));
+        assert!(foo.confirmed_by.contains(SourceSet::CLANGD));
+        assert_eq!(foo.line_conflicts.len(), 1);
+        assert_eq!(foo.line_conflicts[0].source, SourceSet::TREE_SITTER);
+        assert_eq!(foo.line_conflicts[0].line, 10);
+    }
+
+    #[test]
+    fn merge_lower_priority_keeps_line_but_adds_confirmer() {
+        // gtags ranks below tree-sitter: it confirms existence and records its
+        // divergent line, but never wins the canonical line or erases metadata.
+        let mut existing = vec![sym("foo", 10, SourceSet::TREE_SITTER)];
+        merge_symbols(
+            &mut existing,
+            vec![sym("foo", 9, SourceSet::GTAGS)],
+            SourceSet::GTAGS,
+        );
+
+        let foo = &existing[0];
+        assert_eq!(foo.start_line, 10);
+        assert_eq!(foo.kind, SymbolKind::Function);
+        assert_eq!(foo.signature.as_deref(), Some("sig@10"));
+        assert!(foo.confirmed_by.contains(SourceSet::GTAGS));
+        assert_eq!(
+            foo.line_conflicts,
+            vec![SourceLine {
+                source: SourceSet::GTAGS,
+                line: 9
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_beyond_window_keeps_overloads_separate() {
+        // Two same-name definitions far apart are distinct overloads, not a
+        // single symbol two backends disagree about.
+        let mut existing = vec![sym("foo", 10, SourceSet::TREE_SITTER)];
+        merge_symbols(
+            &mut existing,
+            vec![sym("foo", 40, SourceSet::CLANGD)],
+            SourceSet::CLANGD,
+        );
+
+        assert_eq!(existing.len(), 2);
+    }
+
+    #[test]
+    fn merge_inserts_symbol_no_prior_backend_saw() {
+        // A macro-defined symbol only gtags found is added standalone.
+        let mut existing = vec![sym("foo", 10, SourceSet::TREE_SITTER)];
+        merge_symbols(
+            &mut existing,
+            vec![sym("BAR", 5, SourceSet::GTAGS)],
+            SourceSet::GTAGS,
+        );
+
+        assert_eq!(existing.len(), 2);
+        let bar = existing.iter().find(|s| s.name == "BAR").unwrap();
+        assert_eq!(bar.confirmed_by, SourceSet::GTAGS);
     }
 
     #[test]
