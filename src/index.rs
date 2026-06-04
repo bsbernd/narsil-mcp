@@ -719,6 +719,28 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Backends enabled for cross-validation. tree-sitter is always present;
+    /// the C/C++ LSP backends and gtags count only for C/C++ data (`is_cxx`).
+    /// Gates provenance annotations — a divergence is only meaningful when at
+    /// least two backends were enabled. Per-repo refinement (compile_commands /
+    /// GTAGS db) is a later patch.
+    fn enabled_backends(&self, is_cxx: bool) -> SourceSet {
+        let mut set = SourceSet::TREE_SITTER;
+        if is_cxx {
+            if let Some(lsp) = &self.lsp_manager {
+                if lsp.is_enabled() {
+                    for backend in lsp.active_cxx_backends() {
+                        set.insert(backend);
+                    }
+                }
+            }
+            if self.gtags_manager.is_some() {
+                set.insert(SourceSet::GTAGS);
+            }
+        }
+        set
+    }
+
     async fn index_repos(&self) -> Result<()> {
         for repo_path in &self.repo_paths {
             if repo_path.exists() {
@@ -1704,12 +1726,23 @@ impl CodeIntelEngine {
         for (kind, syms) in by_kind {
             output.push_str(&format!("## {:?}s\n\n", kind));
             for sym in syms {
+                let is_cxx = matches!(get_language_from_path(&sym.file_path).as_str(), "c" | "cpp");
+                let provenance = render_provenance(
+                    ProvenanceSubject::Symbol,
+                    self.enabled_backends(is_cxx),
+                    sym.confirmed_by,
+                    sym.start_line,
+                    &sym.line_conflicts,
+                )
+                .map(|annotation| format!(" _({})_", annotation))
+                .unwrap_or_default();
                 output.push_str(&format!(
-                    "- **{}** (`{}:{}`) {}\n",
+                    "- **{}** (`{}:{}`) {}{}\n",
                     sym.name,
                     sym.file_path,
                     sym.start_line,
-                    sym.signature.as_deref().unwrap_or("")
+                    sym.signature.as_deref().unwrap_or(""),
+                    provenance
                 ));
             }
             output.push('\n');
@@ -1764,6 +1797,19 @@ impl CodeIntelEngine {
             symbol.start_line, symbol.end_line
         ));
         output.push_str(&format!("**Kind**: {:?}\n\n", symbol.kind));
+        let is_cxx = matches!(
+            get_language_from_path(&symbol.file_path).as_str(),
+            "c" | "cpp"
+        );
+        if let Some(provenance) = render_provenance(
+            ProvenanceSubject::Symbol,
+            self.enabled_backends(is_cxx),
+            symbol.confirmed_by,
+            symbol.start_line,
+            &symbol.line_conflicts,
+        ) {
+            output.push_str(&format!("**Provenance**: {}\n\n", provenance));
+        }
 
         output.push_str("```");
         output.push_str(get_language_id(&symbol.file_path));
@@ -3688,9 +3734,6 @@ impl CodeIntelEngine {
                                         .copied()
                                         .unwrap_or(SourceSet::CLANGD);
 
-                                    let mut lsp_count = 0usize;
-                                    let mut overlap_count = 0usize;
-
                                     for (rel_path, ref_line, _content) in &lsp_refs {
                                         let key = (rel_path.clone(), *ref_line);
                                         if ast_keys.contains(&key) {
@@ -3702,7 +3745,6 @@ impl CodeIntelEngine {
                                                     edge.confirmed_by.insert(lsp_bit);
                                                 }
                                             }
-                                            overlap_count += 1;
                                         } else {
                                             // LSP-only edge: resolve enclosing function.
                                             let caller_name = Self::enclosing_function_at(
@@ -3721,18 +3763,8 @@ impl CodeIntelEngine {
                                                 confirmed_by: lsp_bit,
                                                 line_conflicts: Vec::new(),
                                             });
-                                            lsp_count += 1;
                                         }
                                     }
-
-                                    let ast_only = callers
-                                        .iter()
-                                        .filter(|e| e.confirmed_by == SourceSet::TREE_SITTER)
-                                        .count();
-                                    output.push_str(&format!(
-                                        "*Sources: {} AST-only, {} LSP-only, {} confirmed by both*\n\n",
-                                        ast_only, lsp_count, overlap_count
-                                    ));
                                 }
                             }
                         }
@@ -3742,19 +3774,22 @@ impl CodeIntelEngine {
 
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
             for caller in &callers {
-                let tag = if caller.confirmed_by.contains(SourceSet::TREE_SITTER)
-                    && caller.confirmed_by.count() >= 2
-                {
-                    // Confirmed by tree-sitter and at least one other backend.
-                    ""
-                } else if caller.confirmed_by == SourceSet::TREE_SITTER {
-                    " `[ast]`"
-                } else {
-                    " `[LSP]`"
-                };
+                let is_cxx = matches!(
+                    get_language_from_path(&caller.file_path).as_str(),
+                    "c" | "cpp"
+                );
+                let provenance = render_provenance(
+                    ProvenanceSubject::CallEdge,
+                    self.enabled_backends(is_cxx),
+                    caller.confirmed_by,
+                    caller.line,
+                    &caller.line_conflicts,
+                )
+                .map(|annotation| format!(" — {}", annotation))
+                .unwrap_or_default();
                 output.push_str(&format!(
                     "- `{}` at `{}:{}`{} ({:?})\n",
-                    caller.target, caller.file_path, caller.line, tag, caller.call_type
+                    caller.target, caller.file_path, caller.line, provenance, caller.call_type
                 ));
             }
         }
@@ -9824,6 +9859,78 @@ struct CxxFileSymbols {
     symbols: Vec<Symbol>,
 }
 
+/// What a provenance annotation describes. Only the gtags-only wording differs:
+/// gtags reports references, not resolved calls.
+#[derive(Clone, Copy)]
+enum ProvenanceSubject {
+    Symbol,
+    CallEdge,
+}
+
+/// All known backends, highest priority first — iterated to list which *enabled*
+/// backends failed to confirm a datum.
+const PROVENANCE_BACKENDS: [SourceSet; 4] = [
+    SourceSet::CLANGD,
+    SourceSet::CCLS,
+    SourceSet::TREE_SITTER,
+    SourceSet::GTAGS,
+];
+
+/// Render a backend-provenance annotation, or `None` when nothing is worth
+/// surfacing. Annotates only on divergence: returns `None` when fewer than two
+/// backends were enabled for the repo (no cross-validation possible) or when
+/// every enabled backend confirmed the datum with no line conflict. Otherwise
+/// it names the disagreement so the consumer reasons about it instead of
+/// trusting one backend blindly.
+fn render_provenance(
+    subject: ProvenanceSubject,
+    enabled: SourceSet,
+    confirmed: SourceSet,
+    canonical_line: usize,
+    conflicts: &[SourceLine],
+) -> Option<String> {
+    if enabled.count() < 2 {
+        return None;
+    }
+
+    // Enabled backends that did not confirm this datum.
+    let mut missing = SourceSet::empty();
+    for backend in PROVENANCE_BACKENDS {
+        if enabled.contains(backend) && !confirmed.contains(backend) {
+            missing.insert(backend);
+        }
+    }
+    if missing.is_empty() && conflicts.is_empty() {
+        return None; // full agreement, no dissent — silent
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if matches!(subject, ProvenanceSubject::CallEdge) && confirmed == SourceSet::GTAGS {
+        // global -rx reports references, not resolved calls.
+        parts.push("reference-derived (gtags) — unverified call".to_string());
+    } else if missing.is_empty() {
+        parts.push(format!("confirmed by {}", confirmed.labels().join(", ")));
+    } else {
+        parts.push(format!(
+            "confirmed by {}; not by {}",
+            confirmed.labels().join(", "),
+            missing.labels().join(", ")
+        ));
+    }
+
+    if !conflicts.is_empty() {
+        let label = |source: SourceSet| source.labels().first().copied().unwrap_or("?");
+        let mut entries = vec![format!("{} {}", label(confirmed.highest()), canonical_line)];
+        for conflict in conflicts {
+            entries.push(format!("{} {}", label(conflict.source), conflict.line));
+        }
+        parts.push(format!("WARNING line disagreement: {}", entries.join(", ")));
+    }
+
+    Some(parts.join("; "))
+}
+
 /// Merge one backend's `incoming` symbols into `existing`, keyed by (name, file)
 /// with nearest-line matching inside [`SYMBOL_MATCH_WINDOW`]. Mirrors
 /// `callgraph::CallGraph::fold_edge`: `confirmed_by` accumulates, priority
@@ -10010,6 +10117,77 @@ mod tests {
         assert_eq!(existing.len(), 2);
         let bar = existing.iter().find(|s| s.name == "BAR").unwrap();
         assert_eq!(bar.confirmed_by, SourceSet::GTAGS);
+    }
+
+    fn source_set(bits: &[SourceSet]) -> SourceSet {
+        let mut set = SourceSet::empty();
+        for bit in bits {
+            set.insert(*bit);
+        }
+        set
+    }
+
+    #[test]
+    fn provenance_silent_without_cross_validation() {
+        // Only one backend enabled — nothing to cross-validate against.
+        let out = render_provenance(
+            ProvenanceSubject::Symbol,
+            SourceSet::TREE_SITTER,
+            SourceSet::TREE_SITTER,
+            10,
+            &[],
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn provenance_silent_on_full_agreement() {
+        let enabled = source_set(&[SourceSet::TREE_SITTER, SourceSet::CLANGD]);
+        assert!(render_provenance(ProvenanceSubject::Symbol, enabled, enabled, 10, &[]).is_none());
+    }
+
+    #[test]
+    fn provenance_reports_existence_disagreement() {
+        let enabled = source_set(&[SourceSet::TREE_SITTER, SourceSet::CLANGD, SourceSet::CCLS]);
+        let msg = render_provenance(
+            ProvenanceSubject::Symbol,
+            enabled,
+            SourceSet::CLANGD,
+            10,
+            &[],
+        )
+        .unwrap();
+        assert!(msg.contains("confirmed by clangd"));
+        assert!(msg.contains("not by"));
+        assert!(msg.contains("ccls") && msg.contains("tree-sitter"));
+    }
+
+    #[test]
+    fn provenance_flags_gtags_only_edge_as_unverified() {
+        let enabled = source_set(&[SourceSet::TREE_SITTER, SourceSet::CLANGD, SourceSet::GTAGS]);
+        let msg = render_provenance(
+            ProvenanceSubject::CallEdge,
+            enabled,
+            SourceSet::GTAGS,
+            10,
+            &[],
+        )
+        .unwrap();
+        assert!(msg.contains("reference-derived (gtags)"));
+    }
+
+    #[test]
+    fn provenance_reports_line_disagreement() {
+        let enabled = source_set(&[SourceSet::TREE_SITTER, SourceSet::CLANGD]);
+        let conflicts = vec![SourceLine {
+            source: SourceSet::TREE_SITTER,
+            line: 9,
+        }];
+        let msg =
+            render_provenance(ProvenanceSubject::Symbol, enabled, enabled, 10, &conflicts).unwrap();
+        assert!(msg.contains("WARNING line disagreement"));
+        assert!(msg.contains("clangd 10"));
+        assert!(msg.contains("tree-sitter 9"));
     }
 
     #[test]
