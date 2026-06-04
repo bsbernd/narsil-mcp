@@ -9279,6 +9279,19 @@ fn load_compile_commands_filter(
             }
         };
 
+        // A present-but-empty compile_commands.json (e.g. `[]`) parses fine yet,
+        // under --use-compile-commands, silently filters out every C/C++ source
+        // file, leaving only headers indexed. Surface it loudly.
+        if arr.is_empty() {
+            warn!(
+                "compile_commands.json at {:?} exists but has 0 entries ({} bytes); \
+                 with --use-compile-commands all C/C++ source files will be skipped \
+                 (headers still indexed). Regenerate it or drop --use-compile-commands.",
+                full_path,
+                content.len()
+            );
+        }
+
         let json_parent = full_path.parent().map(Path::to_path_buf);
         let count_before = result.len();
         let mut unresolved = 0usize;
