@@ -126,6 +126,40 @@ impl GtagsManager {
         }
     }
 
+    /// Refresh an existing GTAGS database incrementally (`global -u`). Writes
+    /// into the repo tree, so callers gate it behind opt-in. Returns true on
+    /// success; no-op returning false when the `gtags` toolchain is missing.
+    pub async fn update_database(&self, repo_path: &Path) -> bool {
+        if !gtags_binary_present() {
+            return false;
+        }
+        info!(
+            "gtags: refreshing GTAGS database in {:?} (global -u)",
+            repo_path
+        );
+        match tokio::process::Command::new("global")
+            .arg("-u")
+            .current_dir(repo_path)
+            .output()
+            .await
+        {
+            Err(e) => {
+                warn!("gtags: failed to run global -u in {:?}: {}", repo_path, e);
+                false
+            }
+            Ok(out) => {
+                if !out.status.success() {
+                    warn!(
+                        "gtags: global -u failed in {:?}: {}",
+                        repo_path,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                out.status.success()
+            }
+        }
+    }
+
     /// Parse `global -x -f` output into (name, line) pairs. Lines that lack a
     /// numeric line column are skipped.
     fn parse_file_symbols(stdout: &[u8]) -> Vec<(String, usize)> {

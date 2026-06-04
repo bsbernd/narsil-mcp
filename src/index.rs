@@ -1118,6 +1118,28 @@ impl CodeIntelEngine {
                 }
             }
         }
+        // An existing GTAGS predating the current sources drifts its line numbers,
+        // which the line-window symbol merge cannot pair — silently degrading gtags
+        // cross-validation. Refresh it (writes into the repo, so opt-in via
+        // --gtags-generate) before the augment runs, else warn.
+        if cxx_present
+            && self.options.gtags_intent != BackendIntent::Off
+            && path.join("GTAGS").exists()
+            && gtags_database_stale(path, &files)
+        {
+            if self.options.gtags_generate && crate::gtags::gtags_binary_present() {
+                if let Some(gtags) = &self.gtags_manager {
+                    gtags.update_database(path).await;
+                }
+            } else {
+                warn!(
+                    "gtags: GTAGS in {:?} is older than indexed sources; symbol \
+                     cross-validation will be degraded. Run `global -u` (or pass \
+                     --gtags-generate to refresh automatically).",
+                    path
+                );
+            }
+        }
         let lsp_for_repo = (cxx_present && self.lsp_repo_enabled(path))
             .then(|| self.lsp_manager.clone())
             .flatten();
@@ -9583,6 +9605,27 @@ impl CodeIntelEngine {
 
 fn is_c_source_ext(ext: &str) -> bool {
     matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")
+}
+
+/// True when `repo_path`'s GTAGS database is older than the newest indexed
+/// C/C++ source. A stale database reports drifted line numbers that the
+/// line-window symbol merge cannot pair, silently dropping gtags confirmation.
+fn gtags_database_stale(repo_path: &Path, files: &[PathBuf]) -> bool {
+    let gtags_mtime = match std::fs::metadata(repo_path.join("GTAGS")).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime,
+        Err(_) => return false,
+    };
+    files.iter().any(|file| {
+        let is_cxx = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| is_c_source_ext(e) || is_c_header_ext(e));
+        is_cxx
+            && std::fs::metadata(file)
+                .and_then(|m| m.modified())
+                .map(|mtime| mtime > gtags_mtime)
+                .unwrap_or(false)
+    })
 }
 
 /// sha256 hex of file content, matching the `content_hash` persisted in
