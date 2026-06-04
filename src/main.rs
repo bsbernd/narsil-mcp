@@ -117,6 +117,13 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_LSP_CXX_BACKENDS", default_value = "auto")]
     lsp_cxx_backends: String,
 
+    /// Per-request timeout (ms) for the index-time C/C++ documentSymbol augment.
+    /// clangd/ccls parse a translation unit on first open, which for large files
+    /// exceeds the interactive timeout; raise this if augmentation is missing on
+    /// big sources. Only takes effect with --lsp.
+    #[arg(long, env = "NARSIL_LSP_INDEX_TIMEOUT_MS", default_value = "60000")]
+    lsp_index_timeout_ms: u64,
+
     /// Force-enable GNU Global (gtags) as a C/C++ reference backend, even when
     /// global(1) is not detected. By default gtags is auto-enabled whenever
     /// global(1) is found on PATH. Returning results still needs a GTAGS database.
@@ -388,6 +395,7 @@ async fn main() -> Result<()> {
     };
     if lsp_enabled {
         lsp_config.enabled = true;
+        lsp_config.index_timeout_ms = server_args.lsp_index_timeout_ms;
         // Enable LSP for common languages
         for lang in [
             "rust",

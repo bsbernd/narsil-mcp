@@ -58,8 +58,13 @@ pub struct LspConfig {
     pub enabled_languages: HashMap<String, bool>,
     /// Custom LSP server paths
     pub server_paths: HashMap<String, PathBuf>,
-    /// Request timeout in milliseconds
+    /// Request timeout in milliseconds (interactive requests)
     pub timeout_ms: u64,
+    /// Request timeout for the index-time documentSymbol augment. clangd/ccls
+    /// must parse a translation unit on first open, which for a large C/C++
+    /// file far exceeds the interactive bound; this batch step can afford to
+    /// wait.
+    pub index_timeout_ms: u64,
     /// Enable LSP globally
     pub enabled: bool,
     /// Which C/C++ LSP backends to start (defaults to clangd only)
@@ -74,6 +79,7 @@ impl Default for LspConfig {
             // Phase B1: Reduced from 5000ms to 1500ms for better responsiveness
             // LSP requests that don't complete within 1.5s are unlikely to complete usefully
             timeout_ms: 1500,
+            index_timeout_ms: 60000,
             enabled: false,
             cxx_lsp_backends: vec![CxxLspBackend::Clangd],
         }
@@ -296,6 +302,20 @@ impl LspManager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        self.send_request_with_timeout(process, method, params, self.config.timeout_ms)
+            .await
+    }
+
+    /// Like `send_request` but with an explicit timeout, for the index-time
+    /// documentSymbol augment whose first-open TU parse far exceeds the
+    /// interactive bound.
+    async fn send_request_with_timeout(
+        &self,
+        process: &LspProcess,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
         let id = process.next_id.fetch_add(1, Ordering::SeqCst);
 
         let message = LspMessage {
@@ -321,7 +341,7 @@ impl LspManager {
         }
 
         // Wait for response with timeout
-        let response = timeout(Duration::from_millis(self.config.timeout_ms), rx)
+        let response = timeout(Duration::from_millis(timeout_ms), rx)
             .await
             .context("LSP request timeout")?
             .context("Response channel closed")?
@@ -871,7 +891,12 @@ impl LspManager {
         let params_value = serde_json::to_value(&params)?;
         self.did_open(&server, language, file_path).await.ok();
         let response = self
-            .send_request(&server, "textDocument/documentSymbol", params_value)
+            .send_request_with_timeout(
+                &server,
+                "textDocument/documentSymbol",
+                params_value,
+                self.config.index_timeout_ms,
+            )
             .await;
         self.did_close(&server, file_path).await.ok();
         let response = response?;
