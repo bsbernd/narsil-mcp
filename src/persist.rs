@@ -45,12 +45,19 @@ pub struct PersistedIndex {
     pub updated_at: u64,
     pub repo_root: PathBuf,
     pub files: HashMap<PathBuf, FileMetadata>,
+    /// git HEAD commit hash at index time, when the repo is a git checkout.
+    /// Compared on startup to rebuild symbols after a checkout/pull.
+    pub head_hash: Option<String>,
+    /// sha256 of the resolved compile_commands.json at index time, when
+    /// compile_commands filtering is on. Detects a CDB regen with no commit.
+    pub cdb_hash: Option<String>,
 }
 
 impl PersistedIndex {
+    // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 3;
+    const CURRENT_VERSION: u32 = 4;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -64,6 +71,8 @@ impl PersistedIndex {
             updated_at: now,
             repo_root,
             files: HashMap::new(),
+            head_hash: None,
+            cdb_hash: None,
         }
     }
 
