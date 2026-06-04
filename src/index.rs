@@ -104,6 +104,25 @@ const SECURITY_REPORT_HEURISTIC_HINT: &str = r#"> **Heuristic severities — ver
 
 "#;
 
+/// Per-backend enable intent recorded at startup. `Auto` defers the decision to
+/// each repository — LSP on a `compile_commands.json`, gtags on a GTAGS db — so
+/// a multi-repo session can enable a backend for the repos that warrant it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendIntent {
+    /// Forced on (`--lsp` / `--gtags`): augment every C/C++ repo.
+    On,
+    /// Forced off (`--no-lsp` / `--no-gtags`).
+    Off,
+    /// Decide per repo from what it ships.
+    #[default]
+    Auto,
+}
+
+/// Upper bound on file count for `--gtags-generate`: building a GTAGS database
+/// on a very large tree (e.g. the kernel) is slow and writes into the repo, so
+/// auto-generation is skipped above this size.
+const GTAGS_GENERATE_MAX_FILES: usize = 50_000;
+
 /// Options for configuring the CodeIntelEngine
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -140,6 +159,13 @@ pub struct EngineOptions {
     pub include: Vec<String>,
     /// Enable GNU Global (gtags) as an additional C/C++ reference backend
     pub gtags_enabled: bool,
+    /// Per-repo intent for LSP index-time augmentation (On/Off/Auto).
+    pub lsp_intent: BackendIntent,
+    /// Per-repo intent for gtags index-time augmentation (On/Off/Auto).
+    pub gtags_intent: BackendIntent,
+    /// Build a GTAGS database (via the `gtags` binary) for C/C++ repos that lack
+    /// one. Writes into the repo, so opt-in; size-gated by GTAGS_GENERATE_MAX_FILES.
+    pub gtags_generate: bool,
     /// Enable RDF knowledge graph storage (requires graph feature)
     #[cfg(feature = "graph")]
     pub graph_enabled: bool,
@@ -166,6 +192,9 @@ impl Default for EngineOptions {
             compile_commands_path: None,
             include: Vec::new(),
             gtags_enabled: false,
+            lsp_intent: BackendIntent::default(),
+            gtags_intent: BackendIntent::default(),
+            gtags_generate: false,
             #[cfg(feature = "graph")]
             graph_enabled: false,
             #[cfg(feature = "graph")]
@@ -719,22 +748,53 @@ impl CodeIntelEngine {
         }
     }
 
-    /// Backends enabled for cross-validation. tree-sitter is always present;
-    /// the C/C++ LSP backends and gtags count only for C/C++ data (`is_cxx`).
-    /// Gates provenance annotations — a divergence is only meaningful when at
-    /// least two backends were enabled. Per-repo refinement (compile_commands /
-    /// GTAGS db) is a later patch.
-    fn enabled_backends(&self, is_cxx: bool) -> SourceSet {
+    /// Does `repo_path` ship a compile_commands.json clangd can read? Honors an
+    /// explicit `--compile-commands-path`, else the conventional locations.
+    fn compile_commands_present(&self, repo_path: &Path) -> bool {
+        if let Some(rel) = &self.options.compile_commands_path {
+            return repo_path.join(rel).exists();
+        }
+        repo_path.join("compile_commands.json").exists()
+            || repo_path.join("build/compile_commands.json").exists()
+    }
+
+    /// Whether LSP augmentation applies to `repo_path` given the recorded intent
+    /// and what the repo ships. Does not test for C/C++ presence — callers gate
+    /// that per file/symbol.
+    fn lsp_repo_enabled(&self, repo_path: &Path) -> bool {
+        self.lsp_manager.as_ref().is_some_and(|l| l.is_enabled())
+            && match self.options.lsp_intent {
+                BackendIntent::On => true,
+                BackendIntent::Off => false,
+                BackendIntent::Auto => self.compile_commands_present(repo_path),
+            }
+    }
+
+    /// Whether gtags augmentation applies to `repo_path`. A GTAGS database is
+    /// required even when intent is `On` (global cannot query without one);
+    /// `On` only forces the manager to exist at startup.
+    fn gtags_repo_enabled(&self, repo_path: &Path) -> bool {
+        self.gtags_manager.is_some()
+            && self.options.gtags_intent != BackendIntent::Off
+            && repo_path.join("GTAGS").exists()
+    }
+
+    /// Backends enabled for cross-validation on `repo_path`. tree-sitter is
+    /// always present; the C/C++ LSP backends and gtags count only for C/C++
+    /// data (`is_cxx`) and only when this repo actually enabled them. Gates
+    /// provenance annotations — a divergence is only meaningful when at least
+    /// two backends were enabled.
+    fn enabled_backends_for_repo(&self, repo_path: &Path, is_cxx: bool) -> SourceSet {
         let mut set = SourceSet::TREE_SITTER;
         if is_cxx {
-            if let Some(lsp) = &self.lsp_manager {
-                if lsp.is_enabled() {
+            if self.lsp_repo_enabled(repo_path) {
+                if let Some(lsp) = &self.lsp_manager {
                     for backend in lsp.active_cxx_backends() {
                         set.insert(backend);
                     }
                 }
             }
-            if self.gtags_manager.is_some() {
+            if self.gtags_repo_enabled(repo_path) {
                 set.insert(SourceSet::GTAGS);
             }
         }
@@ -765,12 +825,16 @@ impl CodeIntelEngine {
         let symbols_cached = self.symbols.contains_key(&repo_name);
 
         // C/C++ symbol augmentation (Phases 2/3): clangd/ccls documentSymbol and
-        // gtags definitions are folded into the tree-sitter baseline. Gated simply
-        // on the backends being enabled here — per-repo auto-enable lands in a
-        // later patch. Cached repos skip it with the rest of the re-index work.
-        let lsp = self.lsp_manager.clone().filter(|l| l.is_enabled());
-        let gtags = self.gtags_manager.clone();
-        let cxx_augment = !symbols_cached && (lsp.is_some() || gtags.is_some());
+        // gtags definitions are folded into the tree-sitter baseline. Whether a
+        // backend actually runs is decided per repo *after* parsing (it needs the
+        // repo's language set and its compile_commands.json / GTAGS db); here we
+        // only decide whether to defer C/C++ symbols for that later pass. Cached
+        // repos skip it with the rest of the re-index work.
+        let lsp_candidate = self.lsp_manager.as_ref().is_some_and(|l| l.is_enabled())
+            && self.options.lsp_intent != BackendIntent::Off;
+        let gtags_candidate =
+            self.gtags_manager.is_some() && self.options.gtags_intent != BackendIntent::Off;
+        let cxx_augment = !symbols_cached && (lsp_candidate || gtags_candidate);
         let mut cxx_groups: Vec<CxxFileSymbols> = Vec::new();
 
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
@@ -914,19 +978,57 @@ impl CodeIntelEngine {
             }
         }
 
+        // Now that parsing has revealed the language set, decide per repo which
+        // backends actually run (Auto needs compile_commands.json / a GTAGS db).
+        // gtags can build its database on demand first, size-gated, since it
+        // writes into the repo tree.
+        let cxx_present = languages.contains_key("C") || languages.contains_key("C++");
+        if cxx_present
+            && self.options.gtags_generate
+            && self.options.gtags_intent != BackendIntent::Off
+            && !path.join("GTAGS").exists()
+        {
+            if file_count > GTAGS_GENERATE_MAX_FILES {
+                info!(
+                    "gtags: skip auto-generate for {} ({} files > {} limit)",
+                    repo_name, file_count, GTAGS_GENERATE_MAX_FILES
+                );
+            } else if crate::gtags::gtags_binary_present() {
+                if let Some(gtags) = &self.gtags_manager {
+                    gtags.ensure_database(path).await;
+                }
+            }
+        }
+        let lsp_for_repo = (cxx_present && self.lsp_repo_enabled(path))
+            .then(|| self.lsp_manager.clone())
+            .flatten();
+        let gtags_for_repo = (cxx_present && self.gtags_repo_enabled(path))
+            .then(|| self.gtags_manager.clone())
+            .flatten();
+
         // Phases 2/3: augment the queued C/C++ files with clangd/ccls
         // documentSymbol and gtags definitions. The LSP/gtags calls are async and
         // cannot run inside the rayon parse closure, so they run here, after it.
         // A small semaphore bounds in-flight files to overlap the servers and
         // subprocesses without flooding a single LSP process. Runs before
         // embedding finalisation so the merged symbols are embedded.
-        if !cxx_groups.is_empty() {
+        if !cxx_groups.is_empty() && lsp_for_repo.is_none() && gtags_for_repo.is_none() {
+            // C/C++ files were deferred but this repo enabled no backend (no
+            // compile_commands.json / GTAGS db, or intent Off): embed and store
+            // the tree-sitter baseline unchanged.
+            for group in cxx_groups {
+                for symbol in &group.symbols {
+                    self.index_symbol_embeddings(symbol, &mut neural_docs);
+                }
+                symbols_vec.extend(group.symbols);
+            }
+        } else if !cxx_groups.is_empty() {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
             let mut tasks = tokio::task::JoinSet::new();
             for group in cxx_groups {
                 let permit = semaphore.clone().acquire_owned().await?;
-                let lsp = lsp.clone();
-                let gtags = gtags.clone();
+                let lsp = lsp_for_repo.clone();
+                let gtags = gtags_for_repo.clone();
                 let repo_path = path.to_path_buf();
                 tasks.spawn(async move {
                     let _permit = permit;
@@ -1071,10 +1173,10 @@ impl CodeIntelEngine {
         // gtags references. Same enable gate as the symbol pass; the baseline
         // graph built above provides the nodes merge_edges folds edges onto.
         if self.options.call_graph_enabled
-            && (lsp.is_some() || gtags.is_some())
+            && (lsp_for_repo.is_some() || gtags_for_repo.is_some())
             && self.call_graphs.contains_key(&repo_name)
         {
-            self.augment_call_graph_cxx(&repo_name, path, &lsp, &gtags)
+            self.augment_call_graph_cxx(&repo_name, path, &lsp_for_repo, &gtags_for_repo)
                 .await;
         }
 
@@ -1723,13 +1825,14 @@ impl CodeIntelEngine {
             by_kind.entry(symbol.kind.clone()).or_default().push(symbol);
         }
 
+        let repo_path = PathBuf::from(&repo);
         for (kind, syms) in by_kind {
             output.push_str(&format!("## {:?}s\n\n", kind));
             for sym in syms {
                 let is_cxx = matches!(get_language_from_path(&sym.file_path).as_str(), "c" | "cpp");
                 let provenance = render_provenance(
                     ProvenanceSubject::Symbol,
-                    self.enabled_backends(is_cxx),
+                    self.enabled_backends_for_repo(&repo_path, is_cxx),
                     sym.confirmed_by,
                     sym.start_line,
                     &sym.line_conflicts,
@@ -1803,7 +1906,7 @@ impl CodeIntelEngine {
         );
         if let Some(provenance) = render_provenance(
             ProvenanceSubject::Symbol,
-            self.enabled_backends(is_cxx),
+            self.enabled_backends_for_repo(&repo_path, is_cxx),
             symbol.confirmed_by,
             symbol.start_line,
             &symbol.line_conflicts,
@@ -3780,7 +3883,7 @@ impl CodeIntelEngine {
                 );
                 let provenance = render_provenance(
                     ProvenanceSubject::CallEdge,
-                    self.enabled_backends(is_cxx),
+                    self.enabled_backends_for_repo(&repo_path, is_cxx),
                     caller.confirmed_by,
                     caller.line,
                     &caller.line_conflicts,

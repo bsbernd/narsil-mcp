@@ -105,6 +105,12 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_LSP")]
     lsp: bool,
 
+    /// Force-disable LSP even when a C/C++ language server is present on PATH.
+    /// Without this, LSP is auto-enabled for C/C++ repos that ship a
+    /// compile_commands.json whenever clangd or ccls is installed.
+    #[arg(long, env = "NARSIL_NO_LSP")]
+    no_lsp: bool,
+
     /// C/C++ LSP backends to start: "auto" probes PATH for clangd and ccls and
     /// starts whichever are installed; a comma-separated subset (e.g. "clangd",
     /// "ccls", "clangd,ccls") pins specific backends. Only takes effect with --lsp.
@@ -120,6 +126,12 @@ struct ServerArgs {
     /// Force-disable gtags even when global(1) is present on PATH.
     #[arg(long, env = "NARSIL_NO_GTAGS")]
     no_gtags: bool,
+
+    /// Build a GTAGS database (via the `gtags` binary) for C/C++ repos that lack
+    /// one, so index-time gtags augmentation has data. Writes GTAGS/GRTAGS/GPATH
+    /// into the repo and is skipped on very large trees.
+    #[arg(long, env = "NARSIL_GTAGS_GENERATE")]
+    gtags_generate: bool,
 
     /// Enable streaming responses for large result sets
     #[arg(long, env = "NARSIL_STREAMING")]
@@ -309,25 +321,72 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "graph"))]
     let graph_available = false;
 
-    // gtags: --gtags / --no-gtags override auto-detection of global(1).
-    let gtags_enabled = if server_args.no_gtags {
-        false
+    // gtags intent: --gtags forces on, --no-gtags forces off, else Auto
+    // (auto-detect global(1)). The manager exists whenever intent ≠ Off and a
+    // backend is available; per-repo gating happens in index_repo.
+    let gtags_intent = if server_args.no_gtags {
+        index::BackendIntent::Off
     } else if server_args.gtags {
-        true
+        index::BackendIntent::On
     } else {
-        narsil_mcp::gtags::gtags_available()
+        index::BackendIntent::Auto
+    };
+    let gtags_enabled = match gtags_intent {
+        index::BackendIntent::Off => false,
+        index::BackendIntent::On => true,
+        index::BackendIntent::Auto => narsil_mcp::gtags::gtags_available(),
+    };
+
+    // LSP intent: --lsp forces on, --no-lsp forces off, else Auto (enable when a
+    // C/C++ language server is on PATH). Per-repo gating (compile_commands.json)
+    // happens in index_repo.
+    let lsp_intent = if server_args.no_lsp {
+        index::BackendIntent::Off
+    } else if server_args.lsp {
+        index::BackendIntent::On
+    } else {
+        index::BackendIntent::Auto
     };
 
     info!(
-        "Features: call_graph={}, git={}, watch={}, persist={}, lsp={}, gtags={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
+        "Features: call_graph={}, git={}, watch={}, persist={}, lsp_intent={:?}, gtags={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
         server_args.call_graph, server_args.git, server_args.watch, server_args.persist,
-        server_args.lsp, gtags_enabled, server_args.streaming, server_args.remote,
+        lsp_intent, gtags_enabled, server_args.streaming, server_args.remote,
         server_args.neural, !server_args.no_cache, graph_available
     );
 
-    // Build LSP config
+    // Build LSP config. Resolve C/C++ backends first so Auto can enable LSP when
+    // a server is available.
     let mut lsp_config = lsp::LspConfig::default();
-    if server_args.lsp {
+    let cxx_backends_auto = server_args
+        .lsp_cxx_backends
+        .trim()
+        .eq_ignore_ascii_case("auto");
+    let cxx_backends: Vec<CxxLspBackend> = if cxx_backends_auto {
+        CxxLspBackend::detect_available()
+    } else {
+        server_args
+            .lsp_cxx_backends
+            .split(',')
+            .filter_map(|s| match s.trim() {
+                "clangd" => Some(CxxLspBackend::Clangd),
+                "ccls" => Some(CxxLspBackend::Ccls),
+                other => {
+                    warn!(
+                        "Unknown --lsp-cxx-backends value '{}'; ignoring (valid: clangd, ccls, auto)",
+                        other
+                    );
+                    None
+                }
+            })
+            .collect()
+    };
+    let lsp_enabled = match lsp_intent {
+        index::BackendIntent::Off => false,
+        index::BackendIntent::On => true,
+        index::BackendIntent::Auto => !cxx_backends.is_empty(),
+    };
+    if lsp_enabled {
         lsp_config.enabled = true;
         // Enable LSP for common languages
         for lang in [
@@ -343,37 +402,15 @@ async fn main() -> Result<()> {
             lsp_config.enabled_languages.insert(lang.to_string(), true);
         }
 
-        // --lsp-cxx-backends: "auto" probes PATH; an explicit comma list is taken
-        // verbatim. An all-invalid explicit list keeps the default.
-        if server_args
-            .lsp_cxx_backends
-            .trim()
-            .eq_ignore_ascii_case("auto")
-        {
-            let detected = CxxLspBackend::detect_available();
-            if detected.is_empty() {
+        // "auto" adopts whatever was detected (possibly empty -> C/C++ LSP off);
+        // an explicit list overrides only when it yields at least one backend.
+        if cxx_backends_auto {
+            if cxx_backends.is_empty() {
                 warn!("No C/C++ LSP backend found on PATH (clangd, ccls); C/C++ LSP disabled");
             }
-            lsp_config.cxx_lsp_backends = detected;
-        } else {
-            let cxx_backends: Vec<CxxLspBackend> = server_args
-                .lsp_cxx_backends
-                .split(',')
-                .filter_map(|s| match s.trim() {
-                    "clangd" => Some(CxxLspBackend::Clangd),
-                    "ccls" => Some(CxxLspBackend::Ccls),
-                    other => {
-                        warn!(
-                            "Unknown --lsp-cxx-backends value '{}'; ignoring (valid: clangd, ccls, auto)",
-                            other
-                        );
-                        None
-                    }
-                })
-                .collect();
-            if !cxx_backends.is_empty() {
-                lsp_config.cxx_lsp_backends = cxx_backends;
-            }
+            lsp_config.cxx_lsp_backends = cxx_backends;
+        } else if !cxx_backends.is_empty() {
+            lsp_config.cxx_lsp_backends = cxx_backends;
         }
 
         info!(
@@ -434,6 +471,9 @@ async fn main() -> Result<()> {
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
         gtags_enabled,
+        lsp_intent,
+        gtags_intent,
+        gtags_generate: server_args.gtags_generate,
         #[cfg(feature = "graph")]
         graph_enabled: server_args.graph,
         #[cfg(feature = "graph")]
