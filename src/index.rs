@@ -2881,6 +2881,228 @@ impl CodeIntelEngine {
         }
     }
 
+    /// The indexed repo a changed compile_commands.json belongs to, matching the
+    /// repo's resolved CDB candidate paths (covers out-of-tree build dirs) and
+    /// falling back to tree containment.
+    fn repo_for_compile_commands(&self, cdb_path: &Path) -> Option<PathBuf> {
+        let canon = cdb_path.canonicalize().ok();
+        for repo in &self.repo_paths {
+            for candidate in self.compile_commands_candidate_paths(repo) {
+                if candidate == cdb_path
+                    || (canon.is_some() && candidate.canonicalize().ok() == canon)
+                {
+                    return Some(repo.clone());
+                }
+            }
+            if path_is_within_repo(cdb_path, repo) {
+                return Some(repo.clone());
+            }
+        }
+        None
+    }
+
+    /// Augment a C/C++ file's tree-sitter `symbols` with clangd/ccls
+    /// documentSymbol and gtags definitions, honoring this repo's enabled
+    /// backends. The per-file analogue of the index-time augment pass, for the
+    /// incremental watch path.
+    async fn augment_cxx_symbols(
+        &self,
+        abs_path: &Path,
+        relative_path: &str,
+        repo_path: &Path,
+        mut symbols: Vec<Symbol>,
+    ) -> Vec<Symbol> {
+        if self.lsp_repo_enabled(repo_path) {
+            if let Some(lsp) = &self.lsp_manager {
+                let lang = get_language_from_path(&abs_path.to_string_lossy());
+                for backend in lsp.active_cxx_backends() {
+                    match lsp.get_document_symbols(backend, abs_path, &lang).await {
+                        Ok(mut lsp_symbols) => {
+                            for symbol in &mut lsp_symbols {
+                                symbol.file_path = relative_path.to_string();
+                            }
+                            merge_symbols(&mut symbols, lsp_symbols, backend);
+                        }
+                        Err(e) => debug!("LSP documentSymbol failed for {:?}: {}", abs_path, e),
+                    }
+                }
+            }
+        }
+        if self.gtags_repo_enabled(repo_path) {
+            if let Some(gtags) = &self.gtags_manager {
+                let gtags_symbols: Vec<Symbol> = gtags
+                    .list_file_symbols(abs_path, repo_path)
+                    .await
+                    .into_iter()
+                    .map(|(name, line)| Symbol {
+                        name,
+                        kind: SymbolKind::Unknown,
+                        file_path: relative_path.to_string(),
+                        start_line: line,
+                        end_line: line,
+                        signature: None,
+                        qualified_name: None,
+                        doc_comment: None,
+                        confirmed_by: SourceSet::GTAGS,
+                        line_conflicts: Vec::new(),
+                    })
+                    .collect();
+                merge_symbols(&mut symbols, gtags_symbols, SourceSet::GTAGS);
+            }
+        }
+        symbols
+    }
+
+    /// Re-index the C/C++ sources a compile_commands.json change adds to or
+    /// removes from `repo_path`'s included set: newly-included files are parsed
+    /// and augmented (clangd/gtags), dropped files are removed. Headers and
+    /// non-C/C++ files are unaffected (never filtered). Returns files changed.
+    async fn reindex_compile_commands_delta(&self, repo_path: &Path) -> usize {
+        use crate::persist::FileMetadata;
+        let repo_name = match canonical_repo_key(repo_path) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(
+                    "compile_commands re-index skipped for {:?}: {}",
+                    repo_path, e
+                );
+                return 0;
+            }
+        };
+        let canon_repo = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+
+        // Source files clangd now knows about (canonical absolute paths).
+        let compiled = if let Some(p) = self.options.compile_commands_path.as_deref() {
+            load_compile_commands_filter(repo_path, &[p])
+        } else {
+            load_compile_commands_filter(
+                repo_path,
+                &[
+                    Path::new("compile_commands.json"),
+                    Path::new("build/compile_commands.json"),
+                ],
+            )
+        };
+
+        // C/C++ source files already carrying symbols, by repo-relative path.
+        let indexed: std::collections::HashSet<String> = self
+            .symbols
+            .get(&repo_name)
+            .map(|syms| {
+                syms.iter()
+                    .map(|s| s.file_path.clone())
+                    .filter(|p| {
+                        Path::new(p)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(is_c_source_ext)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut upserts: Vec<FileMetadata> = Vec::new();
+        let mut deletes: Vec<PathBuf> = Vec::new();
+
+        // Newly-included sources: parse, augment, insert.
+        for abs_path in &compiled {
+            let relative_path = match abs_path.strip_prefix(&canon_repo) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if indexed.contains(&relative_path) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(abs_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let parsed = match self.parser.parse_file(abs_path, &content) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut symbols = parsed.symbols;
+            for symbol in &mut symbols {
+                symbol.file_path = relative_path.clone();
+            }
+            let symbols = self
+                .augment_cxx_symbols(abs_path, &relative_path, repo_path, symbols)
+                .await;
+
+            if let Some(mut entry) = self.symbols.get_mut(&repo_name) {
+                entry.retain(|s| s.file_path != relative_path);
+                entry.extend(symbols.iter().cloned());
+            }
+            self.file_cache
+                .insert(abs_path.clone(), Arc::new(content.clone()));
+            self.search_index.index_file(&relative_path, &content);
+            self.query_cache.invalidate_for_file(&relative_path);
+
+            let content_hash = content_sha256(content.as_bytes());
+            let (modified_time, size) = std::fs::metadata(abs_path)
+                .ok()
+                .map(|meta| {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    (mtime, meta.len())
+                })
+                .unwrap_or((0, 0));
+            upserts.push(FileMetadata {
+                path: abs_path.clone(),
+                content_hash,
+                modified_time,
+                size,
+                symbols,
+            });
+        }
+
+        // Sources dropped from the CDB: remove their symbols.
+        for relative_path in &indexed {
+            let abs = canon_repo.join(relative_path);
+            let still_included = abs
+                .canonicalize()
+                .ok()
+                .map(|c| compiled.contains(&c))
+                .unwrap_or(false);
+            if still_included {
+                continue;
+            }
+            if let Some(mut entry) = self.symbols.get_mut(&repo_name) {
+                entry.retain(|s| s.file_path != *relative_path);
+            }
+            self.file_cache.remove(&abs);
+            self.query_cache.invalidate_for_file(relative_path);
+            deletes.push(abs);
+        }
+
+        let changed = upserts.len() + deletes.len();
+        if changed > 0 && self.options.persist_enabled {
+            if let Some(store) = &self.index_store {
+                if let Err(e) =
+                    store.apply_file_changes(&PathBuf::from(&repo_name), &upserts, &deletes)
+                {
+                    warn!(
+                        "Failed to persist compile_commands delta for {}: {}",
+                        repo_name, e
+                    );
+                }
+            }
+        }
+        if changed > 0 {
+            info!(
+                "compile_commands change: re-indexed {} source file(s) in {}",
+                changed, repo_name
+            );
+        }
+        changed
+    }
+
     /// Process file changes detected by the watcher.
     /// Returns the number of files re-indexed.
     pub async fn process_file_changes(
@@ -2915,6 +3137,12 @@ impl CodeIntelEngine {
                     for lang in ["c", "cpp"] {
                         lsp.restart_server(lang).await;
                     }
+                }
+                // The included C/C++ source set changed: bring symbols in line by
+                // indexing newly-added sources (augmented) and dropping removed
+                // ones. LSP is restarted first so the augment sees fresh flags.
+                if let Some(repo_path) = self.repo_for_compile_commands(&change.path) {
+                    count += self.reindex_compile_commands_delta(&repo_path).await;
                 }
                 continue;
             }
