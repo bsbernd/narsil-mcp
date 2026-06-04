@@ -1045,6 +1045,17 @@ impl CodeIntelEngine {
             }
         }
 
+        // Phases 5/6: augment the C/C++ call graph from LSP callHierarchy and
+        // gtags references. Same enable gate as the symbol pass; the baseline
+        // graph built above provides the nodes merge_edges folds edges onto.
+        if self.options.call_graph_enabled
+            && (lsp.is_some() || gtags.is_some())
+            && self.call_graphs.contains_key(&repo_name)
+        {
+            self.augment_call_graph_cxx(&repo_name, path, &lsp, &gtags)
+                .await;
+        }
+
         // Transform symbols to RDF knowledge graph if enabled
         #[cfg(feature = "graph")]
         if let Some(ref graph) = self.knowledge_graph {
@@ -1087,6 +1098,181 @@ impl CodeIntelEngine {
         }
 
         Ok(())
+    }
+
+    /// Phases 5/6 (C/C++ call-graph augmentation): after the tree-sitter
+    /// baseline graph is built, fold in clangd/ccls `callHierarchy` outgoing
+    /// calls and gtags reverse references. The LSP/gtags queries are async and
+    /// the dominant indexing cost, so they fan out with bounded concurrency;
+    /// `merge_edges` is applied serially afterwards (the call graph is not
+    /// shared across tasks). Only existing tree-sitter caller/callee nodes are
+    /// touched — edges to functions the baseline never saw are dropped.
+    async fn augment_call_graph_cxx(
+        &self,
+        repo_name: &str,
+        repo_path: &Path,
+        lsp: &Option<Arc<LspManager>>,
+        gtags: &Option<Arc<GtagsManager>>,
+    ) {
+        // C/C++ function/method definitions from the merged symbols: (name,
+        // relative file, 1-based definition line).
+        let functions: Vec<(String, String, usize)> = match self.symbols.get(repo_name) {
+            Some(symbols) => symbols
+                .iter()
+                .filter(|sym| {
+                    matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                        && matches!(get_language_from_path(&sym.file_path).as_str(), "c" | "cpp")
+                })
+                .map(|sym| (sym.name.clone(), sym.file_path.clone(), sym.start_line))
+                .collect(),
+            None => return,
+        };
+        if functions.is_empty() {
+            return;
+        }
+
+        // Phase 5: one task per (function, backend) querying callHierarchy
+        // outgoing calls. Each returns its backend bit and the resolved edges;
+        // the graph mutation happens serially below.
+        let mut lsp_edges: Vec<(SourceSet, Vec<(String, CallEdge)>)> = Vec::new();
+        if let Some(lsp) = lsp {
+            let backends = lsp.active_cxx_backends();
+            if !backends.is_empty() {
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
+                let mut tasks = tokio::task::JoinSet::new();
+                for (name, rel_path, line) in &functions {
+                    let abs_path = match validate_path(repo_path, rel_path) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    for backend in &backends {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        let lsp = lsp.clone();
+                        let backend = *backend;
+                        let name = name.clone();
+                        let rel_path = rel_path.clone();
+                        let abs_path = abs_path.clone();
+                        let line = *line;
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            let calls = lsp
+                                .call_hierarchy_outgoing(backend, &abs_path, &name, line as u32)
+                                .await
+                                .unwrap_or_default();
+                            let caller_key = CallGraph::qualified_key(&rel_path, &name);
+                            let edges: Vec<(String, CallEdge)> = calls
+                                .into_iter()
+                                .map(|(callee_name, _callee_file, call_line)| {
+                                    (
+                                        caller_key.clone(),
+                                        CallEdge {
+                                            target: callee_name,
+                                            file_path: rel_path.clone(),
+                                            line: call_line as usize,
+                                            column: 0,
+                                            call_type: CallType::Unknown,
+                                            scope_hint: None,
+                                            confirmed_by: backend,
+                                            line_conflicts: Vec::new(),
+                                        },
+                                    )
+                                })
+                                .collect();
+                            (backend, edges)
+                        });
+                    }
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((backend, edges)) if !edges.is_empty() => {
+                            lsp_edges.push((backend, edges))
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("LSP callHierarchy task failed: {}", e),
+                    }
+                }
+            }
+        }
+
+        // Phase 6: one task per function fetching gtags reverse references.
+        // `global -rx` returns *uses* (which include address-of and
+        // declarations, not only resolved calls), so these edges are weaker —
+        // recorded via the GTAGS bit so the consumer can tell them apart.
+        let mut gtags_refs: Vec<(String, Vec<(String, usize, String)>)> = Vec::new();
+        if let Some(gtags) = gtags {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (name, _rel_path, _line) in &functions {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let gtags = gtags.clone();
+                let name = name.clone();
+                let repo_path = repo_path.to_path_buf();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let refs = gtags.find_references(&name, &repo_path).await;
+                    (name, refs)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok((name, refs)) if !refs.is_empty() => gtags_refs.push((name, refs)),
+                    Ok(_) => {}
+                    Err(e) => warn!("gtags reference task failed: {}", e),
+                }
+            }
+        }
+
+        if lsp_edges.is_empty() && gtags_refs.is_empty() {
+            return;
+        }
+
+        // Serial merge — the call graph is not shared with the async tasks.
+        let call_graph = match self.call_graphs.get(repo_name) {
+            Some(cg) => cg,
+            None => return,
+        };
+
+        for (backend, edges) in lsp_edges {
+            call_graph.merge_edges(edges, backend);
+        }
+
+        // Map each gtags reference site back to its enclosing function (the
+        // caller); the queried function is the callee.
+        if !gtags_refs.is_empty() {
+            if let Some(symbols) = self.symbols.get(repo_name) {
+                for (callee_name, refs) in gtags_refs {
+                    let edges: Vec<(String, CallEdge)> = refs
+                        .into_iter()
+                        .filter_map(|(rel_file, line, _text)| {
+                            let caller =
+                                Self::enclosing_function_at(symbols.value(), &rel_file, line)?;
+                            Some((
+                                CallGraph::qualified_key(&caller.file_path, &caller.name),
+                                CallEdge {
+                                    target: callee_name.clone(),
+                                    file_path: rel_file,
+                                    line,
+                                    column: 0,
+                                    call_type: CallType::Unknown,
+                                    scope_hint: None,
+                                    confirmed_by: SourceSet::GTAGS,
+                                    line_conflicts: Vec::new(),
+                                },
+                            ))
+                        })
+                        .collect();
+                    if !edges.is_empty() {
+                        call_graph.merge_edges(edges, SourceSet::GTAGS);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn reindex_all(&self) -> Result<()> {
