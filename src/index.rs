@@ -41,6 +41,10 @@ pub struct RepoMetadata {
     pub total_lines: usize,
     pub languages: HashMap<String, LanguageStats>,
     pub last_indexed: SystemTime,
+    /// git HEAD and compile_commands.json fingerprint this index was built
+    /// against; a mismatch on startup means the cached symbols are stale.
+    pub head_hash: Option<String>,
+    pub cdb_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -498,6 +502,8 @@ impl CodeIntelEngine {
                                 languages,
                                 last_indexed: SystemTime::UNIX_EPOCH
                                     + std::time::Duration::from_secs(persisted.updated_at),
+                                head_hash: persisted.head_hash.clone(),
+                                cdb_hash: persisted.cdb_hash.clone(),
                             };
 
                             engine.repos.insert(repo_name.clone(), metadata);
@@ -756,6 +762,54 @@ impl CodeIntelEngine {
         }
         repo_path.join("compile_commands.json").exists()
             || repo_path.join("build/compile_commands.json").exists()
+    }
+
+    /// Candidate compile_commands.json paths for `repo_path`, mirroring the
+    /// resolution in `load_compile_commands_filter`.
+    fn compile_commands_candidate_paths(&self, repo_path: &Path) -> Vec<PathBuf> {
+        match &self.options.compile_commands_path {
+            Some(explicit) if explicit.is_absolute() => vec![explicit.clone()],
+            Some(explicit) => vec![repo_path.join(explicit)],
+            None => vec![
+                repo_path.join("compile_commands.json"),
+                repo_path.join("build/compile_commands.json"),
+            ],
+        }
+    }
+
+    /// sha256 over the resolved compile_commands.json content, or None when CDB
+    /// filtering is off or no CDB is present. Folds candidate files in a fixed
+    /// order for determinism; part of the index freshness fingerprint.
+    fn compile_commands_hash(&self, repo_path: &Path) -> Option<String> {
+        if !self.options.use_compile_commands {
+            return None;
+        }
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let mut any = false;
+        for cdb in self.compile_commands_candidate_paths(repo_path) {
+            if let Ok(bytes) = std::fs::read(&cdb) {
+                hasher.update(&bytes);
+                any = true;
+            }
+        }
+        any.then(|| format!("{:x}", hasher.finalize()))
+    }
+
+    /// git HEAD commit hash for `repo_path`, or None when it is not a git
+    /// checkout; part of the index freshness fingerprint.
+    fn git_head_hash(&self, repo_path: &Path) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let hash = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!hash.is_empty()).then_some(hash)
     }
 
     /// Whether LSP augmentation applies to `repo_path` given the recorded intent
@@ -1118,6 +1172,8 @@ impl CodeIntelEngine {
             total_lines,
             languages,
             last_indexed: SystemTime::now(),
+            head_hash: self.git_head_hash(path),
+            cdb_hash: self.compile_commands_hash(path),
         };
 
         info!(
@@ -2583,6 +2639,8 @@ impl CodeIntelEngine {
             // is stored as the canonical absolute path so future loads route
             // through the canonical-keyed index file.
             let mut persisted = PersistedIndex::new(PathBuf::from(&repo_name));
+            persisted.head_hash = self.git_head_hash(repo_path);
+            persisted.cdb_hash = self.compile_commands_hash(repo_path);
 
             // Populate with current symbols
             if let Some(symbols) = self.symbols.get(&repo_name) {
