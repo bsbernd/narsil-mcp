@@ -812,6 +812,38 @@ impl CodeIntelEngine {
         (!hash.is_empty()).then_some(hash)
     }
 
+    /// True when the in-memory repo metadata's recorded fingerprint still matches
+    /// the repo's current git HEAD and compile_commands.json. A false result
+    /// means the cached symbols are stale and must be rebuilt.
+    fn fingerprint_matches(&self, repo_name: &str, repo_path: &Path) -> bool {
+        let (prior_head, prior_cdb) = match self.repos.get(repo_name) {
+            Some(meta) => (meta.head_hash.clone(), meta.cdb_hash.clone()),
+            None => return false,
+        };
+        prior_head == self.git_head_hash(repo_path)
+            && prior_cdb == self.compile_commands_hash(repo_path)
+    }
+
+    /// Persisted per-file `(content_hash, symbols)` for a repo, keyed by the
+    /// repo-relative path, so a fingerprint-triggered rebuild can reuse unchanged
+    /// files' symbols instead of re-augmenting them. None when persistence is off
+    /// or no prior index exists. Files are persisted only when they have at least
+    /// one symbol, whose `file_path` is the repo-relative path.
+    fn load_prior_file_symbols(
+        &self,
+        repo_path: &Path,
+    ) -> Option<HashMap<String, (String, Vec<Symbol>)>> {
+        let store = self.index_store.as_ref()?;
+        let persisted = store.load_repo(repo_path).ok()?;
+        let mut by_rel: HashMap<String, (String, Vec<Symbol>)> = HashMap::new();
+        for file_meta in persisted.files.into_values() {
+            if let Some(rel) = file_meta.symbols.first().map(|s| s.file_path.clone()) {
+                by_rel.insert(rel, (file_meta.content_hash, file_meta.symbols));
+            }
+        }
+        Some(by_rel)
+    }
+
     /// Whether LSP augmentation applies to `repo_path` given the recorded intent
     /// and what the repo ships. Does not test for C/C++ presence — callers gate
     /// that per file/symbol.
@@ -876,7 +908,21 @@ impl CodeIntelEngine {
         // If symbols are already loaded from the persistence cache, skip the
         // expensive per-symbol embedding indexing — BM25 and call graph still
         // get rebuilt from the parsed files below.
-        let symbols_cached = self.symbols.contains_key(&repo_name);
+        // A cached repo whose fingerprint still matches needs no symbol work. A
+        // mismatch (git HEAD moved or compile_commands.json changed since the
+        // index was built) forces a rebuild that reuses unchanged files' persisted
+        // symbols. A never-indexed repo is a full build.
+        let was_cached = self.symbols.contains_key(&repo_name);
+        let symbols_cached = was_cached && self.fingerprint_matches(&repo_name, path);
+        let prior_symbols = if was_cached && !symbols_cached {
+            info!(
+                "index fingerprint changed (HEAD or compile_commands.json) — rebuilding symbols for {}",
+                repo_name
+            );
+            self.load_prior_file_symbols(path)
+        } else {
+            None
+        };
 
         // C/C++ symbol augmentation (Phases 2/3): clangd/ccls documentSymbol and
         // gtags definitions are folded into the tree-sitter baseline. Whether a
@@ -999,7 +1045,26 @@ impl CodeIntelEngine {
                 .to_string();
 
             if !symbols_cached {
-                if cxx_augment && matches!(parsed.language.as_str(), "C" | "C++") {
+                let is_cxx = matches!(parsed.language.as_str(), "C" | "C++");
+                // On a fingerprint rebuild, an unchanged C/C++ file reuses its
+                // persisted (already-augmented) symbols, skipping the costly
+                // clangd/gtags round-trip below.
+                let reused = if cxx_augment && is_cxx {
+                    prior_symbols
+                        .as_ref()
+                        .and_then(|prior| prior.get(&relative_path))
+                        .filter(|(hash, _)| *hash == content_sha256(content.as_bytes()))
+                        .map(|(_, symbols)| symbols.clone())
+                } else {
+                    None
+                };
+
+                if let Some(symbols) = reused {
+                    for symbol in &symbols {
+                        self.index_symbol_embeddings(symbol, &mut neural_docs);
+                    }
+                    symbols_vec.extend(symbols);
+                } else if cxx_augment && is_cxx {
                     // Queue the tree-sitter baseline for the async LSP/gtags pass
                     // below; embeddings happen there once the symbols are merged.
                     let mut symbols = parsed.symbols;
@@ -9290,6 +9355,15 @@ impl CodeIntelEngine {
 
 fn is_c_source_ext(ext: &str) -> bool {
     matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")
+}
+
+/// sha256 hex of file content, matching the `content_hash` persisted in
+/// `FileMetadata`, so a rebuild can tell whether a file changed since last index.
+fn content_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn is_c_header_ext(ext: &str) -> bool {
