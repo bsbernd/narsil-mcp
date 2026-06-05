@@ -585,9 +585,10 @@ impl Metrics {
         self.mark_dirty();
     }
 
-    /// Record one query to a C/C++ reference backend ("clangd", "ccls" or
-    /// "gtags"). Call counts only — surfaced by `narsil-mcp stats` so a user
-    /// can see which backends are actually being exercised.
+    /// Record one query to a reference backend (an LSP backend or language id
+    /// such as "clangd", "ccls", "rust", or "gtags"). Call counts only —
+    /// surfaced by `narsil-mcp stats` so a user can see which backends are
+    /// actually being exercised.
     pub fn record_backend_call(&self, label: &str) {
         *self
             .backend_calls
@@ -998,7 +999,7 @@ fn backend_rows(recorded: &HashMap<String, u64>) -> Vec<(String, u64)> {
     rows
 }
 
-/// Render a `## C/C++ Reference Backends` markdown section listing call counts.
+/// Render a `## Reference Backends` markdown section listing call counts.
 /// `lifetime`/`session` are the two scopes; pass `session = None` for the
 /// aggregate (`stats`) view which has no session.
 fn push_backend_table(
@@ -1006,7 +1007,7 @@ fn push_backend_table(
     lifetime: &HashMap<String, u64>,
     session: Option<&HashMap<String, u64>>,
 ) {
-    output.push_str("## C/C++ Reference Backends\n\n");
+    output.push_str("## Reference Backends\n\n");
     let life_rows = backend_rows(lifetime);
     match session {
         Some(sess) => {
@@ -1690,7 +1691,7 @@ mod tests {
 
         let snaps = vec![PersistedMetrics::load(&a).unwrap()];
         let out = render_aggregate_markdown(&snaps).unwrap();
-        assert!(out.contains("C/C++ Reference Backends"));
+        assert!(out.contains("Reference Backends"));
         // All three known backends are listed, including the never-called one.
         assert!(out.contains("| clangd | 0 |"));
         assert!(out.contains("| ccls | 1 |"));

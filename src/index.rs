@@ -2434,32 +2434,39 @@ impl CodeIntelEngine {
                     })
                     .unwrap_or_else(|| (sym.start_line.saturating_sub(1) as u32, 0));
 
-                if let Ok(Some(locations)) = lsp
-                    .find_references(&language, &file_path, anchor_line, anchor_col, true)
-                    .await
-                {
+                let lsp_map = lsp
+                    .find_references_parallel(&language, &file_path, anchor_line, anchor_col, true)
+                    .await;
+                if !lsp_map.is_empty() {
+                    let mut seen = std::collections::HashSet::new();
                     let mut references = Vec::new();
-                    for loc in locations {
-                        if let Ok(path) = loc.uri.to_file_path() {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let lines: Vec<&str> = content.lines().collect();
+                    for locations in lsp_map.into_values() {
+                        for loc in locations {
+                            if let Ok(path) = loc.uri.to_file_path() {
                                 let line_idx = loc.range.start.line as usize;
-                                if line_idx < lines.len() {
-                                    let rel = path
-                                        .strip_prefix(repo_path)
-                                        .unwrap_or(&path)
-                                        .to_string_lossy()
-                                        .to_string();
-                                    references.push((
-                                        rel,
-                                        line_idx + 1,
-                                        lines[line_idx].trim().to_string(),
-                                    ));
+                                if seen.insert((path.clone(), line_idx)) {
+                                    if let Ok(content) = std::fs::read_to_string(&path) {
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        if line_idx < lines.len() {
+                                            let rel = path
+                                                .strip_prefix(repo_path)
+                                                .unwrap_or(&path)
+                                                .to_string_lossy()
+                                                .to_string();
+                                            references.push((
+                                                rel,
+                                                line_idx + 1,
+                                                lines[line_idx].trim().to_string(),
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    return Some(references);
+                    if !references.is_empty() {
+                        return Some(references);
+                    }
                 }
                 break;
             }
@@ -2468,24 +2475,24 @@ impl CodeIntelEngine {
         None
     }
 
-    /// Query all enabled C/C++ reference backends for `symbol` and return
-    /// per-backend hit sets. Returns `None` when cross-validation does not
-    /// apply (no backends enabled, or symbol is not C/C++).
+    /// Query all enabled reference backends for `symbol` and return per-backend
+    /// hit sets. Returns `None` when no backend applies (none enabled, or the
+    /// symbol's language has no LSP server and gtags does not apply).
     ///
-    /// Backend labels: `"clangd"`, `"ccls"` (from LSP), `"gtags"` (GNU Global).
-    async fn cxx_refs_for_symbol(
+    /// LSP backends apply to any configured language; gtags (GNU Global) is
+    /// C/C++ only. Backend labels: the LSP backend or language id (`"clangd"`,
+    /// `"ccls"`, `"rust"`, ...) and `"gtags"`.
+    async fn refs_for_symbol(
         &self,
         repo: &str,
         symbol: &str,
         repo_path: &Path,
         symbols: &[Symbol],
-    ) -> Option<HashMap<&'static str, Vec<(String, usize, String)>>> {
+    ) -> Option<HashMap<String, Vec<(String, usize, String)>>> {
+        // gtags indexes C/C++ only; used to gate the gtags backend below.
         let is_cxx = symbols.iter().any(|s| {
             s.name == symbol && matches!(get_language_from_path(&s.file_path).as_str(), "c" | "cpp")
         });
-        if !is_cxx {
-            return None;
-        }
 
         let lsp_enabled = self.lsp_manager.as_ref().is_some_and(|l| l.is_enabled());
         let gtags_enabled = self.gtags_manager.is_some();
@@ -2494,7 +2501,7 @@ impl CodeIntelEngine {
             return None;
         }
 
-        let mut all: HashMap<&'static str, Vec<(String, usize, String)>> = HashMap::new();
+        let mut all: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
 
         // LSP backends: find the anchor position then query all backends in parallel
         if lsp_enabled {
@@ -2506,9 +2513,6 @@ impl CodeIntelEngine {
                             continue;
                         }
                         let language = get_language_from_path(&sym.file_path);
-                        if !matches!(language.as_str(), "c" | "cpp") {
-                            continue;
-                        }
                         let file_path = match crate::index::validate_path(repo_path, &sym.file_path)
                         {
                             Ok(p) => p,
@@ -2527,7 +2531,7 @@ impl CodeIntelEngine {
                             .unwrap_or_else(|| (sym.start_line.saturating_sub(1) as u32, 0));
 
                         let lsp_map = lsp
-                            .find_cxx_references_parallel(
+                            .find_references_parallel(
                                 &language,
                                 &file_path,
                                 anchor_line,
@@ -2537,7 +2541,7 @@ impl CodeIntelEngine {
                             .await;
 
                         for (label, locations) in lsp_map {
-                            self.metrics.record_backend_call(label);
+                            self.metrics.record_backend_call(&label);
                             let mut refs: Vec<(String, usize, String)> = Vec::new();
                             for loc in locations {
                                 if let Ok(path) = loc.uri.to_file_path() {
@@ -2569,12 +2573,14 @@ impl CodeIntelEngine {
             }
         }
 
-        // gtags backend
-        if let Some(gtags) = &self.gtags_manager {
-            let gtags_refs = gtags.find_references(symbol, repo_path).await;
-            self.metrics.record_backend_call("gtags");
-            if !gtags_refs.is_empty() {
-                all.insert("gtags", gtags_refs);
+        // gtags backend (C/C++ only)
+        if is_cxx {
+            if let Some(gtags) = &self.gtags_manager {
+                let gtags_refs = gtags.find_references(symbol, repo_path).await;
+                self.metrics.record_backend_call("gtags");
+                if !gtags_refs.is_empty() {
+                    all.insert("gtags".to_string(), gtags_refs);
+                }
             }
         }
 
@@ -4202,8 +4208,9 @@ impl CodeIntelEngine {
                                             .map(|e| (e.file_path.clone(), e.line))
                                             .collect();
 
-                                    // Query-time LSP references come from the
-                                    // primary backend; tag agreement with its bit.
+                                    // lsp_search_references merges all configured
+                                    // C/C++ backends; tag agreement with the primary
+                                    // backend's bit as a coarse "LSP-confirmed" marker.
                                     let lsp_bit = lsp
                                         .active_cxx_backends()
                                         .first()
@@ -7919,11 +7926,11 @@ impl CodeIntelEngine {
             }
         }
 
-        // For C/C++, query all enabled semantic backends to cross-validate
-        // textual hits. Neither source alone is trusted (grep over-reports,
-        // a cold backend under-reports), so results are labelled, not replaced.
+        // Query all enabled semantic backends to cross-validate textual hits.
+        // Neither source alone is trusted (grep over-reports, a cold backend
+        // under-reports), so results are labelled, not replaced.
         let backend_refs = self
-            .cxx_refs_for_symbol(&repo_name, symbol_name, &repo_path, &symbols)
+            .refs_for_symbol(&repo_name, symbol_name, &repo_path, &symbols)
             .await;
 
         let mut output = String::new();
@@ -7940,12 +7947,12 @@ impl CodeIntelEngine {
         if let Some(backends) = &backend_refs {
             // Build a per-backend key set for fast membership tests
             let mut backend_keys: HashMap<
-                &'static str,
+                String,
                 std::collections::HashSet<(String, usize)>,
             > = HashMap::new();
-            for (&label, refs) in backends {
+            for (label, refs) in backends {
                 let keys = refs.iter().map(|(f, l, _)| (f.clone(), *l)).collect();
-                backend_keys.insert(label, keys);
+                backend_keys.insert(label.clone(), keys);
             }
 
             let grep_keys: std::collections::HashSet<(String, usize)> = usages
@@ -7971,7 +7978,7 @@ impl CodeIntelEngine {
             }
 
             // Hits found by a backend but not by text search
-            for (&blabel, refs) in backends {
+            for (blabel, refs) in backends {
                 for (file, line, _) in refs {
                     if !grep_keys.contains(&(file.clone(), *line)) {
                         rows.push((file.clone(), *line, format!("{}-only", blabel)));
@@ -7990,7 +7997,7 @@ impl CodeIntelEngine {
                 let backend_only = rows.len() - confirmed - syntactic;
 
                 // Build a sorted, deduplicated list of active backend labels
-                let mut active: Vec<&'static str> = backends.keys().copied().collect();
+                let mut active: Vec<&str> = backends.keys().map(String::as_str).collect();
                 active.sort_unstable();
                 let active_str = active.join(", ");
 

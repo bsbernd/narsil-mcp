@@ -505,34 +505,42 @@ impl LspManager {
         Ok(Some(locations))
     }
 
-    /// Query all configured C/C++ backends in parallel and return per-backend results.
+    /// Query all configured backends for `language` in parallel and return per-backend results.
     ///
-    /// Returns a map from backend label (`"clangd"`, `"ccls"`) to the locations
-    /// that backend found. Backends that fail or return nothing are omitted.
-    pub async fn find_cxx_references_parallel(
+    /// For C/C++, fans out across all configured backends (clangd, ccls). For all
+    /// other languages, queries the single configured server. Returns a map from
+    /// backend label to the locations that backend found; backends that fail or
+    /// return nothing are omitted.
+    pub async fn find_references_parallel(
         &self,
         language: &str,
         file_path: &Path,
         line: u32,
         character: u32,
         include_declaration: bool,
-    ) -> HashMap<&'static str, Vec<Location>> {
+    ) -> HashMap<String, Vec<Location>> {
         let timeout_ms = self.config.timeout_ms;
         let file_path_buf = file_path.to_path_buf();
         let language_owned = language.to_string();
 
-        // Start all backends first (fast once servers are already warm)
-        let mut servers: Vec<(&'static str, Arc<LspProcess>)> = Vec::new();
-        for &backend in &self.config.cxx_lsp_backends {
-            let key = Self::server_key(language, backend);
-            match self.get_or_start_server_for_key(&key).await {
-                Ok(s) => servers.push((backend.label(), s)),
-                Err(e) => debug!(
-                    "Could not start {} for {}: {}",
-                    backend.label(),
-                    language,
-                    e
-                ),
+        let mut servers: Vec<(String, Arc<LspProcess>)> = Vec::new();
+        if matches!(language, "c" | "cpp") {
+            for &backend in &self.config.cxx_lsp_backends {
+                let key = Self::server_key(language, backend);
+                match self.get_or_start_server_for_key(&key).await {
+                    Ok(s) => servers.push((backend.label().to_string(), s)),
+                    Err(e) => debug!(
+                        "Could not start {} for {}: {}",
+                        backend.label(),
+                        language,
+                        e
+                    ),
+                }
+            }
+        } else {
+            match self.get_or_start_server(language).await {
+                Ok(s) => servers.push((language.to_string(), s)),
+                Err(e) => debug!("Could not start LSP server for {}: {}", language, e),
             }
         }
 
@@ -779,57 +787,6 @@ impl LspManager {
             GotoDefinitionResponse::Link(_) => return Ok(None),
         };
 
-        Ok(Some(locations))
-    }
-
-    /// Find references
-    pub async fn find_references(
-        &self,
-        language: &str,
-        file_path: &Path,
-        line: u32,
-        character: u32,
-        include_declaration: bool,
-    ) -> Result<Option<Vec<Location>>> {
-        if !self.is_enabled_for_language(language) {
-            return Ok(None);
-        }
-
-        let server = match self.get_or_start_server(language).await {
-            Ok(s) => s,
-            Err(e) => {
-                debug!("Failed to start LSP server for {}: {}", language, e);
-                return Ok(None);
-            }
-        };
-
-        let uri = Url::from_file_path(file_path).map_err(|_| anyhow!("Invalid file path"))?;
-
-        let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
-                position: Position { line, character },
-            },
-            context: ReferenceContext {
-                include_declaration,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let params_value = serde_json::to_value(&params)?;
-        self.did_open(&server, language, file_path).await.ok();
-        let response = self
-            .send_request(&server, "textDocument/references", params_value)
-            .await;
-        self.did_close(&server, file_path).await.ok();
-        let response = response?;
-
-        if response.is_null() {
-            return Ok(None);
-        }
-
-        let locations: Vec<Location> = serde_json::from_value(response)?;
         Ok(Some(locations))
     }
 
