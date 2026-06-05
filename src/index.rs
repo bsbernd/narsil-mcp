@@ -958,7 +958,20 @@ impl CodeIntelEngine {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        if self.options.use_compile_commands {
+        // A handful of C/C++ files usually means a plain-Makefile project that
+        // ships no compile_commands.json; applying the filter there would drop
+        // those sources from indexing and warn pointlessly. Engage it only for
+        // repos with a real C/C++ build.
+        let cxx_source_count = files
+            .iter()
+            .filter(|f| {
+                let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
+                is_c_source_ext(ext)
+            })
+            .count();
+        if self.options.use_compile_commands
+            && cxx_source_count >= COMPILE_COMMANDS_MIN_CXX_SOURCES
+        {
             let explicit: Option<&Path> = self.options.compile_commands_path.as_deref();
             let compiled = if let Some(p) = explicit {
                 load_compile_commands_filter(path, &[p])
@@ -9609,6 +9622,12 @@ impl CodeIntelEngine {
         })
     }
 }
+
+/// Minimum C/C++ source files for a repo to be treated as a compile-commands
+/// build. Below this, a missing compile_commands.json is assumed intentional
+/// (e.g. a plain-Makefile project) rather than an error worth filtering or
+/// warning for.
+const COMPILE_COMMANDS_MIN_CXX_SOURCES: usize = 5;
 
 fn is_c_source_ext(ext: &str) -> bool {
     matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")

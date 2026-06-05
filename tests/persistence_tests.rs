@@ -653,6 +653,106 @@ async fn test_async_watcher_passes_compile_commands() -> Result<()> {
     Ok(())
 }
 
+/// Below the C/C++ source-file floor the compile_commands filter must not
+/// engage: a repo with only a few C sources is assumed to be a plain-Makefile
+/// project that ships no usable compile_commands.json, so every source is
+/// indexed even though `--use-compile-commands` is on and the database would
+/// otherwise drop them.
+#[tokio::test]
+async fn test_compile_commands_filter_skipped_below_threshold() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    for idx in 0..4 {
+        repo.add_rust_file(
+            &format!("src/f{idx}.c"),
+            &format!("void func_{idx}(void) {{}}\n"),
+        )?;
+    }
+    // Empty database: were the filter engaged it would drop every source.
+    repo.add_rust_file("compile_commands.json", "[]")?;
+
+    let repo_path = repo.path().canonicalize()?;
+    let index_dir = TempDir::new()?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_path.clone()],
+        EngineOptions {
+            use_compile_commands: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_key = repo_path.to_string_lossy().to_string();
+    let symbols = engine
+        .find_symbols(&repo_key, None, None, None, None, 100)
+        .await?;
+    for idx in 0..4 {
+        assert!(
+            symbols.contains(&format!("func_{idx}")),
+            "sub-threshold repo must index every C source; missing func_{idx}:\n{symbols}"
+        );
+    }
+
+    Ok(())
+}
+
+/// At/above the floor the filter engages: sources absent from
+/// compile_commands.json are dropped from indexing, while listed sources stay.
+#[tokio::test]
+async fn test_compile_commands_filter_applied_at_threshold() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    for idx in 0..5 {
+        repo.add_rust_file(
+            &format!("src/f{idx}.c"),
+            &format!("void func_{idx}(void) {{}}\n"),
+        )?;
+    }
+
+    let repo_path = repo.path().canonicalize()?;
+    // Database lists only src/f0.c, so f1..f4 must be filtered out.
+    let kept = repo_path.join("src/f0.c");
+    let cc = format!(
+        "[{{\"directory\":\"{dir}\",\"file\":\"{file}\",\"command\":\"cc -c {file}\"}}]",
+        dir = repo_path.display(),
+        file = kept.display(),
+    );
+    repo.add_rust_file("compile_commands.json", &cc)?;
+
+    let index_dir = TempDir::new()?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_path.clone()],
+        EngineOptions {
+            use_compile_commands: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    let repo_key = repo_path.to_string_lossy().to_string();
+    let symbols = engine
+        .find_symbols(&repo_key, None, None, None, None, 100)
+        .await?;
+    assert!(
+        symbols.contains("func_0"),
+        "source listed in compile_commands.json must be indexed:\n{symbols}"
+    );
+    for idx in 1..5 {
+        assert!(
+            !symbols.contains(&format!("func_{idx}")),
+            "source absent from compile_commands.json must be filtered out; found func_{idx}:\n{symbols}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Issue #26 regression: when the caller holds the shutdown `Sender`, the
 /// watcher must keep running and re-index files that change on disk. The
 /// original `main.rs` wiring dropped the `Sender` immediately, which made the
