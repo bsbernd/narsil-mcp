@@ -199,6 +199,16 @@ struct PersistedCounter {
     histogram_bytes: Vec<u8>,
 }
 
+/// On-disk heap snapshot: the live [`MemoryReport`] plus when it was taken.
+/// Overwritten (not merged) on each flush — memory is a per-run snapshot, not a
+/// counter. Added in v3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedMemoryReport {
+    /// Unix seconds when the engine measured this snapshot.
+    pub measured_at: u64,
+    pub report: MemoryReport,
+}
+
 /// On-disk metric snapshot. Loaded on startup, written periodically and on
 /// shutdown so accumulated counters survive process restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +227,9 @@ pub struct PersistedMetrics {
     file_parse: PersistedCounter,
     /// Per-backend C/C++ reference query call counts (added in v2).
     backends: HashMap<String, u64>,
+    /// Heap snapshot from the most recent run (None for migrated v1/v2 files;
+    /// added in v3).
+    pub memory: Option<PersistedMemoryReport>,
 }
 
 /// v1 on-disk layout (pre-`backends`). Kept only so `load` can migrate files
@@ -248,12 +261,48 @@ impl PersistedMetricsV1 {
             tools: self.tools,
             file_parse: self.file_parse,
             backends: HashMap::new(),
+            memory: None,
+        }
+    }
+}
+
+/// v2 on-disk layout (pre-`memory`). Kept only so `load` can migrate files
+/// written before the heap snapshot existed, preserving their tool/backend/
+/// uptime history. Field order must match the v2 struct exactly — postcard is
+/// positional and not self-describing.
+///
+/// `Serialize` is derived only so tests can write authentic v2 byte streams;
+/// production code never serialises this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMetricsV2 {
+    version: u32,
+    index_path: String,
+    first_started_at: u64,
+    saved_at: u64,
+    total_uptime_seconds: u64,
+    tools: HashMap<String, PersistedCounter>,
+    file_parse: PersistedCounter,
+    backends: HashMap<String, u64>,
+}
+
+impl PersistedMetricsV2 {
+    fn upgrade(self) -> PersistedMetrics {
+        PersistedMetrics {
+            version: PersistedMetrics::CURRENT_VERSION,
+            index_path: self.index_path,
+            first_started_at: self.first_started_at,
+            saved_at: self.saved_at,
+            total_uptime_seconds: self.total_uptime_seconds,
+            tools: self.tools,
+            file_parse: self.file_parse,
+            backends: self.backends,
+            memory: None,
         }
     }
 }
 
 impl PersistedMetrics {
-    const CURRENT_VERSION: u32 = 2;
+    const CURRENT_VERSION: u32 = 3;
 
     fn empty(index_path: String) -> Self {
         let now = now_unix_seconds();
@@ -266,30 +315,38 @@ impl PersistedMetrics {
             tools: HashMap::new(),
             file_parse: empty_persisted_counter(),
             backends: HashMap::new(),
+            memory: None,
         }
     }
 
     /// Read and decode a stats file. Returns an error for any failure
     /// (missing file, bad version, deserialisation failure).
     ///
-    /// v1 files lack the trailing `backends` map, so the v2 decode hits EOF;
-    /// we fall back to decoding the v1 layout and upgrading it in place.
+    /// Older files lack the trailing fields each version added (`backends` in
+    /// v2, `memory` in v3), so decoding them at the current layout hits EOF.
+    /// postcard ignores trailing bytes, so we try the largest layout first and
+    /// fall back through v2 to v1, upgrading in place.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path).context("Failed to read metrics file")?;
-        match postcard::from_bytes::<Self>(&data) {
-            Ok(snapshot) if snapshot.version == Self::CURRENT_VERSION => Ok(snapshot),
-            _ => {
-                let v1: PersistedMetricsV1 = postcard::from_bytes(&data)
-                    .context("Failed to deserialise metrics file (tried v2 and v1)")?;
-                if v1.version != 1 {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported metrics file version: {}",
-                        v1.version
-                    ));
-                }
-                Ok(v1.upgrade())
+        if let Ok(snapshot) = postcard::from_bytes::<Self>(&data) {
+            if snapshot.version == Self::CURRENT_VERSION {
+                return Ok(snapshot);
             }
         }
+        if let Ok(v2) = postcard::from_bytes::<PersistedMetricsV2>(&data) {
+            if v2.version == 2 {
+                return Ok(v2.upgrade());
+            }
+        }
+        let v1: PersistedMetricsV1 = postcard::from_bytes(&data)
+            .context("Failed to deserialise metrics file (tried v3, v2 and v1)")?;
+        if v1.version != 1 {
+            return Err(anyhow::anyhow!(
+                "Unsupported metrics file version: {}",
+                v1.version
+            ));
+        }
+        Ok(v1.upgrade())
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -502,6 +559,9 @@ pub struct Metrics {
     /// Session-only per-backend C/C++ reference query counts (reset on start).
     /// The lifetime view lives in the shared `lifetime` state.
     backend_calls: RwLock<HashMap<String, u64>>,
+    /// Latest live heap snapshot from this run, written to disk on the next
+    /// flush. None until the engine reports one; overwritten, never merged.
+    memory_snapshot: RwLock<Option<PersistedMemoryReport>>,
 }
 
 impl Metrics {
@@ -519,6 +579,7 @@ impl Metrics {
             flush_notify: Arc::new(Notify::new()),
             known_tools: RwLock::new(Vec::new()),
             backend_calls: RwLock::new(HashMap::new()),
+            memory_snapshot: RwLock::new(None),
         }
     }
 
@@ -563,6 +624,7 @@ impl Metrics {
             flush_notify: Arc::new(Notify::new()),
             known_tools: RwLock::new(Vec::new()),
             backend_calls: RwLock::new(HashMap::new()),
+            memory_snapshot: RwLock::new(None),
         }
     }
 
@@ -596,6 +658,17 @@ impl Metrics {
             .entry(label.to_string())
             .or_insert(0) += 1;
         self.lifetime.write().deltas.record_backend_call(label);
+        self.mark_dirty();
+    }
+
+    /// Record the engine's live heap breakdown for persistence. Unlike the
+    /// counters, this is a snapshot: it overwrites any previous value and is
+    /// written verbatim (not merged) by the next flush.
+    pub fn set_memory_report(&self, report: MemoryReport) {
+        *self.memory_snapshot.write() = Some(PersistedMemoryReport {
+            measured_at: now_unix_seconds(),
+            report,
+        });
         self.mark_dirty();
     }
 
@@ -750,6 +823,11 @@ impl Metrics {
 
         // Write merged counters into the persisted struct.
         merged.write_into_persisted(&mut current)?;
+        // Memory is a snapshot, not a counter: overwrite with this run's value
+        // if we have one, otherwise preserve whatever the file already held.
+        if let Some(snapshot) = self.memory_snapshot.read().clone() {
+            current.memory = Some(snapshot);
+        }
         current.saved_at = now_unix_seconds();
         current.total_uptime_seconds = current.total_uptime_seconds.saturating_add(uptime_delta);
         // Preserve the earliest first_started_at across concurrent writers.
@@ -1038,6 +1116,57 @@ fn backend_calls_to_json(calls: &HashMap<String, u64>) -> serde_json::Value {
     )
 }
 
+/// Render a `## Memory (most recent run)` section from the per-`index_path`
+/// snapshots that carry one. Memory is never summed across paths: a single
+/// snapshot gets the full per-subsystem breakdown, multiple get one row each.
+fn push_memory_section(output: &mut String, snapshots: &[PersistedMetrics]) {
+    let with_memory: Vec<&PersistedMetrics> = snapshots
+        .iter()
+        .filter(|snap| snap.memory.is_some())
+        .collect();
+
+    output.push_str("## Memory (most recent run)\n\n");
+    if with_memory.is_empty() {
+        output.push_str("*No memory snapshot recorded yet.*\n\n");
+        return;
+    }
+
+    // Single index path: show the full per-subsystem breakdown.
+    if let [snap] = with_memory.as_slice() {
+        let mem = snap.memory.as_ref().expect("filtered to Some");
+        if !snap.index_path.is_empty() {
+            output.push_str(&format!("**Index path**: {}\n", snap.index_path));
+        }
+        output.push_str(&format!(
+            "**Measured**: {}\n\n",
+            format_unix_timestamp(mem.measured_at)
+        ));
+        output.push_str(&mem.report.render_table());
+        output.push('\n');
+        return;
+    }
+
+    // Multiple index paths: one compact row each (never summed).
+    output.push_str("| Index Path | Measured | Tracked | RSS |\n");
+    output.push_str("|------------|----------|---------|-----|\n");
+    for snap in &with_memory {
+        let mem = snap.memory.as_ref().expect("filtered to Some");
+        let rss = mem
+            .report
+            .process_rss
+            .map(format_bytes)
+            .unwrap_or_else(|| "n/a".to_string());
+        output.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            snap.index_path,
+            format_unix_timestamp(mem.measured_at),
+            format_bytes(mem.report.total_tracked()),
+            rss
+        ));
+    }
+    output.push('\n');
+}
+
 fn push_md_row<'a>(output: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
     output.push('|');
     for (cell, w) in cells.zip(widths.iter()) {
@@ -1255,6 +1384,8 @@ pub fn render_aggregate_markdown(snapshots: &[PersistedMetrics]) -> Result<Strin
 
     push_backend_table(&mut output, &merged.backends, None);
 
+    push_memory_section(&mut output, snapshots);
+
     output.push_str("## Tool Execution Times\n\n");
     if merged.tools.is_empty() {
         output.push_str("*No tool calls recorded.*\n");
@@ -1273,16 +1404,32 @@ pub fn render_list_markdown(snapshots: &[(PathBuf, PersistedMetrics)]) -> String
         output.push_str("*No stats files found.*\n");
         return output;
     }
-    output.push_str("| Index Path | Requests | Tracking Since | Last Update | Total Uptime |\n");
-    output.push_str("|------------|----------|----------------|-------------|--------------|\n");
+    output.push_str(
+        "| Index Path | Requests | Tracking Since | Last Update | Total Uptime | Tracked Heap | RSS |\n",
+    );
+    output.push_str(
+        "|------------|----------|----------------|-------------|--------------|--------------|-----|\n",
+    );
     for (_path, snap) in snapshots {
+        let (heap, rss) = match snap.memory.as_ref() {
+            Some(mem) => (
+                format_bytes(mem.report.total_tracked()),
+                mem.report
+                    .process_rss
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "n/a".to_string()),
+            ),
+            None => ("n/a".to_string(), "n/a".to_string()),
+        };
         output.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             snap.index_path,
             snap.total_requests(),
             format_unix_timestamp(snap.first_started_at),
             format_unix_timestamp(snap.saved_at),
-            format_duration_seconds(snap.total_uptime_seconds)
+            format_duration_seconds(snap.total_uptime_seconds),
+            heap,
+            rss
         ));
     }
     output
@@ -1307,6 +1454,32 @@ pub fn render_aggregate_json(snapshots: &[PersistedMetrics]) -> Result<serde_jso
     if snapshots.is_empty() {
         earliest = 0;
     }
+
+    // Memory is per-run and never summed across index paths — emit one entry
+    // per snapshot that carries a heap breakdown.
+    let memory_by_index_path: Vec<serde_json::Value> = snapshots
+        .iter()
+        .filter_map(|snap| {
+            let mem = snap.memory.as_ref()?;
+            Some(json!({
+                "index_path": snap.index_path,
+                "measured_at": mem.measured_at,
+                "tracked_bytes": mem.report.total_tracked(),
+                "process_rss_bytes": mem.report.process_rss,
+                "subsystems": {
+                    "symbols": mem.report.symbols,
+                    "search_index": mem.report.search_index,
+                    "embeddings": mem.report.embeddings,
+                    "file_cache": mem.report.file_cache,
+                    "call_graphs": mem.report.call_graphs,
+                    "repos": mem.report.repos,
+                    "git_repos": mem.report.git_repos,
+                    "neural": mem.report.neural,
+                },
+            }))
+        })
+        .collect();
+
     Ok(json!({
         "index_paths_covered": snapshots.len(),
         "total_requests": total_requests,
@@ -1316,6 +1489,7 @@ pub fn render_aggregate_json(snapshots: &[PersistedMetrics]) -> Result<serde_jso
         "file_parsing": parse_stats_to_json(&merged.file_parse),
         "tools": tool_stats_to_json(&merged.tools),
         "cxx_backends": backend_calls_to_json(&merged.backends),
+        "memory_by_index_path": memory_by_index_path,
     }))
 }
 
@@ -1369,7 +1543,7 @@ pub(crate) fn hashmap_table_bytes<K, V>(capacity: usize) -> usize {
 /// owned String/Vec/f32 allocations — heap *held by the index*, not process RSS
 /// (allocator overhead and transient parse buffers are excluded; `process_rss`
 /// shows the gap).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryReport {
     /// DashMap<String, Vec<Symbol>>: keys + Vec caps + per-Symbol strings.
     pub symbols: usize,
@@ -1423,9 +1597,16 @@ impl MemoryReport {
     /// Markdown `## Memory usage` section: rows sorted desc with human-readable
     /// bytes and % of tracked, plus a process_rss line and the unaccounted gap.
     pub fn render_markdown(&self) -> String {
+        let mut out = String::from("## Memory usage\n\n");
+        out.push_str(&self.render_table());
+        out
+    }
+
+    /// The heap table plus the process_rss / unaccounted-gap lines, without a
+    /// section header, so callers can place it under their own heading.
+    pub fn render_table(&self) -> String {
         let tracked = self.total_tracked();
         let mut out = String::new();
-        out.push_str("## Memory usage\n\n");
         out.push_str("| Subsystem | Heap | % of tracked |\n");
         out.push_str("|-----------|------|--------------|\n");
         for (name, bytes) in self.rows_desc() {
@@ -1555,6 +1736,87 @@ mod tests {
         assert!(
             embeddings_pos < symbols_pos,
             "rows must be sorted descending by size"
+        );
+    }
+
+    #[test]
+    fn test_memory_snapshot_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.bin");
+        {
+            let m = make_persisted_metrics(path.clone());
+            m.set_memory_report(MemoryReport {
+                search_index: 4096,
+                embeddings: 8192,
+                process_rss: Some(99999),
+                ..Default::default()
+            });
+            m.flush().unwrap();
+        }
+        let snap = PersistedMetrics::load(&path).unwrap();
+        let mem = snap.memory.expect("memory snapshot persisted");
+        assert_eq!(mem.report.search_index, 4096);
+        assert_eq!(mem.report.embeddings, 8192);
+        assert_eq!(mem.report.process_rss, Some(99999));
+        assert!(mem.measured_at > 0);
+    }
+
+    #[test]
+    fn test_flush_preserves_existing_memory_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.bin");
+
+        // First process records a memory snapshot.
+        let m1 = make_persisted_metrics(path.clone());
+        m1.set_memory_report(MemoryReport {
+            embeddings: 1234,
+            ..Default::default()
+        });
+        m1.flush().unwrap();
+
+        // Second process never measures memory; its flush must not wipe the
+        // snapshot the first one wrote.
+        let m2 = make_persisted_metrics(path.clone());
+        m2.record_tool("alpha", Duration::from_millis(5));
+        m2.flush().unwrap();
+
+        let snap = PersistedMetrics::load(&path).unwrap();
+        let mem = snap.memory.expect("prior memory snapshot preserved");
+        assert_eq!(mem.report.embeddings, 1234);
+        assert_eq!(snap.tools.get("alpha").unwrap().count, 1);
+    }
+
+    #[test]
+    fn test_v2_file_migrates_to_v3_without_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v2.bin");
+
+        // Write an authentic v2 byte stream (no trailing `memory` field).
+        let mut tool = MetricStats::new();
+        tool.record(42);
+        let mut tools = HashMap::new();
+        tools.insert("alpha".to_string(), tool.to_persisted().unwrap());
+        let mut backends = HashMap::new();
+        backends.insert("clangd".to_string(), 7u64);
+        let v2 = PersistedMetricsV2 {
+            version: 2,
+            index_path: "/path/v2".to_string(),
+            first_started_at: 111,
+            saved_at: 222,
+            total_uptime_seconds: 50,
+            tools,
+            file_parse: empty_persisted_counter(),
+            backends,
+        };
+        std::fs::write(&path, postcard::to_stdvec(&v2).unwrap()).unwrap();
+
+        let snap = PersistedMetrics::load(&path).unwrap();
+        assert_eq!(snap.version, PersistedMetrics::CURRENT_VERSION);
+        assert_eq!(snap.tools.get("alpha").unwrap().count, 1);
+        assert_eq!(snap.backends.get("clangd"), Some(&7));
+        assert!(
+            snap.memory.is_none(),
+            "migrated v2 file has no memory snapshot"
         );
     }
 

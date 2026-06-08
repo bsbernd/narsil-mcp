@@ -681,7 +681,11 @@ impl CodeIntelEngine {
 
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
-        info!("{}", self.memory_report().summary_line());
+        let memory = self.memory_report();
+        info!("{}", memory.summary_line());
+        // Persist the snapshot so the offline `narsil-mcp stats` command can
+        // report it; written by the next periodic/shutdown/Drop flush.
+        self.metrics.set_memory_report(memory);
 
         Ok(())
     }
