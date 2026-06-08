@@ -681,6 +681,10 @@ impl CodeIntelEngine {
 
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
+        // The initial build's transient buffers (parse trees, cleared content
+        // strings) are the bulk of glibc's retained high-water mark — trim
+        // before measuring so the startup RSS reflects the live working set.
+        Self::return_freed_heap_to_os();
         let memory = self.memory_report();
         info!("{}", memory.summary_line());
         // Persist the snapshot so the offline `narsil-mcp stats` command can
@@ -3789,11 +3793,32 @@ impl CodeIntelEngine {
         None
     }
 
+    /// Release freed heap back to the kernel. glibc keeps the indexing
+    /// high-water mark in its arenas; malloc_trim(0) returns the unused top so
+    /// RSS tracks the live working set. glibc/Linux only — a no-op on
+    /// musl/macOS/wasm, which lack malloc_trim.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn return_freed_heap_to_os() {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+        }
+        // SAFETY: malloc_trim is safe to call at any point; it only walks the
+        // allocator's free lists and may madvise unused pages away.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn return_freed_heap_to_os() {}
+
     /// Re-measure the live heap and hand it to metrics so the next flush
     /// persists an up-to-date snapshot. Called after a runtime re-index changes
     /// the in-memory subsystems. `memory_report()` walks every DashMap, so this
-    /// is only invoked on actual re-index events, never on a timer.
+    /// is only invoked on actual re-index events, never on a timer. Trims first
+    /// so the persisted RSS reflects the reclaimed working set.
     fn refresh_memory_snapshot(&self) {
+        Self::return_freed_heap_to_os();
         self.metrics.set_memory_report(self.memory_report());
     }
 
