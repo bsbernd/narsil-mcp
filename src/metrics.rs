@@ -1354,6 +1354,145 @@ pub fn spawn_flush_task(metrics: Arc<Metrics>, interval: Duration) -> tokio::tas
     })
 }
 
+// ---------- Memory reporting -------------------------------------------------
+
+/// Approximate the heap held by a hashbrown table (`HashMap`/`HashSet`) with
+/// `capacity` slots of `(K, V)`: one control byte plus the inline key and value
+/// per slot. Heap *behind* the keys/values (String buffers, Vec payloads) is
+/// summed separately by the caller. For a `HashSet<T>` pass `V = ()`. Good to
+/// ~10%; the small fixed table header is ignored.
+pub(crate) fn hashmap_table_bytes<K, V>(capacity: usize) -> usize {
+    capacity * (std::mem::size_of::<K>() + std::mem::size_of::<V>() + 1)
+}
+
+/// Per-subsystem heap estimate. Bytes are summed from container capacities and
+/// owned String/Vec/f32 allocations — heap *held by the index*, not process RSS
+/// (allocator overhead and transient parse buffers are excluded; `process_rss`
+/// shows the gap).
+#[derive(Debug, Clone, Default)]
+pub struct MemoryReport {
+    /// DashMap<String, Vec<Symbol>>: keys + Vec caps + per-Symbol strings.
+    pub symbols: usize,
+    /// BM25 documents + inverted_index postings + doc_freq + synonyms.
+    pub search_index: usize,
+    /// TF-IDF Vec<f32> per doc + vocabulary/doc_freq maps.
+    pub embeddings: usize,
+    /// Cached file contents (Arc<String> lengths + path keys).
+    pub file_cache: usize,
+    /// Call graph nodes + edges (0 unless --call-graph).
+    pub call_graphs: usize,
+    /// Per-repo metadata (names, paths, language maps).
+    pub repos: usize,
+    /// Git repository handle keys (libgit2-internal buffers not tracked).
+    pub git_repos: usize,
+    /// Neural embedding engine — not tracked yet; always 0.
+    pub neural: usize,
+    /// Process resident set size (Linux /proc/self/status), when available.
+    pub process_rss: Option<usize>,
+}
+
+impl MemoryReport {
+    /// Sum of all subsystem fields (excludes process_rss).
+    pub fn total_tracked(&self) -> usize {
+        self.symbols
+            + self.search_index
+            + self.embeddings
+            + self.file_cache
+            + self.call_graphs
+            + self.repos
+            + self.git_repos
+            + self.neural
+    }
+
+    /// Named subsystem rows, largest first, for table rendering.
+    fn rows_desc(&self) -> Vec<(&'static str, usize)> {
+        let mut rows = vec![
+            ("Embeddings (TF-IDF)", self.embeddings),
+            ("Search index (BM25)", self.search_index),
+            ("File cache", self.file_cache),
+            ("Symbols", self.symbols),
+            ("Call graphs", self.call_graphs),
+            ("Repos", self.repos),
+            ("Git repos", self.git_repos),
+            ("Neural", self.neural),
+        ];
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows
+    }
+
+    /// Markdown `## Memory usage` section: rows sorted desc with human-readable
+    /// bytes and % of tracked, plus a process_rss line and the unaccounted gap.
+    pub fn render_markdown(&self) -> String {
+        let tracked = self.total_tracked();
+        let mut out = String::new();
+        out.push_str("## Memory usage\n\n");
+        out.push_str("| Subsystem | Heap | % of tracked |\n");
+        out.push_str("|-----------|------|--------------|\n");
+        for (name, bytes) in self.rows_desc() {
+            let pct = if tracked > 0 {
+                bytes as f64 / tracked as f64 * 100.0
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "| {} | {} | {:.1}% |\n",
+                name,
+                format_bytes(bytes),
+                pct
+            ));
+        }
+        out.push_str(&format!(
+            "| **Total tracked** | **{}** | **100.0%** |\n\n",
+            format_bytes(tracked)
+        ));
+        match self.process_rss {
+            Some(rss) => {
+                out.push_str(&format!("**Process RSS**: {}\n", format_bytes(rss)));
+                out.push_str(&format!(
+                    "**Unaccounted** (allocator overhead, transient buffers, untracked): {}\n",
+                    format_bytes(rss.saturating_sub(tracked))
+                ));
+            }
+            None => out.push_str("**Process RSS**: unavailable\n"),
+        }
+        out
+    }
+
+    /// One-line summary for the startup log.
+    pub fn summary_line(&self) -> String {
+        let rss = match self.process_rss {
+            Some(bytes) => format_bytes(bytes),
+            None => "n/a".to_string(),
+        };
+        format!(
+            "memory: tracked={} (embeddings={}, search={}, file_cache={}, symbols={}, call_graphs={}), rss={}",
+            format_bytes(self.total_tracked()),
+            format_bytes(self.embeddings),
+            format_bytes(self.search_index),
+            format_bytes(self.file_cache),
+            format_bytes(self.symbols),
+            format_bytes(self.call_graphs),
+            rss
+        )
+    }
+}
+
+/// Render a byte count with a binary unit suffix (KiB/MiB/GiB).
+fn format_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1385,6 +1524,38 @@ mod tests {
         assert_eq!(stats.avg_ms(), 100.0);
         assert_eq!(stats.min_ms, 100);
         assert_eq!(stats.max_ms, 100);
+    }
+
+    #[test]
+    fn test_memory_report_render_and_total() {
+        let report = MemoryReport {
+            symbols: 100,
+            search_index: 400,
+            embeddings: 1000,
+            file_cache: 50,
+            call_graphs: 0,
+            repos: 10,
+            git_repos: 5,
+            neural: 0,
+            process_rss: Some(4096),
+        };
+        assert_eq!(report.total_tracked(), 100 + 400 + 1000 + 50 + 10 + 5);
+
+        let md = report.render_markdown();
+        assert!(md.contains("## Memory usage"));
+        assert!(md.contains("Embeddings (TF-IDF)"));
+        assert!(md.contains("Total tracked"));
+        assert!(md.contains("Process RSS"));
+        assert!(md.contains("Unaccounted"));
+
+        // Rows are sorted descending, so the largest subsystem (embeddings)
+        // must render before a smaller one (symbols).
+        let embeddings_pos = md.find("Embeddings (TF-IDF)").unwrap();
+        let symbols_pos = md.find("Symbols").unwrap();
+        assert!(
+            embeddings_pos < symbols_pos,
+            "rows must be sorted descending by size"
+        );
     }
 
     #[test]

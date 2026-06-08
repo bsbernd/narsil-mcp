@@ -40,6 +40,21 @@ pub struct SearchDocument {
     pub term_freq: HashMap<String, usize>,
 }
 
+impl SearchDocument {
+    /// Heap bytes owned by this document: string buffers plus the term_freq
+    /// map. Excludes the struct's own inline footprint (counted by the holding
+    /// `Vec<SearchDocument>`'s capacity).
+    fn heap_bytes(&self) -> usize {
+        let term_freq =
+            crate::metrics::hashmap_table_bytes::<String, usize>(self.term_freq.capacity())
+                + self.term_freq.keys().map(String::capacity).sum::<usize>();
+        self.id.capacity()
+            + self.file_path.capacity()
+            + self.content.as_ref().map_or(0, String::capacity)
+            + term_freq
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DocType {
     File,
@@ -352,6 +367,46 @@ impl SearchIndex {
         self.total_tokens = 0;
         self.avg_doc_len = 0.0;
     }
+
+    /// Estimated heap held by this BM25 index: the documents and their owned
+    /// allocations, the inverted-index postings, the doc-freq map, and the
+    /// static synonym table.
+    pub fn heap_bytes(&self) -> usize {
+        use crate::metrics::hashmap_table_bytes;
+
+        let documents = self.documents.capacity() * std::mem::size_of::<SearchDocument>()
+            + self
+                .documents
+                .iter()
+                .map(SearchDocument::heap_bytes)
+                .sum::<usize>();
+
+        let inverted_index =
+            hashmap_table_bytes::<String, Vec<usize>>(self.inverted_index.capacity())
+                + self
+                    .inverted_index
+                    .iter()
+                    .map(|(term, postings)| {
+                        term.capacity() + postings.capacity() * std::mem::size_of::<usize>()
+                    })
+                    .sum::<usize>();
+
+        let doc_freq = hashmap_table_bytes::<String, usize>(self.doc_freq.capacity())
+            + self.doc_freq.keys().map(String::capacity).sum::<usize>();
+
+        let synonyms = hashmap_table_bytes::<String, Vec<String>>(self.synonyms.capacity())
+            + self
+                .synonyms
+                .iter()
+                .map(|(term, alternatives)| {
+                    term.capacity()
+                        + alternatives.capacity() * std::mem::size_of::<String>()
+                        + alternatives.iter().map(String::capacity).sum::<usize>()
+                })
+                .sum::<usize>();
+
+        documents + inverted_index + doc_freq + synonyms
+    }
 }
 
 /// Index statistics
@@ -600,6 +655,25 @@ mod tests {
         let results = index.search("user", 10);
         assert!(!results.is_empty());
         assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_heap_bytes_grows_with_documents() {
+        let mut index = SearchIndex::new();
+        // A fresh index still holds the static synonym table, so the baseline
+        // is non-zero; indexing real content must push it strictly higher.
+        let baseline = index.heap_bytes();
+        index.index_file("user.rs", "pub fn get_user_by_id(id: u32) -> User { user }");
+        let after_one = index.heap_bytes();
+        assert!(after_one > baseline, "indexing a file must grow heap_bytes");
+        index.index_file(
+            "order.rs",
+            "pub fn create_order(user: &User) -> Order { order }",
+        );
+        assert!(
+            index.heap_bytes() > after_one,
+            "indexing a second file must grow heap_bytes further"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::embeddings::EmbeddingEngine;
 use crate::git::GitRepo;
 use crate::gtags::GtagsManager;
 use crate::lsp::{LspConfig, LspManager};
-use crate::metrics::{spawn_flush_task, Metrics, DEFAULT_FLUSH_INTERVAL};
+use crate::metrics::{spawn_flush_task, MemoryReport, Metrics, DEFAULT_FLUSH_INTERVAL};
 use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
@@ -681,6 +681,7 @@ impl CodeIntelEngine {
 
         self.initialization_complete.store(true, Ordering::Release);
         info!("Background initialization complete");
+        info!("{}", self.memory_report().summary_line());
 
         Ok(())
     }
@@ -969,8 +970,7 @@ impl CodeIntelEngine {
                 is_c_source_ext(ext)
             })
             .count();
-        if self.options.use_compile_commands
-            && cxx_source_count >= COMPILE_COMMANDS_MIN_CXX_SOURCES
+        if self.options.use_compile_commands && cxx_source_count >= COMPILE_COMMANDS_MIN_CXX_SOURCES
         {
             let explicit: Option<&Path> = self.options.compile_commands_path.as_deref();
             let compiled = if let Some(p) = explicit {
@@ -3686,6 +3686,96 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Walk every in-memory subsystem and return a heap breakdown. Sizes the
+    /// engine-owned collections (symbols, file_cache, repos, git_repos) here and
+    /// delegates to each subsystem's `heap_bytes()` for the rest. Sizes are
+    /// estimates from container capacities and owned allocations — see
+    /// [`MemoryReport`].
+    pub fn memory_report(&self) -> MemoryReport {
+        use crate::metrics::hashmap_table_bytes;
+
+        // symbols: DashMap<String, Vec<Symbol>>
+        let symbols = hashmap_table_bytes::<String, Vec<Symbol>>(self.symbols.len())
+            + self
+                .symbols
+                .iter()
+                .map(|entry| {
+                    entry.key().capacity()
+                        + entry.value().capacity() * std::mem::size_of::<Symbol>()
+                        + entry.value().iter().map(Symbol::heap_bytes).sum::<usize>()
+                })
+                .sum::<usize>();
+
+        // file_cache: DashMap<PathBuf, Arc<String>> — content is shared via Arc
+        // but each entry holds a distinct file, so count each once.
+        let file_cache = hashmap_table_bytes::<PathBuf, Arc<String>>(self.file_cache.len())
+            + self
+                .file_cache
+                .iter()
+                .map(|entry| entry.key().capacity() + entry.value().capacity())
+                .sum::<usize>();
+
+        // repos: DashMap<String, RepoMetadata>
+        let repos = hashmap_table_bytes::<String, RepoMetadata>(self.repos.len())
+            + self
+                .repos
+                .iter()
+                .map(|entry| {
+                    let meta = entry.value();
+                    entry.key().capacity()
+                        + meta.name.capacity()
+                        + meta.path.capacity()
+                        + hashmap_table_bytes::<String, LanguageStats>(meta.languages.capacity())
+                        + meta.languages.keys().map(String::capacity).sum::<usize>()
+                        + meta.head_hash.as_ref().map_or(0, String::capacity)
+                        + meta.cdb_hash.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>();
+
+        // git_repos: DashMap<String, GitRepo> — only the keys are tracked;
+        // libgit2 keeps its own buffers that are invisible here.
+        let git_repos = hashmap_table_bytes::<String, GitRepo>(self.git_repos.len())
+            + self
+                .git_repos
+                .iter()
+                .map(|entry| entry.key().capacity())
+                .sum::<usize>();
+
+        // call_graphs: DashMap<String, CallGraph>
+        let call_graphs = hashmap_table_bytes::<String, CallGraph>(self.call_graphs.len())
+            + self
+                .call_graphs
+                .iter()
+                .map(|entry| entry.key().capacity() + entry.value().heap_bytes())
+                .sum::<usize>();
+
+        MemoryReport {
+            symbols,
+            search_index: self.search_index.inner.read().heap_bytes(),
+            embeddings: self.embedding_engine.heap_bytes(),
+            file_cache,
+            call_graphs,
+            repos,
+            git_repos,
+            neural: 0,
+            process_rss: Self::process_rss_bytes(),
+        }
+    }
+
+    /// Resident set size in bytes from the `VmRSS:` line of /proc/self/status
+    /// (already in kB, so no page-size lookup is needed). None when the file is
+    /// unavailable (non-Linux).
+    fn process_rss_bytes() -> Option<usize> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+
     /// Get status of the search index
     pub async fn get_index_status(&self, repo: Option<&str>) -> Result<String> {
         // Resolve the optional repo filter to a canonical path; an unknown or
@@ -3813,6 +3903,8 @@ impl CodeIntelEngine {
                 ));
             }
         }
+
+        output.push_str(&self.memory_report().render_markdown());
 
         Ok(output)
     }
@@ -7959,10 +8051,8 @@ impl CodeIntelEngine {
 
         if let Some(backends) = &backend_refs {
             // Build a per-backend key set for fast membership tests
-            let mut backend_keys: HashMap<
-                String,
-                std::collections::HashSet<(String, usize)>,
-            > = HashMap::new();
+            let mut backend_keys: HashMap<String, std::collections::HashSet<(String, usize)>> =
+                HashMap::new();
             for (label, refs) in backends {
                 let keys = refs.iter().map(|(f, l, _)| (f.clone(), *l)).collect();
                 backend_keys.insert(label.clone(), keys);

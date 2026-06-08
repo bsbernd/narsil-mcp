@@ -267,6 +267,29 @@ impl VectorStore {
         self.documents.clear();
         self.id_to_idx.clear();
     }
+
+    /// Estimated heap held by the store: the document Vec (inline structs plus
+    /// each doc's id/file_path/content strings and dense embedding vector) and
+    /// the id_to_idx lookup. Content strings are normally empty post-finalize.
+    fn heap_bytes(&self) -> usize {
+        let documents = self.documents.capacity() * std::mem::size_of::<EmbeddedDocument>()
+            + self
+                .documents
+                .iter()
+                .map(|doc| {
+                    doc.id.capacity()
+                        + doc.file_path.capacity()
+                        + doc.content.capacity()
+                        + doc.embedding.capacity() * std::mem::size_of::<f32>()
+                })
+                .sum::<usize>();
+
+        let id_to_idx =
+            crate::metrics::hashmap_table_bytes::<String, usize>(self.id_to_idx.capacity())
+                + self.id_to_idx.keys().map(String::capacity).sum::<usize>();
+
+        documents + id_to_idx
+    }
 }
 
 impl Default for VectorStore {
@@ -330,6 +353,11 @@ impl ConcurrentVectorStore {
         for doc in &mut store.documents {
             doc.content = String::new();
         }
+    }
+
+    /// Estimated heap held by the underlying vector store.
+    pub fn heap_bytes(&self) -> usize {
+        self.inner.read().heap_bytes()
     }
 }
 
@@ -418,6 +446,30 @@ impl EmbeddingEngine {
         provider.total_docs = 0;
         provider.vocabulary.clear();
     }
+
+    /// Estimated heap held by the TF-IDF engine: the provider's document-freq
+    /// and vocabulary maps plus the vector store (dense per-doc embeddings).
+    pub fn heap_bytes(&self) -> usize {
+        use crate::metrics::hashmap_table_bytes;
+
+        let provider = self.provider.read();
+        let provider_bytes =
+            hashmap_table_bytes::<String, usize>(provider.document_freq.capacity())
+                + provider
+                    .document_freq
+                    .keys()
+                    .map(String::capacity)
+                    .sum::<usize>()
+                + hashmap_table_bytes::<String, usize>(provider.vocabulary.capacity())
+                + provider
+                    .vocabulary
+                    .keys()
+                    .map(String::capacity)
+                    .sum::<usize>();
+        drop(provider);
+
+        provider_bytes + self.store.heap_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -502,6 +554,31 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].document.id, "doc1"); // Should be most similar
         assert!(results[0].similarity > results[1].similarity);
+    }
+
+    #[test]
+    fn test_heap_bytes_grows_with_indexing() {
+        let engine = EmbeddingEngine::new(100);
+        let baseline = engine.heap_bytes();
+        engine.index_snippet(
+            "doc1".to_string(),
+            "test.rs".to_string(),
+            "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
+            1,
+            1,
+        );
+        let after_index = engine.heap_bytes();
+        assert!(
+            after_index > baseline,
+            "indexing a snippet must grow heap_bytes"
+        );
+        // finalize() allocates the dense per-doc embedding vector, so the heap
+        // grows again even though content strings are cleared afterwards.
+        engine.finalize();
+        assert!(
+            engine.heap_bytes() > after_index,
+            "finalize must allocate the embedding vector"
+        );
     }
 
     #[test]

@@ -96,6 +96,28 @@ impl Default for CallGraph {
     }
 }
 
+/// Heap bytes owned by one call edge (strings + line_conflicts Vec). Excludes
+/// the edge's inline footprint, counted by the holding Vec's capacity.
+fn call_edge_heap_bytes(edge: &CallEdge) -> usize {
+    edge.target.capacity()
+        + edge.file_path.capacity()
+        + edge.scope_hint.as_ref().map_or(0, String::capacity)
+        + edge.line_conflicts.capacity() * std::mem::size_of::<SourceLine>()
+}
+
+/// Heap behind a `DashMap<String, Vec<String>>`: key buffers plus each Vec's
+/// inline String slots and their buffers. The map's slot table is sized by the
+/// caller; DashMap does not expose slot capacity, so len() approximates it.
+fn string_vec_map_heap_bytes(map: &DashMap<String, Vec<String>>) -> usize {
+    map.iter()
+        .map(|entry| {
+            entry.key().capacity()
+                + entry.value().capacity() * std::mem::size_of::<String>()
+                + entry.value().iter().map(String::capacity).sum::<usize>()
+        })
+        .sum()
+}
+
 impl CallGraph {
     pub fn new() -> Self {
         Self {
@@ -103,6 +125,42 @@ impl CallGraph {
             file_functions: DashMap::new(),
             name_index: DashMap::new(),
         }
+    }
+
+    /// Estimated heap held by this call graph: the three DashMaps' slot tables,
+    /// their String keys, and the CallNodes with their CallEdge vectors. DashMap
+    /// does not expose slot capacity, so per-map table overhead is approximated
+    /// from len().
+    pub fn heap_bytes(&self) -> usize {
+        use crate::metrics::hashmap_table_bytes;
+
+        let nodes = hashmap_table_bytes::<String, CallNode>(self.nodes.len())
+            + self
+                .nodes
+                .iter()
+                .map(|entry| {
+                    let node = entry.value();
+                    entry.key().capacity()
+                        + node.name.capacity()
+                        + node.file_path.capacity()
+                        + node.calls.capacity() * std::mem::size_of::<CallEdge>()
+                        + node.calls.iter().map(call_edge_heap_bytes).sum::<usize>()
+                        + node.called_by.capacity() * std::mem::size_of::<CallEdge>()
+                        + node
+                            .called_by
+                            .iter()
+                            .map(call_edge_heap_bytes)
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+
+        let file_functions = hashmap_table_bytes::<String, Vec<String>>(self.file_functions.len())
+            + string_vec_map_heap_bytes(&self.file_functions);
+
+        let name_index = hashmap_table_bytes::<String, Vec<String>>(self.name_index.len())
+            + string_vec_map_heap_bytes(&self.name_index);
+
+        nodes + file_functions + name_index
     }
 
     /// Build call graph from parsed files

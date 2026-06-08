@@ -228,6 +228,18 @@ impl Symbol {
     pub fn line_count(&self) -> usize {
         self.end_line.saturating_sub(self.start_line) + 1
     }
+
+    /// Heap bytes owned by this symbol: the string buffers plus the
+    /// `line_conflicts` Vec. Excludes the struct's own inline footprint, which
+    /// is counted by the holding `Vec<Symbol>`'s capacity.
+    pub fn heap_bytes(&self) -> usize {
+        self.name.capacity()
+            + self.file_path.capacity()
+            + self.signature.as_ref().map_or(0, String::capacity)
+            + self.qualified_name.as_ref().map_or(0, String::capacity)
+            + self.doc_comment.as_ref().map_or(0, String::capacity)
+            + self.line_conflicts.capacity() * std::mem::size_of::<SourceLine>()
+    }
 }
 
 #[cfg(test)]
