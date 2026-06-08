@@ -1568,7 +1568,9 @@ impl CodeIntelEngine {
         // Clear all caches on full reindex
         self.analysis_cache.clear();
         self.query_cache.clear();
-        self.index_repos().await
+        let result = self.index_repos().await;
+        self.refresh_memory_snapshot();
+        result
     }
 
     pub async fn reindex(&self, repo: Option<&str>) -> Result<String> {
@@ -1589,6 +1591,7 @@ impl CodeIntelEngine {
                 self.query_cache.invalidate_for_repo(&repo_key);
                 self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
                 self.index_repo(&path).await?;
+                self.refresh_memory_snapshot();
                 Ok(format!("Re-indexed repository: {}", repo_key))
             }
             None => {
@@ -3334,6 +3337,12 @@ impl CodeIntelEngine {
             }
         }
 
+        // Re-measure only when something was actually re-indexed (a lone
+        // compile_commands.json restart that touches no sources leaves count 0).
+        if count > 0 {
+            self.refresh_memory_snapshot();
+        }
+
         Ok(count)
     }
 
@@ -3778,6 +3787,14 @@ impl CodeIntelEngine {
             }
         }
         None
+    }
+
+    /// Re-measure the live heap and hand it to metrics so the next flush
+    /// persists an up-to-date snapshot. Called after a runtime re-index changes
+    /// the in-memory subsystems. `memory_report()` walks every DashMap, so this
+    /// is only invoked on actual re-index events, never on a timer.
+    fn refresh_memory_snapshot(&self) {
+        self.metrics.set_memory_report(self.memory_report());
     }
 
     /// Get status of the search index
