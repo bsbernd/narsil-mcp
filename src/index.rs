@@ -829,8 +829,15 @@ impl CodeIntelEngine {
             Some(meta) => (meta.head_hash.clone(), meta.cdb_hash.clone()),
             None => return false,
         };
-        prior_head == self.git_head_hash(repo_path)
-            && prior_cdb == self.compile_commands_hash(repo_path)
+        let head = self.git_head_hash(repo_path);
+        let cdb = self.compile_commands_hash(repo_path);
+        // With neither a git HEAD nor a compile_commands.json there is no fingerprint
+        // to prove freshness, so an in-place edit between restarts would go undetected
+        // and stale symbols would be served. Treat the cache as invalid and rebuild.
+        if head.is_none() && cdb.is_none() {
+            return false;
+        }
+        prior_head == head && prior_cdb == cdb
     }
 
     /// Persisted per-file `(content_hash, symbols)` for a repo, keyed by the
