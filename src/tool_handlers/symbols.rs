@@ -18,7 +18,10 @@ impl ToolHandler for FindSymbolsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let symbol_type = args.get_str("symbol_type");
-        let pattern = args.get_str("pattern");
+        // Accept `query` as an alias for `pattern`: it is the filter key callers most
+        // often reach for (search_code/semantic_search/hybrid_search all name it
+        // `query`), and without the alias it silently degrades to a match-all dump.
+        let pattern = args.get_str("pattern").or_else(|| args.get_str("query"));
         let file_pattern = args.get_str("file_pattern");
         let exclude_tests = args.get_bool("exclude_tests");
         let limit = args.get_u64_or("limit", 500) as usize;

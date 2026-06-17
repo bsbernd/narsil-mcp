@@ -122,7 +122,14 @@ async fn test_persistence_index_loading() -> Result<()> {
         engine.complete_initialization().await?;
 
         let symbols = engine
-            .find_symbols(repo.path().to_str().unwrap(), None, None, None, None, 100)
+            .find_symbols(
+                repo.path().to_str().unwrap(),
+                None,
+                Some("*"),
+                None,
+                None,
+                100,
+            )
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -145,7 +152,14 @@ async fn test_persistence_index_loading() -> Result<()> {
 
         // Verify symbols are available (loaded from cache)
         let symbols = engine2
-            .find_symbols(repo.path().to_str().unwrap(), None, None, None, None, 100)
+            .find_symbols(
+                repo.path().to_str().unwrap(),
+                None,
+                Some("*"),
+                None,
+                None,
+                100,
+            )
             .await?;
         assert!(symbols.contains("User"));
         assert!(symbols.contains("create_user"));
@@ -278,7 +292,14 @@ async fn test_persistence_disabled() -> Result<()> {
 
     // Verify it still works, just doesn't persist
     let symbols = engine
-        .find_symbols(repo.path().to_str().unwrap(), None, None, None, None, 100)
+        .find_symbols(
+            repo.path().to_str().unwrap(),
+            None,
+            Some("*"),
+            None,
+            None,
+            100,
+        )
         .await?;
     assert!(symbols.contains("test"));
 
@@ -339,7 +360,14 @@ async fn test_empty_persisted_index() -> Result<()> {
         engine2.complete_initialization().await?;
 
         let symbols = engine2
-            .find_symbols(repo.path().to_str().unwrap(), None, None, None, None, 100)
+            .find_symbols(
+                repo.path().to_str().unwrap(),
+                None,
+                Some("*"),
+                None,
+                None,
+                100,
+            )
             .await?;
         assert!(symbols.contains("new_function"));
     }
@@ -687,7 +715,7 @@ async fn test_compile_commands_filter_skipped_below_threshold() -> Result<()> {
 
     let repo_key = repo_path.to_string_lossy().to_string();
     let symbols = engine
-        .find_symbols(&repo_key, None, None, None, None, 100)
+        .find_symbols(&repo_key, None, Some("*"), None, None, 100)
         .await?;
     for idx in 0..4 {
         assert!(
@@ -737,7 +765,7 @@ async fn test_compile_commands_filter_applied_at_threshold() -> Result<()> {
 
     let repo_key = repo_path.to_string_lossy().to_string();
     let symbols = engine
-        .find_symbols(&repo_key, None, None, None, None, 100)
+        .find_symbols(&repo_key, None, Some("*"), None, None, 100)
         .await?;
     assert!(
         symbols.contains("func_0"),

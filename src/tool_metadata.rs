@@ -339,7 +339,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "symbol_type": {"type": "string", "enum": ["struct", "class", "enum", "interface", "function", "method", "trait", "type", "all"], "description": "Type of symbol to find (default: all)"},
-                    "pattern": {"type": "string", "description": "Pattern to filter symbol names: use '*'/'?' wildcards for glob matching (e.g. 'fuse_*'), or a plain string for case-insensitive substring matching"},
+                    "pattern": {"type": "string", "description": "Pattern to filter symbol names: use '*'/'?' wildcards for glob matching (e.g. 'fuse_*'), or a plain string for case-insensitive substring matching. Required unless symbol_type/file_pattern is given; pass '*' to list everything. Also accepted under the alias 'query'."},
+                    "query": {"type": "string", "description": "Alias for 'pattern'."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
                     "limit": {"type": "integer", "description": "Maximum number of symbols to return (default: 500)"}

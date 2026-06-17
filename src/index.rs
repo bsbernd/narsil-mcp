@@ -1883,6 +1883,19 @@ impl CodeIntelEngine {
 
         let repo = self.resolve_repo(repo)?;
 
+        // A missing name filter must not silently dump every symbol in the repo: a
+        // misnamed argument (e.g. `query=` before it was aliased, or a typo) lands here
+        // with no filter and would return the first `limit` symbols of the whole repo.
+        // Refuse with guidance; an explicit `pattern="*"` is the way to list everything.
+        if pattern.is_none() && file_pattern.is_none() && symbol_type.is_none() {
+            return Ok(format!(
+                "# Symbols in {}\n\nNo `pattern` (or `query`) given — refusing to list \
+                 every symbol.\nPass a name pattern, e.g. `pattern=\"next_mount_opt\"` or \
+                 `pattern=\"fuse_*\"`; use `pattern=\"*\"` to list all.\n",
+                repo
+            ));
+        }
+
         // Build cache key from query parameters
         let cache_key = {
             let options = SearchOptions {
@@ -1936,7 +1949,7 @@ impl CodeIntelEngine {
 
         let file_glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
 
-        let filtered: Vec<_> = symbols
+        let mut filtered: Vec<_> = symbols
             .iter()
             .filter(|s| {
                 if exclude_tests && is_test_file(&s.file_path) {
@@ -1965,6 +1978,23 @@ impl CodeIntelEngine {
                 true
             })
             .collect();
+
+        // Surface the most relevant matches within `limit`: exact name (case-insensitive)
+        // first, then prefix, then substring/other. Stable sort keeps insertion order on
+        // ties, so a specific pattern lands its intended symbol at the top of the window.
+        if let Some(pat) = pattern {
+            let pat_lc = pat.to_lowercase();
+            filtered.sort_by_key(|s| {
+                let name_lc = s.name.to_lowercase();
+                if name_lc == pat_lc {
+                    0u8
+                } else if name_lc.starts_with(&pat_lc) {
+                    1
+                } else {
+                    2
+                }
+            });
+        }
 
         let total = filtered.len();
 
