@@ -874,6 +874,29 @@ impl CodeIntelEngine {
             && repo_path.join("GTAGS").exists()
     }
 
+    /// Refresh the GTAGS database for `repo_path` when gtags is the active C/C++
+    /// backend, mirroring index_repo's refresh gating. The watch path calls this
+    /// wherever it brings clangd back in sync (compile_commands change, source edit)
+    /// so the gtags peer backend does not silently drift its line numbers.
+    async fn refresh_gtags_if_active(&self, repo_path: &Path) {
+        // gtags_repo_enabled == gtags is genuinely active here (manager present,
+        // intent not Off, a GTAGS db exists) — i.e. "if gtags is used".
+        if !self.gtags_repo_enabled(repo_path) {
+            return;
+        }
+        if self.options.gtags_generate && crate::gtags::gtags_binary_present() {
+            if let Some(gtags) = &self.gtags_manager {
+                gtags.update_database(repo_path).await; // global -u, incremental
+            }
+        } else {
+            warn!(
+                "gtags: {:?} changed under watch but GTAGS was not refreshed (pass \
+                 --gtags-generate to refresh automatically); cross-validation degraded.",
+                repo_path
+            );
+        }
+    }
+
     /// Backends enabled for cross-validation on `repo_path`. tree-sitter is
     /// always present; the C/C++ LSP backends and gtags count only for C/C++
     /// data (`is_cxx`) and only when this repo actually enabled them. Gates
@@ -3234,6 +3257,9 @@ impl CodeIntelEngine {
         let mut pending: HashMap<String, RepoPending> = HashMap::new();
 
         let mut count = 0;
+        // Repos whose C/C++ sources changed this batch: their GTAGS db drifts on every
+        // edit, so refresh it once per repo after the loop (not per file).
+        let mut gtags_dirty: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         for change in changes {
             // compile_commands.json regenerated → clangd holds stale flags. Restart
@@ -3256,6 +3282,9 @@ impl CodeIntelEngine {
                 // ones. LSP is restarted first so the augment sees fresh flags.
                 if let Some(repo_path) = self.repo_for_compile_commands(&change.path) {
                     count += self.reindex_compile_commands_delta(&repo_path).await;
+                    // gtags is the peer C/C++ backend: keep its database in sync with
+                    // the changed source set, just as clangd was restarted above.
+                    self.refresh_gtags_if_active(&repo_path).await;
                 }
                 continue;
             }
@@ -3281,6 +3310,15 @@ impl CodeIntelEngine {
                     continue;
                 }
             };
+
+            // A C/C++ source changed (created/modified/deleted): flag the repo so its
+            // GTAGS database is refreshed below, keeping the gtags backend in sync.
+            if matches!(
+                get_language_from_path(&change.path.to_string_lossy()).as_str(),
+                "c" | "cpp"
+            ) {
+                gtags_dirty.insert(repo_path.to_path_buf());
+            }
 
             match change.change_type {
                 ChangeType::Created | ChangeType::Modified => {
@@ -3400,6 +3438,12 @@ impl CodeIntelEngine {
                     }
                 }
             }
+        }
+
+        // Bring the gtags peer backend in sync for every repo whose C/C++ sources
+        // changed — once per repo, since the watcher already debounces/batches.
+        for repo_path in &gtags_dirty {
+            self.refresh_gtags_if_active(repo_path).await;
         }
 
         // Re-measure only when something was actually re-indexed (a lone
