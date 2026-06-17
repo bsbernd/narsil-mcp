@@ -160,6 +160,34 @@ impl GtagsManager {
         }
     }
 
+    /// Run `global -x SYMBOL` from `repo_path` and return parsed definitions.
+    ///
+    /// Without `-r`, `global -x` reports definition sites (the tag), in the same
+    /// space-separated format as `-rx`:
+    ///   NAME  LINE  FILE  SOURCE_TEXT
+    ///
+    /// Returns an empty vec when global is missing, the GTAGS database is absent,
+    /// or the symbol is not defined.
+    pub async fn find_definitions(
+        &self,
+        symbol: &str,
+        repo_path: &Path,
+    ) -> Vec<(String, usize, String)> {
+        let output = tokio::process::Command::new("global")
+            .args(["-x", symbol])
+            .current_dir(repo_path)
+            .output()
+            .await;
+
+        match output {
+            Err(e) => {
+                debug!("gtags: global -x unavailable: {}", e);
+                vec![]
+            }
+            Ok(out) => Self::parse_output(&out.stdout, repo_path),
+        }
+    }
+
     /// Parse `global -x -f` output into (name, line) pairs. Lines that lack a
     /// numeric line column are skipped.
     fn parse_file_symbols(stdout: &[u8]) -> Vec<(String, usize)> {

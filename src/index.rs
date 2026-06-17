@@ -2111,6 +2111,48 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
+    /// Render a definition located via gtags when the AST symbol table missed it
+    /// (e.g. a file-local static the C parser dropped). gtags yields only the start
+    /// line, not an AST end line, so a bounded window after it is shown and the
+    /// provenance is flagged as approximate.
+    fn render_gtags_definition(
+        &self,
+        repo_path: &Path,
+        symbol_name: &str,
+        rel_file: &str,
+        start_line: usize,
+        context_lines: usize,
+    ) -> Result<String> {
+        // Number of body lines shown after the definition site, since gtags gives no
+        // end line; enough to reveal a typical signature and the start of the body.
+        const GTAGS_DEF_WINDOW: usize = 40;
+
+        let file_path = validate_path(repo_path, rel_file)?;
+        let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = start_line.saturating_sub(context_lines + 1);
+        let end = (start_line + GTAGS_DEF_WINDOW).min(lines.len());
+
+        let mut output = String::new();
+        output.push_str(&format!("# {}\n\n", symbol_name));
+        output.push_str(&format!("**File**: `{}`\n", rel_file));
+        output.push_str(&format!("**Line**: {}\n", start_line));
+        output.push_str(
+            "**Provenance**: located via gtags (GNU Global); the AST symbol table \
+             missed it, so the shown body window is approximate\n\n",
+        );
+        output.push_str("```");
+        output.push_str(get_language_id(rel_file));
+        output.push('\n');
+        for (offset, line) in lines[start..end].iter().enumerate() {
+            let line_num = start + offset + 1;
+            let marker = if line_num == start_line { "→" } else { " " };
+            output.push_str(&format!("{} {:4} │ {}\n", marker, line_num, line));
+        }
+        output.push_str("```\n");
+        Ok(output)
+    }
+
     pub async fn get_symbol_definition(
         &self,
         repo: &str,
@@ -2125,16 +2167,54 @@ impl CodeIntelEngine {
             .ok_or_else(|| self.repo_not_found_error(&repo))?;
 
         // Find matching symbol
-        let symbol = symbols
+        let symbol = match symbols
             .iter()
             .find(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
-            .ok_or_else(|| {
-                anyhow!(
-                    "Symbol '{}' not found in repository '{}'",
+        {
+            Some(s) => s,
+            None => {
+                // AST miss (e.g. a file-local static the C parser dropped): consult
+                // gtags, which indexes definitions independently of the AST pass.
+                if self.gtags_repo_enabled(&repo_path) {
+                    if let Some(gtags) = &self.gtags_manager {
+                        if let Some((file, line, _)) = gtags
+                            .find_definitions(symbol_name, &repo_path)
+                            .await
+                            .into_iter()
+                            .next()
+                        {
+                            return self.render_gtags_definition(
+                                &repo_path,
+                                symbol_name,
+                                &file,
+                                line,
+                                context_lines,
+                            );
+                        }
+                    }
+                }
+                // Still nothing: offer near-miss candidates rather than a bare error,
+                // so the caller can re-query instead of falling back to grep.
+                let mut hints: Vec<&str> = symbols
+                    .iter()
+                    .filter(|s| s.name.to_lowercase().contains(&symbol_name.to_lowercase()))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                hints.sort_unstable();
+                hints.dedup();
+                hints.truncate(10);
+                return Err(anyhow!(
+                    "Symbol '{}' not found in repository '{}'.{}",
                     symbol_name,
-                    repo
-                )
-            })?;
+                    repo,
+                    if hints.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Did you mean: {}", hints.join(", "))
+                    }
+                ));
+            }
+        };
 
         let file_path = validate_path(&repo_path, &symbol.file_path)?;
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
