@@ -267,7 +267,8 @@ fn test_list_repos() -> Result<()> {
     let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
-    let response = server.call_tool("list_repos", json!({}))?;
+    // detail=true so the per-language breakdown (checked below) is emitted.
+    let response = server.call_tool("list_repos", json!({"detail": true}))?;
 
     assert!(response["error"].is_null());
     let content = response["result"]["content"][0]["text"]
@@ -1087,7 +1088,8 @@ interface TypeScriptInterface {
     let repo_name = repo.path().to_str().unwrap();
     server.wait_for_repo(repo_name, Duration::from_secs(30))?;
 
-    let response = server.call_tool("list_repos", json!({}))?;
+    // detail=true so the per-language breakdown (checked below) is emitted.
+    let response = server.call_tool("list_repos", json!({"detail": true}))?;
 
     assert!(response["error"].is_null());
     let content = response["result"]["content"][0]["text"]

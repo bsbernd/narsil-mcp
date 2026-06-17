@@ -1776,6 +1776,21 @@ impl CodeIntelEngine {
     }
 
     pub async fn list_repos(&self) -> Result<String> {
+        // Back-compat: the bare form keeps the full per-language detail for all repos.
+        self.list_repos_scoped(None, true).await
+    }
+
+    /// List indexed repositories, optionally scoped to one and/or with the
+    /// per-language breakdown.
+    ///
+    /// @param[in] repo    Show only this repo (resolved like any `repo` arg); all if None.
+    /// @param[in] detail  Emit the per-language file/line table; compact summary if false.
+    pub async fn list_repos_scoped(&self, repo: Option<&str>, detail: bool) -> Result<String> {
+        let only: Option<String> = match repo {
+            Some(r) => Some(self.resolve_repo(r)?),
+            None => None,
+        };
+
         let mut output = String::new();
         output.push_str("# Indexed Repositories\n\n");
         output.push_str(
@@ -1784,30 +1799,46 @@ impl CodeIntelEngine {
              relative paths and `.` (current directory) are also accepted.\n\n",
         );
 
+        let mut shown = 0usize;
         for entry in self.repos.iter() {
+            if only.as_deref().is_some_and(|key| entry.key() != key) {
+                continue;
+            }
             let repo = entry.value();
             // The map key is the canonical absolute path string; the basename
             // is shown as a friendly label only.
             output.push_str(&format!("## {}\n", repo.name));
             output.push_str(&format!("- **Repo**: `{}`\n", entry.key()));
-            output.push_str(&format!("- **Files**: {}\n", repo.file_count));
-            output.push_str(&format!("- **Total Lines**: {}\n", repo.total_lines));
-            output.push_str("- **Languages**:\n");
 
-            let mut langs: Vec<_> = repo.languages.iter().collect();
-            langs.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.line_count));
+            if detail {
+                output.push_str(&format!("- **Files**: {}\n", repo.file_count));
+                output.push_str(&format!("- **Total Lines**: {}\n", repo.total_lines));
+                output.push_str("- **Languages**:\n");
 
-            for (lang, stats) in langs {
+                let mut langs: Vec<_> = repo.languages.iter().collect();
+                langs.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.line_count));
+
+                for (lang, stats) in langs {
+                    output.push_str(&format!(
+                        "  - {}: {} files, {} lines\n",
+                        lang, stats.file_count, stats.line_count
+                    ));
+                }
+            } else {
+                // Compact default: one summary line, no per-language table.
                 output.push_str(&format!(
-                    "  - {}: {} files, {} lines\n",
-                    lang, stats.file_count, stats.line_count
+                    "- **Files**: {}, **Lines**: {} (pass `detail=true` for languages)\n",
+                    repo.file_count, repo.total_lines
                 ));
             }
             output.push('\n');
+            shown += 1;
         }
 
         if self.repos.is_empty() {
             output.push_str("*No repositories indexed yet.*\n");
+        } else if shown == 0 {
+            output.push_str("*No matching repository.*\n");
         }
 
         Ok(output)

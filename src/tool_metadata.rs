@@ -131,13 +131,16 @@ lazy_static! {
 
         map.insert("list_repos", ToolMetadata {
             name: "list_repos",
-            description: "List all indexed repositories with metadata (path, language breakdown, file count)",
+            description: "List indexed repositories (path, file/line counts). Pass detail=true for the per-language breakdown, or repo=<path> to scope to one.",
             category: ToolCategory::Repository,
             tags: ["repository", "index", "metadata", "list"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
             performance: PerformanceImpact::Low,
             required_flags: HashSet::new(),
-            input_schema: json!({"type": "object", "properties": {}, "required": []}),
+            input_schema: json!({"type": "object", "properties": {
+                "repo": {"type": "string", "description": "Show only this repository (path or '.'); omit to list all"},
+                "detail": {"type": "boolean", "description": "Include the per-language file/line breakdown (default: false)"}
+            }, "required": []}),
             requires_api_key: false,
             aliases: vec!["repos", "list_repositories"],
         });

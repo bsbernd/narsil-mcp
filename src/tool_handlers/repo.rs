@@ -16,8 +16,10 @@ impl ToolHandler for ListReposHandler {
         "list_repos"
     }
 
-    async fn execute(&self, engine: &CodeIntelEngine, _args: Value) -> Result<String> {
-        engine.list_repos().await
+    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
+        let repo = args.get_str("repo");
+        let detail = args.get_bool_or("detail", false);
+        engine.list_repos_scoped(repo, detail).await
     }
 }
 
