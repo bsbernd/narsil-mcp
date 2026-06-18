@@ -630,7 +630,18 @@ impl LspManager {
         let init_params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: Some(Url::from_file_path(&workspace_root).unwrap()),
-            capabilities: ClientCapabilities::default(),
+            // Advertise hierarchical document symbols, else clangd/ccls reply with
+            // the legacy flat SymbolInformation[] that document_symbols_raw drops.
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    document_symbol: Some(DocumentSymbolClientCapabilities {
+                        hierarchical_document_symbol_support: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             trace: Some(TraceValue::Off),
             workspace_folders: Some(vec![workspace_folder]),
             client_info: Some(ClientInfo {
