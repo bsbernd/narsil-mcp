@@ -56,6 +56,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"], optional = true }
 async-trait = { version = "0.1", optional = true }
+futures = "0.3"  # FutureExt::catch_unwind for the panic-safe dispatch boundary
 
 # Tree-sitter for parsing
 tree-sitter = "0.26"
@@ -174,7 +175,9 @@ harness = false
 [profile.release]
 lto = "thin"
 codegen-units = 16
-panic = "abort"
+# Unwind (not abort) so a panic in one tool handler is caught at the MCP
+# dispatch boundary and returned as an error, instead of killing the server.
+panic = "unwind"
 strip = true
 
 [lib]

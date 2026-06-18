@@ -388,11 +388,21 @@ impl McpServer {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        // Dispatch to tool registry
-        let result: Result<String> = self
+        // Dispatch to tool registry. The release profile unwinds (not aborts),
+        // so catch a panicking handler here and turn it into an error instead
+        // of letting it take down the whole server for every other tool.
+        use futures::FutureExt;
+        let dispatch = self
             .tool_registry
-            .dispatch(tool_name, &self.engine, arguments)
-            .await;
+            .dispatch(tool_name, &self.engine, arguments);
+        let result: Result<String> =
+            match std::panic::AssertUnwindSafe(dispatch).catch_unwind().await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "Internal error: tool '{}' panicked",
+                    tool_name
+                )),
+            };
 
         // Record metrics and log execution time.  Cap at 60 s to exclude
         // suspend-inflated measurements (CLOCK_BOOTTIME advances during sleep).
