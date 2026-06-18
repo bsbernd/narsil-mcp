@@ -665,8 +665,8 @@ impl CodeIntelEngine {
             for repo in self.repos.iter() {
                 for lang in repo.value().languages.keys() {
                     match lang.as_str() {
-                        "C" => has_c = true,
-                        "C++" => has_cpp = true,
+                        "c" | "C" => has_c = true,
+                        "cpp" | "C++" => has_cpp = true,
                         _ => {}
                     }
                 }
@@ -1096,7 +1096,7 @@ impl CodeIntelEngine {
                 .to_string();
 
             if !symbols_cached {
-                let is_cxx = matches!(parsed.language.as_str(), "C" | "C++");
+                let is_cxx = is_cxx_language(parsed.language.as_str());
                 // On a fingerprint rebuild, an unchanged C/C++ file reuses its
                 // persisted (already-augmented) symbols, skipping the costly
                 // clangd/gtags round-trip below.
@@ -1152,7 +1152,7 @@ impl CodeIntelEngine {
         // backends actually run (Auto needs compile_commands.json / a GTAGS db).
         // gtags can build its database on demand first, size-gated, since it
         // writes into the repo tree.
-        let cxx_present = languages.contains_key("C") || languages.contains_key("C++");
+        let cxx_present = languages.keys().any(|lang| is_cxx_language(lang));
         if cxx_present
             && self.options.gtags_generate
             && self.options.gtags_intent != BackendIntent::Off
@@ -10665,6 +10665,14 @@ fn calculate_relevance(line: &str, query: &str) -> f32 {
     score
 }
 
+/// True for the tree-sitter language names of C and C++ sources. Accepts both
+/// the parser's lowercase config names ("c"/"cpp") and the capitalized display
+/// names from `ext_to_language` ("C"/"C++"), since the fresh-index and
+/// persisted-load paths key the languages map with different conventions.
+fn is_cxx_language(name: &str) -> bool {
+    matches!(name, "c" | "cpp" | "C" | "C++")
+}
+
 fn ext_to_language(ext: &str) -> String {
     match ext {
         "rs" => "Rust",
@@ -10900,6 +10908,28 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn cxx_parser_language_names_drive_augmentation_gate() {
+        // Regression: index_repo gates the clangd/ccls/gtags augmentation pass on
+        // is_cxx_language(parsed.language). The parser names C "c" and C++ "cpp"
+        // (lowercase); a stale uppercase "C"/"C++" comparison made the gate always
+        // false, so no C/C++ symbol was ever cross-validated. Couple the two so
+        // they cannot drift apart again.
+        let parser = crate::parser::LanguageParser::new().unwrap();
+        for (path, src) in [
+            ("a.c", "int f(void) { return 0; }\n"),
+            ("a.cpp", "int g() { return 0; }\n"),
+        ] {
+            let parsed = parser.parse_file(Path::new(path), src).unwrap();
+            assert!(
+                is_cxx_language(&parsed.language),
+                "parser language {:?} for {} is not recognized by is_cxx_language",
+                parsed.language,
+                path
+            );
+        }
     }
 
     fn sym(name: &str, line: usize, source: SourceSet) -> Symbol {
