@@ -2137,8 +2137,10 @@ impl CodeIntelEngine {
         let file_path = validate_path(repo_path, rel_file)?;
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
         let lines: Vec<&str> = content.lines().collect();
-        let start = start_line.saturating_sub(context_lines + 1);
+        // end is bounded by the file; clamp start so a line number past EOF
+        // yields an empty window instead of a slice-index panic.
         let end = (start_line + GTAGS_DEF_WINDOW).min(lines.len());
+        let start = start_line.saturating_sub(context_lines + 1).min(end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", symbol_name));
@@ -2227,8 +2229,10 @@ impl CodeIntelEngine {
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(context_lines + 1);
+        // end is bounded by the file; clamp start so a stale line number past
+        // EOF yields an empty window instead of a slice-index panic.
         let end = (symbol.end_line + context_lines).min(lines.len());
+        let start = symbol.start_line.saturating_sub(context_lines + 1).min(end);
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", symbol.name));
