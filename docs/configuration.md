@@ -99,6 +99,42 @@ narsil-mcp config profiles
 CLI flags still win, so `narsil-mcp --profile platform --repos ~/src/one-off`
 uses the explicit `--repos` value while keeping profile feature defaults.
 
+#### Per-repo overrides
+
+A repo entry can be either a bare path (all defaults) or a map carrying
+overrides for that repo alone. This is how a single large C repo is bounded
+without affecting the others in the profile:
+
+```yaml
+version: "1.0"
+profiles:
+  platform:
+    lsp: true
+    use_compile_commands: true
+    repos:
+      # Huge C tree: index only these subtrees and stop clangd/ccls from
+      # indexing the whole compile_commands.json in the background.
+      - path: ~/src/bigkernel
+        background_index: false
+        index_filter: [fs, mm, drivers/block]
+        lsp_scope: [fs]
+      # A C++ repo keeps the background index on (it needs cross-file
+      # resolution that gtags cannot provide).
+      - path: ~/src/cpp-engine
+      # A bare path uses all defaults.
+      - ~/src/liburing
+```
+
+- `index_filter` / `lsp_scope` accept paths **relative to the repo root**
+  (absolute paths also work). They override the global `--index-filter` /
+  `--lsp-scope` flags for that repo; a repo without its own list falls back to
+  those flags.
+- `background_index` defaults to `true`. Set it `false` on very large trees so
+  the language server does not index every translation unit; the on-demand
+  documentSymbol / callHierarchy passes and gtags still cover the repo.
+- ccls always writes its cache under the user cache directory, never a
+  `.ccls-cache/` inside the repository.
+
 ## Configuration Levels
 
 Configurations are loaded and merged with the following priority (highest to lowest):

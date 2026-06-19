@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-repo profile overrides for scope and background indexing**. A repo
+  entry in a `--profile` may now be a map (`{ path, index_filter, lsp_scope,
+  background_index }`) instead of a bare path. `index_filter`/`lsp_scope` are
+  repo-relative and override the global `--index-filter`/`--lsp-scope` flags for
+  that repo only; `background_index: false` launches clangd
+  (`--background-index=false`) / ccls (`index.initialBlacklist`) for a huge tree
+  so it is not indexed whole, while other repos keep it on. Language servers are
+  now keyed and rooted per repository (fixing a multi-repo bug where every
+  C/C++ query ran against whichever repo was listed first), and ccls writes its
+  cache under the user cache directory instead of a `.ccls-cache/` in the repo.
 - **Symbolic heap-overflow detection (CWE-122-001)**. A new `heap_size`
   subsystem builds a `SizeExpr` algebra for allocator calls
   (`malloc`/`calloc`/`realloc`/`asprintf`/`vasprintf`/`strdup`/`strndup`)
