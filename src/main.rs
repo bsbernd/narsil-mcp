@@ -249,6 +249,18 @@ struct ServerArgs {
     /// paths are queried via LSP. Comma-separated. Empty = whole repo (default).
     #[arg(long, env = "NARSIL_LSP_SCOPE", value_delimiter = ',')]
     lsp_scope: Vec<String>,
+
+    /// Restrict the base (tree-sitter) index to these paths: in a repo with any
+    /// matching file, only matching files (plus --include) are indexed at all —
+    /// nothing else exists in narsil for that repo. Same matching as --lsp-scope
+    /// (relative or absolute, recursive dirs, globs); use absolute paths to scope
+    /// one repo in a multi-repo server. A repo with no match is indexed in full,
+    /// so unrelated repos are untouched. Trade-off: out-of-scope files (incl.
+    /// headers) are absent, so narsil's symbols/call graph won't resolve into
+    /// them (a whole-repo GTAGS db still answers gtags reference queries).
+    /// Comma-separated. Empty = whole repo (the default).
+    #[arg(long, env = "NARSIL_INDEX_FILTER", value_delimiter = ',')]
+    index_filter: Vec<String>,
 }
 
 #[tokio::main]
@@ -491,6 +503,7 @@ async fn main() -> Result<()> {
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
         lsp_scope: server_args.lsp_scope,
+        index_filter: server_args.index_filter,
         gtags_enabled,
         lsp_intent,
         gtags_intent,
