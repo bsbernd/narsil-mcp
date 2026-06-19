@@ -243,6 +243,17 @@ impl LspManager {
         Ok(process)
     }
 
+    /// Parse one LSP message body. The serde_json recursion limit (128) is
+    /// disabled: clangd/ccls return deeply nested documentSymbol trees for
+    /// large files, and the input is trusted backend output, not adversarial.
+    fn parse_lsp_message(buffer: &[u8]) -> Result<LspMessage> {
+        let mut de = serde_json::Deserializer::from_slice(buffer);
+        de.disable_recursion_limit();
+        let message = LspMessage::deserialize(&mut de)?;
+        de.end()?;
+        Ok(message)
+    }
+
     /// Handle responses from LSP server
     async fn handle_responses(
         stdout: ChildStdout,
@@ -272,7 +283,7 @@ impl LspManager {
                 let mut buffer = vec![0u8; content_length];
                 tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buffer).await?;
 
-                let message: LspMessage = serde_json::from_slice(&buffer)?;
+                let message: LspMessage = Self::parse_lsp_message(&buffer)?;
                 debug!("Received LSP message: {:?}", message);
 
                 // Handle response
