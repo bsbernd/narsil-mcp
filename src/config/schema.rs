@@ -4,7 +4,7 @@
 /// They are designed to be serialized/deserialized with serde.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default version for configuration
 fn default_version() -> String {
@@ -58,12 +58,69 @@ impl Default for ToolConfig {
     }
 }
 
+/// One repository in a profile: either a bare path (all defaults) or a path
+/// with per-repo overrides. The untagged enum lets a YAML list mix both forms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RepoEntry {
+    /// `- ~/src/foo` — index the whole repo with the global defaults.
+    Path(PathBuf),
+    /// `- { path: ..., index_filter: [...], background_index: false }`.
+    Detailed(RepoEntrySettings),
+}
+
+/// Per-repo overrides for a profile entry. `index_filter`/`lsp_scope` accept
+/// paths relative to the repo root (no need to repeat the absolute prefix);
+/// absolute entries are also matched against the absolute path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoEntrySettings {
+    /// Repository path.
+    pub path: PathBuf,
+
+    /// clangd/ccls background indexing for this repo. None = use the default
+    /// (enabled). Set false on huge C repos to bound the language server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_index: Option<bool>,
+
+    /// Restrict the base (tree-sitter) index to these paths for this repo.
+    /// Overrides the global --index-filter when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_filter: Vec<String>,
+
+    /// Restrict the clangd/ccls augment pass to these paths for this repo.
+    /// Overrides the global --lsp-scope when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lsp_scope: Vec<String>,
+}
+
+impl RepoEntry {
+    /// The repository path, regardless of entry form.
+    pub fn path(&self) -> &Path {
+        match self {
+            RepoEntry::Path(path) => path,
+            RepoEntry::Detailed(settings) => &settings.path,
+        }
+    }
+
+    /// The per-repo overrides; a bare path yields all-default settings.
+    pub fn settings(&self) -> RepoEntrySettings {
+        match self {
+            RepoEntry::Path(path) => RepoEntrySettings {
+                path: path.clone(),
+                ..Default::default()
+            },
+            RepoEntry::Detailed(settings) => settings.clone(),
+        }
+    }
+}
+
 /// Named workspace profile selected with `--profile NAME`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoProfile {
-    /// Repository paths to index when this profile is selected.
+    /// Repository entries to index when this profile is selected. Each entry is
+    /// a bare path or a path with per-repo overrides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub repos: Vec<PathBuf>,
+    pub repos: Vec<RepoEntry>,
 
     /// Optional directory to auto-discover repositories from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,9 +375,39 @@ profiles:
         let config: ToolConfig = serde_saphyr::from_str(yaml).unwrap();
         let profile = config.profiles.get("work").unwrap();
         assert_eq!(profile.repos.len(), 2);
+        assert!(matches!(profile.repos[0], RepoEntry::Path(_)));
         assert_eq!(profile.git, Some(true));
         assert_eq!(profile.call_graph, Some(true));
         assert_eq!(profile.preset.as_deref(), Some("balanced"));
+    }
+
+    #[test]
+    fn test_repo_entry_mixed_bare_and_detailed() {
+        let yaml = r#"
+profiles:
+  work:
+    repos:
+      - ~/src/liburing
+      - path: ~/src/linux
+        background_index: false
+        index_filter: [fs, mm, io_uring]
+        lsp_scope: [fs/fuse]
+"#;
+        let config: ToolConfig = serde_saphyr::from_str(yaml).unwrap();
+        let profile = config.profiles.get("work").unwrap();
+        assert_eq!(profile.repos.len(), 2);
+
+        // Bare path -> all defaults.
+        let bare = profile.repos[0].settings();
+        assert_eq!(bare.background_index, None);
+        assert!(bare.index_filter.is_empty());
+
+        // Detailed entry -> overrides carried through.
+        let detailed = profile.repos[1].settings();
+        assert_eq!(detailed.path, PathBuf::from("~/src/linux"));
+        assert_eq!(detailed.background_index, Some(false));
+        assert_eq!(detailed.index_filter, vec!["fs", "mm", "io_uring"]);
+        assert_eq!(detailed.lsp_scope, vec!["fs/fuse"]);
     }
 
     #[test]

@@ -169,6 +169,10 @@ pub struct EngineOptions {
     /// with any matching file indexes only matching files (plus --include).
     /// A repo with no match is indexed in full. Empty means the whole repo.
     pub index_filter: Vec<String>,
+    /// Per-repo overrides (from a `--profile` config). A repo listed here uses
+    /// its own index_filter/lsp_scope/background_index; `lsp_scope`/`index_filter`
+    /// above remain the defaults for any repo without an entry.
+    pub repo_settings: Vec<crate::config::schema::RepoEntrySettings>,
     /// Enable GNU Global (gtags) as an additional C/C++ reference backend
     pub gtags_enabled: bool,
     /// Per-repo intent for LSP index-time augmentation (On/Off/Auto).
@@ -205,6 +209,7 @@ impl Default for EngineOptions {
             include: Vec::new(),
             lsp_scope: Vec::new(),
             index_filter: Vec::new(),
+            repo_settings: Vec::new(),
             gtags_enabled: false,
             lsp_intent: BackendIntent::default(),
             gtags_intent: BackendIntent::default(),
@@ -220,9 +225,20 @@ impl Default for EngineOptions {
 /// One compiled scope entry (`--lsp-scope` / `--index-filter`). A plain path is a
 /// recursive directory prefix; an entry with glob metacharacters is matched with
 /// `glob`. Matched against both the repo-relative and the absolute path.
+#[derive(Clone)]
 enum ScopeRule {
     Prefix(String),
     Glob(glob::Pattern),
+}
+
+/// Per-repo compiled scope rules. Built once per repo in `with_options` from
+/// the profile entry (falling back to the global `--index-filter`/`--lsp-scope`
+/// defaults when the entry omits them).
+struct CompiledRepoSettings {
+    /// Effective `--index-filter` rules for this repo (empty = whole repo).
+    index_filter: Vec<ScopeRule>,
+    /// Effective `--lsp-scope` rules for this repo (empty = whole repo).
+    lsp_scope: Vec<ScopeRule>,
 }
 
 /// Compile raw scope entries (paths or globs) into matchers. Invalid globs are
@@ -321,11 +337,15 @@ pub struct CodeIntelEngine {
     /// Last time a `global -u` ran per repo, to debounce gtags refreshes under
     /// a burst of file events.
     gtags_last_refresh: DashMap<PathBuf, std::time::Instant>,
-    /// Compiled `--lsp-scope` rules; empty means the clangd/ccls pass runs for
-    /// the whole repo (the default).
-    lsp_scope: Vec<ScopeRule>,
-    /// Compiled `--index-filter` rules; empty means the whole repo is indexed.
-    index_filter: Vec<ScopeRule>,
+    /// Global `--lsp-scope` rules, used as the default for any repo without a
+    /// per-repo override; empty means the clangd/ccls pass runs repo-wide.
+    default_lsp_scope: Vec<ScopeRule>,
+    /// Global `--index-filter` rules, used as the default for any repo without a
+    /// per-repo override; empty means the whole repo is indexed.
+    default_index_filter: Vec<ScopeRule>,
+    /// Per-repo compiled scope rules and flags, keyed by canonical repo path.
+    /// A repo absent here falls back to the global defaults above.
+    repo_settings: std::collections::HashMap<String, CompiledRepoSettings>,
     /// Per-repo memo: true when the repo had >=1 file under `--index-filter`, so
     /// the watch path can drop changes to out-of-scope files. Absent = not
     /// scoped (full index), which keeps unrelated repos untouched.
@@ -481,9 +501,43 @@ impl CodeIntelEngine {
         let metrics = Arc::new(Metrics::with_persistence(expanded_index.clone()));
         let flush_task = spawn_flush_task(Arc::clone(&metrics), DEFAULT_FLUSH_INTERVAL);
 
-        // Compile the path-scope flags once.
-        let lsp_scope = compile_scope(&options.lsp_scope);
-        let index_filter = compile_scope(&options.index_filter);
+        // Compile the global path-scope flags once; these are the defaults for
+        // any repo without a per-repo override.
+        let default_lsp_scope = compile_scope(&options.lsp_scope);
+        let default_index_filter = compile_scope(&options.index_filter);
+
+        // Compile per-repo overrides, keyed by canonical repo path so lookups
+        // match canonical_repo_key(repo_path). A repo entry that omits a scope
+        // list inherits the corresponding global default.
+        let mut repo_settings: std::collections::HashMap<String, CompiledRepoSettings> =
+            std::collections::HashMap::new();
+        for entry in &options.repo_settings {
+            let key = match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
+                Ok(key) => key,
+                Err(e) => {
+                    warn!(
+                        "per-repo config ignored for {:?}: {}",
+                        entry.path, e
+                    );
+                    continue;
+                }
+            };
+            repo_settings.insert(
+                key,
+                CompiledRepoSettings {
+                    index_filter: if entry.index_filter.is_empty() {
+                        default_index_filter.clone()
+                    } else {
+                        compile_scope(&entry.index_filter)
+                    },
+                    lsp_scope: if entry.lsp_scope.is_empty() {
+                        default_lsp_scope.clone()
+                    } else {
+                        compile_scope(&entry.lsp_scope)
+                    },
+                },
+            );
+        }
 
         let engine = Self {
             _index_path: expanded_index,
@@ -514,8 +568,9 @@ impl CodeIntelEngine {
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
             gitignore_matchers: DashMap::new(),
             gtags_last_refresh: DashMap::new(),
-            lsp_scope,
-            index_filter,
+            default_lsp_scope,
+            default_index_filter,
+            repo_settings,
             index_filtered_repos: DashMap::new(),
         };
 
@@ -963,18 +1018,37 @@ impl CodeIntelEngine {
             && repo_path.join("GTAGS").exists()
     }
 
-    /// Whether `--lsp-scope` was given at all (empty = LSP pass runs repo-wide).
-    fn lsp_scope_active(&self) -> bool {
-        !self.lsp_scope.is_empty()
+    /// Effective `--index-filter` rules for a repo: its per-repo override if it
+    /// has one, else the global default.
+    fn repo_index_filter_rules(&self, repo_name: &str) -> &[ScopeRule] {
+        self.repo_settings
+            .get(repo_name)
+            .map(|s| s.index_filter.as_slice())
+            .unwrap_or(&self.default_index_filter)
     }
 
-    /// Whether a file is under any `--lsp-scope` entry. Each entry is matched
-    /// against both the repo-relative path and the absolute path, so a relative
-    /// entry (e.g. `fs/fuse`) matches that path in any repo, while an absolute
-    /// entry (e.g. `/home/u/src/linux.git/fs`) scopes one repo precisely and
-    /// never matches another — the natural form for a multi-repo server.
-    fn lsp_scope_matches(&self, rel: &str, abs: &str) -> bool {
-        scope_matches(&self.lsp_scope, rel, abs)
+    /// Effective `--lsp-scope` rules for a repo: its per-repo override if it has
+    /// one, else the global default.
+    fn repo_lsp_scope_rules(&self, repo_name: &str) -> &[ScopeRule] {
+        self.repo_settings
+            .get(repo_name)
+            .map(|s| s.lsp_scope.as_slice())
+            .unwrap_or(&self.default_lsp_scope)
+    }
+
+    /// Whether `--lsp-scope` applies to this repo (empty = LSP pass runs
+    /// repo-wide).
+    fn lsp_scope_active(&self, repo_name: &str) -> bool {
+        !self.repo_lsp_scope_rules(repo_name).is_empty()
+    }
+
+    /// Whether a file is under any `--lsp-scope` entry for this repo. Each entry
+    /// is matched against both the repo-relative path and the absolute path, so
+    /// a relative entry (e.g. `fs/fuse`) matches that path in any repo, while an
+    /// absolute entry (e.g. `/home/u/src/linux.git/fs`) scopes one repo
+    /// precisely and never matches another.
+    fn lsp_scope_matches(&self, repo_name: &str, rel: &str, abs: &str) -> bool {
+        scope_matches(self.repo_lsp_scope_rules(repo_name), rel, abs)
     }
 
     /// Whether `--index-filter` restricted this repo's base index (memoized at
@@ -994,7 +1068,7 @@ impl CodeIntelEngine {
     /// (headers / non-built files are excluded; the `.c` files reaching
     /// augmentation are already compile_commands-filtered, so an extension check
     /// suffices).
-    fn lsp_augment_allows(&self, repo_scoped: bool, rel: &str, abs: &str) -> bool {
+    fn lsp_augment_allows(&self, repo_name: &str, repo_scoped: bool, rel: &str, abs: &str) -> bool {
         if !repo_scoped {
             return true;
         }
@@ -1002,7 +1076,7 @@ impl CodeIntelEngine {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        self.lsp_scope_matches(rel, abs) && is_c_source_ext(ext)
+        self.lsp_scope_matches(repo_name, rel, abs) && is_c_source_ext(ext)
     }
 
     /// Per-repo `.gitignore` matcher (repo `.gitignore` + `.git/info/exclude`),
@@ -1184,10 +1258,11 @@ impl CodeIntelEngine {
         // a repo that actually contains a match — a repo with none is indexed in
         // full, so unrelated repos are never touched. Files named by --include are
         // force-kept. The decision is memoized for the watch path.
-        let repo_index_filtered = !self.index_filter.is_empty()
+        let index_filter_rules = self.repo_index_filter_rules(&repo_name);
+        let repo_index_filtered = !index_filter_rules.is_empty()
             && files.iter().any(|f| {
                 let rel = f.strip_prefix(path).unwrap_or(f).to_string_lossy().into_owned();
-                scope_matches(&self.index_filter, &rel, &f.to_string_lossy())
+                scope_matches(index_filter_rules, &rel, &f.to_string_lossy())
             });
         if repo_index_filtered {
             let before = files.len();
@@ -1195,7 +1270,7 @@ impl CodeIntelEngine {
             files.retain(|f| {
                 let rel = f.strip_prefix(path).unwrap_or(f).to_string_lossy().into_owned();
                 let abs = f.to_string_lossy();
-                scope_matches(&self.index_filter, &rel, &abs)
+                scope_matches(index_filter_rules, &rel, &abs)
                     || scope_matches(&include, &rel, &abs)
             });
             info!(
@@ -1440,14 +1515,19 @@ impl CodeIntelEngine {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
             // When --lsp-scope is given, gate the LSP pass to files under it (only
             // for repos that actually contain a matching file). gtags is unaffected.
-            let repo_scoped = self.lsp_scope_active()
+            let repo_scoped = self.lsp_scope_active(&repo_name)
                 && cxx_groups.iter().any(|g| {
-                    self.lsp_scope_matches(&g.relative_path, &g.abs_path.to_string_lossy())
+                    self.lsp_scope_matches(
+                        &repo_name,
+                        &g.relative_path,
+                        &g.abs_path.to_string_lossy(),
+                    )
                 });
             let mut tasks = tokio::task::JoinSet::new();
             for group in cxx_groups {
                 let permit = semaphore.clone().acquire_owned().await?;
                 let lsp = if self.lsp_augment_allows(
+                    &repo_name,
                     repo_scoped,
                     &group.relative_path,
                     &group.abs_path.to_string_lossy(),
@@ -1708,9 +1788,9 @@ impl CodeIntelEngine {
             let backends = lsp.active_cxx_backends();
             // Same --lsp-scope gate as the documentSymbol pass: skip callHierarchy
             // for functions outside the scoped paths in a scoped repo.
-            let repo_scoped = self.lsp_scope_active()
+            let repo_scoped = self.lsp_scope_active(repo_name)
                 && functions.iter().any(|(_, rel, _)| {
-                    self.lsp_scope_matches(rel, &repo_path.join(rel).to_string_lossy())
+                    self.lsp_scope_matches(repo_name, rel, &repo_path.join(rel).to_string_lossy())
                 });
             // Group functions by file so each translation unit is opened once and
             // all its functions are queried against that single open document,
@@ -1730,6 +1810,7 @@ impl CodeIntelEngine {
                 // parallel up to CXX_AUGMENT_CONCURRENCY.
                 for (rel_path, file_funcs) in by_file {
                     if !self.lsp_augment_allows(
+                        repo_name,
                         repo_scoped,
                         &rel_path,
                         &repo_path.join(&rel_path).to_string_lossy(),
@@ -3422,13 +3503,14 @@ impl CodeIntelEngine {
     /// incremental watch path.
     async fn augment_cxx_symbols(
         &self,
+        repo_name: &str,
         abs_path: &Path,
         relative_path: &str,
         repo_path: &Path,
         repo_scoped: bool,
         mut symbols: Vec<Symbol>,
     ) -> Vec<Symbol> {
-        if self.lsp_augment_allows(repo_scoped, relative_path, &abs_path.to_string_lossy())
+        if self.lsp_augment_allows(repo_name, repo_scoped, relative_path, &abs_path.to_string_lossy())
             && self.lsp_repo_enabled(repo_path)
         {
             if let Some(lsp) = &self.lsp_manager {
@@ -3526,12 +3608,16 @@ impl CodeIntelEngine {
 
         // --lsp-scope gate for this repo: scoped only when some compiled TU lies
         // under a scope entry (else this repo is unaffected).
-        let repo_scoped = self.lsp_scope_active()
+        let repo_scoped = self.lsp_scope_active(&repo_name)
             && compiled.iter().any(|abs| {
                 abs.strip_prefix(&canon_repo)
                     .ok()
                     .map(|rel| {
-                        self.lsp_scope_matches(&rel.to_string_lossy(), &abs.to_string_lossy())
+                        self.lsp_scope_matches(
+                            &repo_name,
+                            &rel.to_string_lossy(),
+                            &abs.to_string_lossy(),
+                        )
                     })
                     .unwrap_or(false)
             });
@@ -3547,7 +3633,11 @@ impl CodeIntelEngine {
             }
             // Honor --index-filter on the compile_commands delta too.
             if self.repo_index_filtered(&repo_name)
-                && !scope_matches(&self.index_filter, &relative_path, &abs_path.to_string_lossy())
+                && !scope_matches(
+                    self.repo_index_filter_rules(&repo_name),
+                    &relative_path,
+                    &abs_path.to_string_lossy(),
+                )
             {
                 continue;
             }
@@ -3564,7 +3654,14 @@ impl CodeIntelEngine {
                 symbol.file_path = relative_path.clone();
             }
             let symbols = self
-                .augment_cxx_symbols(abs_path, &relative_path, repo_path, repo_scoped, symbols)
+                .augment_cxx_symbols(
+                    &repo_name,
+                    abs_path,
+                    &relative_path,
+                    repo_path,
+                    repo_scoped,
+                    symbols,
+                )
                 .await;
 
             if let Some(mut entry) = self.symbols.get_mut(&repo_name) {
@@ -3730,7 +3827,11 @@ impl CodeIntelEngine {
                     .unwrap_or(&change.path)
                     .to_string_lossy()
                     .into_owned();
-                if !scope_matches(&self.index_filter, &rel, &change.path.to_string_lossy()) {
+                if !scope_matches(
+                    self.repo_index_filter_rules(&repo_name),
+                    &rel,
+                    &change.path.to_string_lossy(),
+                ) {
                     continue;
                 }
             }

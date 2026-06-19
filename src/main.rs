@@ -261,6 +261,11 @@ struct ServerArgs {
     /// Comma-separated. Empty = whole repo (the default).
     #[arg(long, env = "NARSIL_INDEX_FILTER", value_delimiter = ',')]
     index_filter: Vec<String>,
+
+    /// Per-repo overrides sourced from a `--profile` config entry. Not a CLI
+    /// flag; populated by `apply_named_profile`.
+    #[arg(skip)]
+    repo_settings: Vec<config::schema::RepoEntrySettings>,
 }
 
 #[tokio::main]
@@ -504,6 +509,7 @@ async fn main() -> Result<()> {
         include: server_args.include,
         lsp_scope: server_args.lsp_scope,
         index_filter: server_args.index_filter,
+        repo_settings: server_args.repo_settings,
         gtags_enabled,
         lsp_intent,
         gtags_intent,
@@ -733,7 +739,10 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     })?;
 
     if server_args.repos.is_empty() {
-        server_args.repos = profile.repos.clone();
+        server_args.repos = profile.repos.iter().map(|e| e.path().to_path_buf()).collect();
+        // Carry per-repo overrides alongside the flat path list so the path code
+        // below stays untouched; the engine keys these by canonical repo path.
+        server_args.repo_settings = profile.repos.iter().map(|e| e.settings()).collect();
     }
     if server_args.discover.is_none() {
         server_args.discover = profile.discover.clone();

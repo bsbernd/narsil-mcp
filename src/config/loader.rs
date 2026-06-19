@@ -421,7 +421,7 @@ mod tests {
         overlay.profiles.insert(
             "work".to_string(),
             crate::config::schema::RepoProfile {
-                repos: vec![PathBuf::from("~/src/work")],
+                repos: vec![crate::config::schema::RepoEntry::Path(PathBuf::from("~/src/work"))],
                 git: Some(true),
                 ..Default::default()
             },
