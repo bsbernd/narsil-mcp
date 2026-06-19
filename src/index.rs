@@ -797,9 +797,11 @@ impl CodeIntelEngine {
         // Warm clangd now so the cross-validation path is ready before the
         // first C/C++ query, rather than racing a cold preamble/index build.
         if let Some(lsp) = &self.lsp_manager {
-            let mut has_c = false;
-            let mut has_cpp = false;
+            // Servers are per repo, so warm each repo's C/C++ backends rooted at
+            // that repo rather than starting a single shared server.
             for repo in self.repos.iter() {
+                let mut has_c = false;
+                let mut has_cpp = false;
                 for lang in repo.value().languages.keys() {
                     match lang.as_str() {
                         "c" | "C" => has_c = true,
@@ -807,12 +809,16 @@ impl CodeIntelEngine {
                         _ => {}
                     }
                 }
-            }
-            if has_c {
-                lsp.warm_up("c").await;
-            }
-            if has_cpp {
-                lsp.warm_up("cpp").await;
+                if !has_c && !has_cpp {
+                    continue;
+                }
+                let repo_path = PathBuf::from(repo.key());
+                if has_c {
+                    lsp.warm_up(&repo_path, "c").await;
+                }
+                if has_cpp {
+                    lsp.warm_up(&repo_path, "cpp").await;
+                }
             }
         }
 
@@ -3770,15 +3776,30 @@ impl CodeIntelEngine {
                 .file_name()
                 .is_some_and(|n| n == "compile_commands.json")
             {
+                let cc_repo = self.repo_for_compile_commands(&change.path);
                 if let Some(lsp) = &self.lsp_manager {
-                    for lang in ["c", "cpp"] {
-                        lsp.restart_server(lang).await;
+                    match &cc_repo {
+                        Some(repo_path) => {
+                            for lang in ["c", "cpp"] {
+                                lsp.restart_server(repo_path, lang).await;
+                            }
+                        }
+                        // Out-of-tree build dir we could not map to a repo:
+                        // restart every repo's C/C++ servers so none keeps stale
+                        // flags. A repo with no running server is a no-op.
+                        None => {
+                            for repo in &self.repo_paths {
+                                for lang in ["c", "cpp"] {
+                                    lsp.restart_server(repo, lang).await;
+                                }
+                            }
+                        }
                     }
                 }
                 // The included C/C++ source set changed: bring symbols in line by
                 // indexing newly-added sources (augmented) and dropping removed
                 // ones. LSP is restarted first so the augment sees fresh flags.
-                if let Some(repo_path) = self.repo_for_compile_commands(&change.path) {
+                if let Some(repo_path) = cc_repo {
                     count += self.reindex_compile_commands_delta(&repo_path).await;
                     // gtags is the peer C/C++ backend: keep its database in sync with
                     // the changed source set, just as clangd was restarted above.
