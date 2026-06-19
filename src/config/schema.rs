@@ -82,6 +82,12 @@ pub struct RepoEntrySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_index: Option<bool>,
 
+    /// clangd/ccls augment passes (documentSymbol + callHierarchy) for this
+    /// repo. None = enabled. Set false to index with tree-sitter + gtags only,
+    /// skipping the language server entirely (no warm-up, no server start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<bool>,
+
     /// Restrict the base (tree-sitter) index to these paths for this repo.
     /// Overrides the global --index-filter when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -390,6 +396,7 @@ profiles:
       - ~/src/liburing
       - path: ~/src/linux
         background_index: false
+        lsp: false
         index_filter: [fs, mm, io_uring]
         lsp_scope: [fs/fuse]
 "#;
@@ -400,12 +407,14 @@ profiles:
         // Bare path -> all defaults.
         let bare = profile.repos[0].settings();
         assert_eq!(bare.background_index, None);
+        assert_eq!(bare.lsp, None);
         assert!(bare.index_filter.is_empty());
 
         // Detailed entry -> overrides carried through.
         let detailed = profile.repos[1].settings();
         assert_eq!(detailed.path, PathBuf::from("~/src/linux"));
         assert_eq!(detailed.background_index, Some(false));
+        assert_eq!(detailed.lsp, Some(false));
         assert_eq!(detailed.index_filter, vec!["fs", "mm", "io_uring"]);
         assert_eq!(detailed.lsp_scope, vec!["fs/fuse"]);
     }

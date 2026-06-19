@@ -346,6 +346,9 @@ pub struct CodeIntelEngine {
     /// Per-repo compiled scope rules and flags, keyed by canonical repo path.
     /// A repo absent here falls back to the global defaults above.
     repo_settings: std::collections::HashMap<String, CompiledRepoSettings>,
+    /// Canonical repo paths whose clangd/ccls augment passes are disabled
+    /// (`lsp: false`). Such a repo is indexed with tree-sitter + gtags only.
+    lsp_augment_disabled_repos: std::collections::HashSet<String>,
     /// Per-repo memo: true when the repo had >=1 file under `--index-filter`, so
     /// the watch path can drop changes to out-of-scope files. Absent = not
     /// scoped (full index), which keeps unrelated repos untouched.
@@ -559,6 +562,23 @@ impl CodeIntelEngine {
             );
         }
 
+        // Repos that opted out of the clangd/ccls augment passes entirely
+        // (tree-sitter + gtags only), keyed by canonical repo path.
+        let mut lsp_augment_disabled_repos = std::collections::HashSet::new();
+        for entry in &options.repo_settings {
+            if entry.lsp == Some(false) {
+                if let Ok(key) = expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
+                    lsp_augment_disabled_repos.insert(key);
+                }
+            }
+        }
+        if !lsp_augment_disabled_repos.is_empty() {
+            info!(
+                "clangd/ccls augment disabled (gtags only) for: {:?}",
+                lsp_augment_disabled_repos
+            );
+        }
+
         let engine = Self {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
@@ -591,6 +611,7 @@ impl CodeIntelEngine {
             default_lsp_scope,
             default_index_filter,
             repo_settings,
+            lsp_augment_disabled_repos,
             index_filtered_repos: DashMap::new(),
         };
 
@@ -820,6 +841,10 @@ impl CodeIntelEngine {
             // Servers are per repo, so warm each repo's C/C++ backends rooted at
             // that repo rather than starting a single shared server.
             for repo in self.repos.iter() {
+                // gtags-only repos never start a language server.
+                if self.lsp_augment_disabled(repo.key()) {
+                    continue;
+                }
                 let mut has_c = false;
                 let mut has_cpp = false;
                 for lang in repo.value().languages.keys() {
@@ -1077,6 +1102,12 @@ impl CodeIntelEngine {
         scope_matches(self.repo_lsp_scope_rules(repo_name), rel, abs)
     }
 
+    /// Whether this repo opted out of the clangd/ccls augment passes
+    /// (`lsp: false`) — indexed with tree-sitter + gtags only.
+    fn lsp_augment_disabled(&self, repo_name: &str) -> bool {
+        self.lsp_augment_disabled_repos.contains(repo_name)
+    }
+
     /// Whether `--index-filter` restricted this repo's base index (memoized at
     /// index time). Absent = not restricted, so unrelated repos stay full.
     fn repo_index_filtered(&self, repo_name: &str) -> bool {
@@ -1095,6 +1126,9 @@ impl CodeIntelEngine {
     /// augmentation are already compile_commands-filtered, so an extension check
     /// suffices).
     fn lsp_augment_allows(&self, repo_name: &str, repo_scoped: bool, rel: &str, abs: &str) -> bool {
+        if self.lsp_augment_disabled(repo_name) {
+            return false;
+        }
         if !repo_scoped {
             return true;
         }
@@ -1810,6 +1844,10 @@ impl CodeIntelEngine {
         // the graph mutation happens serially below.
         let lsp_phase_start = std::time::Instant::now();
         let mut lsp_edges: Vec<(SourceSet, Vec<(String, CallEdge)>)> = Vec::new();
+        // gtags-only repos skip the callHierarchy pass entirely: with the
+        // background index off it re-parses every TU cold to resolve callees,
+        // which is ruinous on a huge tree. Phase 6 (gtags) below still runs.
+        let lsp = lsp.as_ref().filter(|_| !self.lsp_augment_disabled(repo_name));
         if let Some(lsp) = lsp {
             let backends = lsp.active_cxx_backends();
             // Same --lsp-scope gate as the documentSymbol pass: skip callHierarchy
