@@ -128,6 +128,9 @@ struct LspProcess {
 pub struct LspManager {
     config: LspConfig,
     servers: DashMap<String, Arc<LspProcess>>,
+    /// Per-key locks serializing server creation so concurrent callers for the
+    /// same key spawn one process, not one each.
+    server_start_locks: DashMap<String, Arc<Mutex<()>>>,
     workspace_roots: Vec<PathBuf>,
 }
 
@@ -137,6 +140,7 @@ impl LspManager {
         Self {
             config,
             servers: DashMap::new(),
+            server_start_locks: DashMap::new(),
             workspace_roots,
         }
     }
@@ -218,6 +222,18 @@ impl LspManager {
 
     /// Get or start the server identified by `key`.
     async fn get_or_start_server_for_key(&self, key: &str) -> Result<Arc<LspProcess>> {
+        if let Some(server) = self.servers.get(key) {
+            return Ok(server.clone());
+        }
+        // Serialize creation per key. The DashMap guard from `entry` is dropped
+        // before awaiting the lock so we never hold a shard lock across an await.
+        let start_lock = self
+            .server_start_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = start_lock.lock().await;
+        // Another caller may have started it while we waited for the lock.
         if let Some(server) = self.servers.get(key) {
             return Ok(server.clone());
         }
