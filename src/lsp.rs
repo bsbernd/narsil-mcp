@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -69,6 +69,10 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Which C/C++ LSP backends to start (defaults to clangd only)
     pub cxx_lsp_backends: Vec<CxxLspBackend>,
+    /// Canonical repo roots whose clangd/ccls should NOT build a background
+    /// index (from a profile's `background_index: false`). Empty = all repos
+    /// keep background indexing on (the default).
+    pub background_index_disabled: HashSet<PathBuf>,
 }
 
 impl Default for LspConfig {
@@ -82,6 +86,7 @@ impl Default for LspConfig {
             index_timeout_ms: 60000,
             enabled: false,
             cxx_lsp_backends: vec![CxxLspBackend::Clangd],
+            background_index_disabled: HashSet::new(),
         }
     }
 }
@@ -755,6 +760,10 @@ impl LspManager {
             return Ok((path.clone(), vec![]));
         }
 
+        // Per-repo background-index decision (the repo is encoded in the key).
+        let (_, repo) = Self::parse_server_key(server_key);
+        let bg_disabled = self.config.background_index_disabled.contains(repo);
+
         match lang_backend {
             "rust" => Ok((PathBuf::from("rust-analyzer"), vec![])),
             "python" => Ok((
@@ -767,19 +776,50 @@ impl LspManager {
             )),
             "go" => Ok((PathBuf::from("gopls"), vec![])),
             // --pch-storage=disk keeps per-TU preambles off the heap (kernel
-            // preambles otherwise dominate clangd RSS); background index stays on
-            // (references/definition/callHierarchy need it).
-            "c:clangd" | "cpp:clangd" => Ok((
-                PathBuf::from("clangd"),
-                vec!["--pch-storage=disk".to_string()],
-            )),
-            "c:ccls" | "cpp:ccls" => Ok((PathBuf::from("ccls"), vec![])),
+            // preambles otherwise dominate clangd RSS). The background index is
+            // on by default (references/definition/callHierarchy need it) but
+            // disabled for repos that opted out, so a huge tree is not indexed
+            // whole.
+            "c:clangd" | "cpp:clangd" => {
+                let mut args = vec!["--pch-storage=disk".to_string()];
+                if bg_disabled {
+                    args.push("--background-index=false".to_string());
+                }
+                Ok((PathBuf::from("clangd"), args))
+            }
+            // ccls writes its index to cache.directory; point it under the user
+            // cache dir so it never drops a .ccls-cache/ into the repo. When the
+            // repo opted out of background indexing, blacklist everything so only
+            // files opened on demand are parsed.
+            "c:ccls" | "cpp:ccls" => {
+                let cache_dir = Self::ccls_cache_dir(repo);
+                let mut init = serde_json::json!({
+                    "cache": { "directory": cache_dir.to_string_lossy() },
+                });
+                if bg_disabled {
+                    init["index"] = serde_json::json!({ "initialBlacklist": [".*"] });
+                }
+                Ok((PathBuf::from("ccls"), vec![format!("--init={}", init)]))
+            }
             "java" => Ok((
                 PathBuf::from("jdtls"),
                 vec!["-data".to_string(), "/tmp/jdtls-workspace".to_string()],
             )),
             _ => Err(anyhow!("No LSP server configured for {}", server_key)),
         }
+    }
+
+    /// Per-repo ccls cache directory under the user cache dir. Keeps ccls from
+    /// writing a `.ccls-cache/` into the repository tree; the repo path is
+    /// hashed so distinct repos never collide.
+    fn ccls_cache_dir(repo: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(repo.to_string_lossy().as_bytes());
+        let hash: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        let base = directories::BaseDirs::new()
+            .map(|dirs| dirs.cache_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("narsil-mcp").join("ccls").join(hash)
     }
 
     /// Get hover information
@@ -1395,6 +1435,38 @@ mod tests {
 
         let (cmd, _) = manager.get_server_command_for_key("c:ccls").unwrap();
         assert_eq!(cmd, PathBuf::from("ccls"));
+    }
+
+    #[test]
+    fn test_background_index_toggle_per_repo() {
+        let off_repo = PathBuf::from("/work/linux");
+        let config = LspConfig {
+            background_index_disabled: HashSet::from([off_repo.clone()]),
+            ..Default::default()
+        };
+        let manager = LspManager::new(config, vec![]);
+
+        // Opted-out repo: clangd is told not to build a background index.
+        let key_off = LspManager::server_key("c", CxxLspBackend::Clangd, &off_repo);
+        let (cmd, args) = manager.get_server_command_for_key(&key_off).unwrap();
+        assert_eq!(cmd, PathBuf::from("clangd"));
+        assert!(args.iter().any(|a| a == "--background-index=false"));
+
+        // A different repo keeps the background index on.
+        let on_repo = PathBuf::from("/work/libfuse");
+        let key_on = LspManager::server_key("c", CxxLspBackend::Clangd, &on_repo);
+        let (_, args) = manager.get_server_command_for_key(&key_on).unwrap();
+        assert!(!args.iter().any(|a| a == "--background-index=false"));
+
+        // ccls for the opted-out repo blacklists everything and relocates its
+        // cache out of the repo tree.
+        let key_ccls = LspManager::server_key("c", CxxLspBackend::Ccls, &off_repo);
+        let (cmd, args) = manager.get_server_command_for_key(&key_ccls).unwrap();
+        assert_eq!(cmd, PathBuf::from("ccls"));
+        assert_eq!(args.len(), 1);
+        assert!(args[0].starts_with("--init="));
+        assert!(args[0].contains("initialBlacklist"));
+        assert!(!args[0].contains("/work/linux/.ccls-cache"));
     }
 
     #[test]

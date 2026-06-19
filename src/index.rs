@@ -366,7 +366,7 @@ impl CodeIntelEngine {
     pub async fn with_options(
         index_path: PathBuf,
         repo_paths: Vec<PathBuf>,
-        options: EngineOptions,
+        mut options: EngineOptions,
     ) -> Result<Self> {
         let expanded_index = expand_path(&index_path)?;
         std::fs::create_dir_all(&expanded_index)?;
@@ -395,6 +395,26 @@ impl CodeIntelEngine {
         // Initialize LSP manager if enabled
         let lsp_manager = if options.lsp_config.enabled {
             info!("LSP integration enabled");
+            // Repos that opted out of clangd/ccls background indexing. Keyed by
+            // canonical repo root so it matches the repo encoded in server keys.
+            let mut disabled = std::collections::HashSet::new();
+            for entry in &options.repo_settings {
+                if entry.background_index == Some(false) {
+                    match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
+                        Ok(key) => {
+                            disabled.insert(PathBuf::from(key));
+                        }
+                        Err(e) => warn!(
+                            "background_index setting ignored for {:?}: {}",
+                            entry.path, e
+                        ),
+                    }
+                }
+            }
+            if !disabled.is_empty() {
+                info!("clangd/ccls background index disabled for: {:?}", disabled);
+            }
+            options.lsp_config.background_index_disabled = disabled;
             Some(Arc::new(LspManager::new(
                 options.lsp_config.clone(),
                 expanded_repos.clone(),
