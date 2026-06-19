@@ -924,37 +924,71 @@ impl LspManager {
     /// occurs (from `from_ranges`) — a `CallEdge`'s line is the call site, not
     /// the callee's definition. Empty when the backend has no callHierarchy
     /// support, the position cannot be anchored, or there are no outgoing calls.
-    pub async fn call_hierarchy_outgoing(
+    pub async fn call_hierarchy_outgoing_batch(
         &self,
         backend: SourceSet,
         file_path: &Path,
-        symbol_name: &str,
-        line: u32,
-    ) -> Result<Vec<(String, String, u32)>> {
+        functions: &[(String, u32)],
+    ) -> Vec<Vec<(String, String, u32)>> {
+        let empty = || functions.iter().map(|_| Vec::new()).collect::<Vec<_>>();
         let cxx = match Self::cxx_backend_for_source(backend) {
             Some(b) => b,
-            None => return Ok(Vec::new()),
+            None => return empty(),
         };
         let language = cxx_language_id(file_path);
         let server_key = Self::server_key(language, cxx);
         let server = match self.get_or_start_server_for_key(&server_key).await {
             Ok(s) => s,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return empty(),
         };
 
+        let content = std::fs::read_to_string(file_path).unwrap_or_default();
+        let uri = match Url::from_file_path(file_path) {
+            Ok(u) => u,
+            Err(_) => return empty(),
+        };
+
+        // Open the document once; every function's prepare/outgoing pair runs
+        // against this single open doc so the preamble/AST is built once rather
+        // than once per function.
+        self.did_open(&server, language, file_path).await.ok();
+        let mut results = Vec::with_capacity(functions.len());
+        for (symbol_name, line) in functions {
+            let calls = self
+                .call_hierarchy_one_on_open(&server, &uri, &content, symbol_name, *line)
+                .await;
+            results.push(calls);
+        }
+        self.did_close(&server, file_path).await.ok();
+        results
+    }
+
+    /// One function's outgoing calls against an already-open document. Does not
+    /// open or close it — the caller owns that lifecycle.
+    ///
+    /// @param[in] server    The (already-open) backend process.
+    /// @param[in] uri       The open document's URI.
+    /// @param[in] content   The document text (for name-token anchoring).
+    /// @param[in] symbol_name  Function name to anchor prepareCallHierarchy on.
+    /// @param[in] line      The symbol's 1-based definition row.
+    /// @return (callee_name, callee_def_file, call_site_line) per outgoing call.
+    async fn call_hierarchy_one_on_open(
+        &self,
+        server: &LspProcess,
+        uri: &Url,
+        content: &str,
+        symbol_name: &str,
+        line: u32,
+    ) -> Vec<(String, String, u32)> {
         // prepareCallHierarchy must sit on the identifier; anchor on the name
         // token. `line` is the symbol's 1-based definition row.
-        let content = std::fs::read_to_string(file_path).unwrap_or_default();
         let (anchor_line, anchor_col) =
-            name_anchor(&content, symbol_name, (line.max(1) - 1) as usize)
+            name_anchor(content, symbol_name, (line.max(1) - 1) as usize)
                 .unwrap_or((line.max(1) - 1, 0));
-
-        let uri = Url::from_file_path(file_path).map_err(|_| anyhow!("Invalid file path"))?;
-        self.did_open(&server, language, file_path).await.ok();
 
         let prepare_params = CallHierarchyPrepareParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: Position {
                     line: anchor_line,
                     character: anchor_col,
@@ -962,9 +996,12 @@ impl LspManager {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let prepare_value = serde_json::to_value(&prepare_params)?;
+        let prepare_value = match serde_json::to_value(&prepare_params) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
         let prepare_resp = self
-            .send_request(&server, "textDocument/prepareCallHierarchy", prepare_value)
+            .send_request(server, "textDocument/prepareCallHierarchy", prepare_value)
             .await;
 
         let item = match prepare_resp {
@@ -975,10 +1012,7 @@ impl LspManager {
         };
         let item = match item {
             Some(i) => i,
-            None => {
-                self.did_close(&server, file_path).await.ok();
-                return Ok(Vec::new());
-            }
+            None => return Vec::new(),
         };
 
         let out_params = CallHierarchyOutgoingCallsParams {
@@ -986,15 +1020,17 @@ impl LspManager {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let out_value = serde_json::to_value(&out_params)?;
+        let out_value = match serde_json::to_value(&out_params) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
         let out_resp = self
-            .send_request(&server, "callHierarchy/outgoingCalls", out_value)
+            .send_request(server, "callHierarchy/outgoingCalls", out_value)
             .await;
-        self.did_close(&server, file_path).await.ok();
 
         let calls: Vec<CallHierarchyOutgoingCall> = match out_resp {
             Ok(v) if !v.is_null() => serde_json::from_value(v).unwrap_or_default(),
-            _ => return Ok(Vec::new()),
+            _ => return Vec::new(),
         };
 
         let mut result = Vec::new();
@@ -1015,7 +1051,7 @@ impl LspManager {
                 .unwrap_or_else(|| call.to.selection_range.start.line + 1);
             result.push((call.to.name, callee_file, call_site_line));
         }
-        Ok(result)
+        result
     }
 
     /// Gracefully stop one server: shutdown request followed by exit notification.

@@ -1687,18 +1687,31 @@ impl CodeIntelEngine {
                 && functions.iter().any(|(_, rel, _)| {
                     self.lsp_scope_matches(rel, &repo_path.join(rel).to_string_lossy())
                 });
+            // Group functions by file so each translation unit is opened once and
+            // all its functions are queried against that single open document,
+            // rather than reopening (and rebuilding the preamble) per function.
+            let mut by_file: std::collections::HashMap<String, Vec<(String, u32)>> =
+                std::collections::HashMap::new();
+            for (name, rel_path, line) in &functions {
+                by_file
+                    .entry(rel_path.clone())
+                    .or_default()
+                    .push((name.clone(), *line as u32));
+            }
             if !backends.is_empty() {
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
                 let mut tasks = tokio::task::JoinSet::new();
-                for (name, rel_path, line) in &functions {
+                // One task per (file, backend); the semaphore runs files in
+                // parallel up to CXX_AUGMENT_CONCURRENCY.
+                for (rel_path, file_funcs) in by_file {
                     if !self.lsp_augment_allows(
                         repo_scoped,
-                        rel_path,
-                        &repo_path.join(rel_path).to_string_lossy(),
+                        &rel_path,
+                        &repo_path.join(&rel_path).to_string_lossy(),
                     ) {
                         continue;
                     }
-                    let abs_path = match validate_path(repo_path, rel_path) {
+                    let abs_path = match validate_path(repo_path, &rel_path) {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
@@ -1709,21 +1722,21 @@ impl CodeIntelEngine {
                         };
                         let lsp = lsp.clone();
                         let backend = *backend;
-                        let name = name.clone();
                         let rel_path = rel_path.clone();
                         let abs_path = abs_path.clone();
-                        let line = *line;
+                        let file_funcs = file_funcs.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let calls = lsp
-                                .call_hierarchy_outgoing(backend, &abs_path, &name, line as u32)
-                                .await
-                                .unwrap_or_default();
-                            let caller_key = CallGraph::qualified_key(&rel_path, &name);
-                            let edges: Vec<(String, CallEdge)> = calls
-                                .into_iter()
-                                .map(|(callee_name, _callee_file, call_line)| {
-                                    (
+                            let per_func = lsp
+                                .call_hierarchy_outgoing_batch(backend, &abs_path, &file_funcs)
+                                .await;
+                            // per_func is aligned with file_funcs; map each
+                            // function's outgoing calls onto its caller edges.
+                            let mut edges: Vec<(String, CallEdge)> = Vec::new();
+                            for ((name, _line), calls) in file_funcs.iter().zip(per_func) {
+                                let caller_key = CallGraph::qualified_key(&rel_path, name);
+                                for (callee_name, _callee_file, call_line) in calls {
+                                    edges.push((
                                         caller_key.clone(),
                                         CallEdge {
                                             target: callee_name,
@@ -1735,9 +1748,9 @@ impl CodeIntelEngine {
                                             confirmed_by: backend,
                                             line_conflicts: Vec::new(),
                                         },
-                                    )
-                                })
-                                .collect();
+                                    ));
+                                }
+                            }
                             (backend, edges)
                         });
                     }
@@ -1753,11 +1766,17 @@ impl CodeIntelEngine {
                 }
             }
         }
+        info!(
+            "timing: callHierarchy (LSP) in {:?} for {}",
+            lsp_phase_start.elapsed(),
+            repo_name
+        );
 
         // Phase 6: one task per function fetching gtags reverse references.
         // `global -rx` returns *uses* (which include address-of and
         // declarations, not only resolved calls), so these edges are weaker —
         // recorded via the GTAGS bit so the consumer can tell them apart.
+        let gtags_phase_start = std::time::Instant::now();
         let mut gtags_refs: Vec<(String, Vec<(String, usize, String)>)> = Vec::new();
         if let Some(gtags) = gtags {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
@@ -1784,6 +1803,11 @@ impl CodeIntelEngine {
                 }
             }
         }
+        info!(
+            "timing: gtags references in {:?} for {}",
+            gtags_phase_start.elapsed(),
+            repo_name
+        );
 
         if lsp_edges.is_empty() && gtags_refs.is_empty() {
             return;
