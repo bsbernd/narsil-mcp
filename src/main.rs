@@ -237,6 +237,18 @@ struct ServerArgs {
     /// Comma-separated (e.g. "tools/perf/**/*.c,scripts/**/*.py").
     #[arg(long, env = "NARSIL_INCLUDE", value_delimiter = ',')]
     include: Vec<String>,
+
+    /// Paths that additionally get the clangd/ccls pass; a plain dir matches it
+    /// and all subdirs, globs (*, **) are supported. Each entry is matched
+    /// against both the repo-relative and the absolute path: a relative entry
+    /// (e.g. "fs/fuse") applies in every repo that has it, while an absolute
+    /// entry (e.g. "$HOME/src/linux.git/fs") scopes one repo precisely and never
+    /// matches another — use absolute paths to scope a single repo in a
+    /// multi-repo server. tree-sitter and gtags still cover every file. Within a
+    /// repo where any file matches, only compile_commands.json TUs under these
+    /// paths are queried via LSP. Comma-separated. Empty = whole repo (default).
+    #[arg(long, env = "NARSIL_LSP_SCOPE", value_delimiter = ',')]
+    lsp_scope: Vec<String>,
 }
 
 #[tokio::main]
@@ -478,6 +490,7 @@ async fn main() -> Result<()> {
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
         include: server_args.include,
+        lsp_scope: server_args.lsp_scope,
         gtags_enabled,
         lsp_intent,
         gtags_intent,

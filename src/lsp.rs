@@ -691,7 +691,13 @@ impl LspManager {
                 vec!["--stdio".to_string()],
             )),
             "go" => Ok((PathBuf::from("gopls"), vec![])),
-            "c:clangd" | "cpp:clangd" => Ok((PathBuf::from("clangd"), vec![])),
+            // --pch-storage=disk keeps per-TU preambles off the heap (kernel
+            // preambles otherwise dominate clangd RSS); background index stays on
+            // (references/definition/callHierarchy need it).
+            "c:clangd" | "cpp:clangd" => Ok((
+                PathBuf::from("clangd"),
+                vec!["--pch-storage=disk".to_string()],
+            )),
             "c:ccls" | "cpp:ccls" => Ok((PathBuf::from("ccls"), vec![])),
             "java" => Ok((
                 PathBuf::from("jdtls"),

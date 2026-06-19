@@ -161,6 +161,10 @@ pub struct EngineOptions {
     pub compile_commands_path: Option<PathBuf>,
     /// Glob patterns (relative to repo root) for files to always index
     pub include: Vec<String>,
+    /// Paths/globs (relative to repo root) that additionally get the clangd/ccls
+    /// pass. Empty means the whole repo. tree-sitter and gtags are unaffected;
+    /// this only bounds the secondary LSP augmentation.
+    pub lsp_scope: Vec<String>,
     /// Enable GNU Global (gtags) as an additional C/C++ reference backend
     pub gtags_enabled: bool,
     /// Per-repo intent for LSP index-time augmentation (On/Off/Auto).
@@ -195,6 +199,7 @@ impl Default for EngineOptions {
             use_compile_commands: false,
             compile_commands_path: None,
             include: Vec::new(),
+            lsp_scope: Vec::new(),
             gtags_enabled: false,
             lsp_intent: BackendIntent::default(),
             gtags_intent: BackendIntent::default(),
@@ -205,6 +210,13 @@ impl Default for EngineOptions {
             graph_path: None,
         }
     }
+}
+
+/// One compiled `--lsp-scope` entry. A plain path is treated as a recursive
+/// directory prefix; an entry with glob metacharacters is matched with `glob`.
+enum LspScopeRule {
+    Prefix(String),
+    Glob(glob::Pattern),
 }
 
 /// The main code intelligence engine
@@ -267,6 +279,9 @@ pub struct CodeIntelEngine {
     /// Last time a `global -u` ran per repo, to debounce gtags refreshes under
     /// a burst of file events.
     gtags_last_refresh: DashMap<PathBuf, std::time::Instant>,
+    /// Compiled `--lsp-scope` rules; empty means the clangd/ccls pass runs for
+    /// the whole repo (the default).
+    lsp_scope: Vec<LspScopeRule>,
 }
 
 impl CodeIntelEngine {
@@ -418,6 +433,27 @@ impl CodeIntelEngine {
         let metrics = Arc::new(Metrics::with_persistence(expanded_index.clone()));
         let flush_task = spawn_flush_task(Arc::clone(&metrics), DEFAULT_FLUSH_INTERVAL);
 
+        // Compile --lsp-scope once: glob entries via `glob`, plain paths as
+        // recursive directory prefixes.
+        let lsp_scope: Vec<LspScopeRule> = options
+            .lsp_scope
+            .iter()
+            .map(|entry| {
+                let trimmed = entry.trim().trim_end_matches('/');
+                if trimmed.contains(['*', '?', '[']) {
+                    match glob::Pattern::new(trimmed) {
+                        Ok(pattern) => LspScopeRule::Glob(pattern),
+                        Err(e) => {
+                            warn!("--lsp-scope: ignoring invalid glob {:?}: {}", trimmed, e);
+                            LspScopeRule::Prefix(trimmed.to_string())
+                        }
+                    }
+                } else {
+                    LspScopeRule::Prefix(trimmed.to_string())
+                }
+            })
+            .collect();
+
         let engine = Self {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
@@ -447,6 +483,7 @@ impl CodeIntelEngine {
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
             gitignore_matchers: DashMap::new(),
             gtags_last_refresh: DashMap::new(),
+            lsp_scope,
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -889,6 +926,45 @@ impl CodeIntelEngine {
             && repo_path.join("GTAGS").exists()
     }
 
+    /// Whether `--lsp-scope` was given at all (empty = LSP pass runs repo-wide).
+    fn lsp_scope_active(&self) -> bool {
+        !self.lsp_scope.is_empty()
+    }
+
+    /// Whether a file is under any `--lsp-scope` entry. Each entry is matched
+    /// against both the repo-relative path and the absolute path, so a relative
+    /// entry (e.g. `fs/fuse`) matches that path in any repo, while an absolute
+    /// entry (e.g. `/home/u/src/linux.git/fs`) scopes one repo precisely and
+    /// never matches another — the natural form for a multi-repo server.
+    fn lsp_scope_matches(&self, rel: &str, abs: &str) -> bool {
+        let under = |path: &str, prefix: &str| {
+            path == prefix || path.starts_with(&format!("{prefix}/"))
+        };
+        self.lsp_scope.iter().any(|rule| match rule {
+            LspScopeRule::Prefix(prefix) => under(rel, prefix) || under(abs, prefix),
+            LspScopeRule::Glob(pattern) => pattern.matches(rel) || pattern.matches(abs),
+        })
+    }
+
+    /// Whether the additional clangd/ccls pass should run for `rel`. tree-sitter
+    /// and gtags always run; this only bounds the LSP layer. `repo_scoped` is true
+    /// when the repo has at least one file under `--lsp-scope` (so an unrelated
+    /// repo is never silently dropped). In a scoped repo the pass is limited to
+    /// matching files that are real C/C++ source TUs — honoring compile_commands
+    /// (headers / non-built files are excluded; the `.c` files reaching
+    /// augmentation are already compile_commands-filtered, so an extension check
+    /// suffices).
+    fn lsp_augment_allows(&self, repo_scoped: bool, rel: &str, abs: &str) -> bool {
+        if !repo_scoped {
+            return true;
+        }
+        let ext = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        self.lsp_scope_matches(rel, abs) && is_c_source_ext(ext)
+    }
+
     /// Per-repo `.gitignore` matcher (repo `.gitignore` + `.git/info/exclude`),
     /// built once and cached. Mirrors the `git_ignore`/`git_exclude` flags the
     /// index-time `ignore::WalkBuilder` uses so the watch path can reject the
@@ -1283,10 +1359,24 @@ impl CodeIntelEngine {
             }
         } else if !cxx_groups.is_empty() {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
+            // When --lsp-scope is given, gate the LSP pass to files under it (only
+            // for repos that actually contain a matching file). gtags is unaffected.
+            let repo_scoped = self.lsp_scope_active()
+                && cxx_groups.iter().any(|g| {
+                    self.lsp_scope_matches(&g.relative_path, &g.abs_path.to_string_lossy())
+                });
             let mut tasks = tokio::task::JoinSet::new();
             for group in cxx_groups {
                 let permit = semaphore.clone().acquire_owned().await?;
-                let lsp = lsp_for_repo.clone();
+                let lsp = if self.lsp_augment_allows(
+                    repo_scoped,
+                    &group.relative_path,
+                    &group.abs_path.to_string_lossy(),
+                ) {
+                    lsp_for_repo.clone()
+                } else {
+                    None
+                };
                 let gtags = gtags_for_repo.clone();
                 let repo_path = path.to_path_buf();
                 tasks.spawn(async move {
@@ -1522,10 +1612,23 @@ impl CodeIntelEngine {
         let mut lsp_edges: Vec<(SourceSet, Vec<(String, CallEdge)>)> = Vec::new();
         if let Some(lsp) = lsp {
             let backends = lsp.active_cxx_backends();
+            // Same --lsp-scope gate as the documentSymbol pass: skip callHierarchy
+            // for functions outside the scoped paths in a scoped repo.
+            let repo_scoped = self.lsp_scope_active()
+                && functions.iter().any(|(_, rel, _)| {
+                    self.lsp_scope_matches(rel, &repo_path.join(rel).to_string_lossy())
+                });
             if !backends.is_empty() {
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
                 let mut tasks = tokio::task::JoinSet::new();
                 for (name, rel_path, line) in &functions {
+                    if !self.lsp_augment_allows(
+                        repo_scoped,
+                        rel_path,
+                        &repo_path.join(rel_path).to_string_lossy(),
+                    ) {
+                        continue;
+                    }
                     let abs_path = match validate_path(repo_path, rel_path) {
                         Ok(p) => p,
                         Err(_) => continue,
@@ -3204,9 +3307,12 @@ impl CodeIntelEngine {
         abs_path: &Path,
         relative_path: &str,
         repo_path: &Path,
+        repo_scoped: bool,
         mut symbols: Vec<Symbol>,
     ) -> Vec<Symbol> {
-        if self.lsp_repo_enabled(repo_path) {
+        if self.lsp_augment_allows(repo_scoped, relative_path, &abs_path.to_string_lossy())
+            && self.lsp_repo_enabled(repo_path)
+        {
             if let Some(lsp) = &self.lsp_manager {
                 let lang = get_language_from_path(&abs_path.to_string_lossy());
                 for backend in lsp.active_cxx_backends() {
@@ -3300,6 +3406,18 @@ impl CodeIntelEngine {
         let mut upserts: Vec<FileMetadata> = Vec::new();
         let mut deletes: Vec<PathBuf> = Vec::new();
 
+        // --lsp-scope gate for this repo: scoped only when some compiled TU lies
+        // under a scope entry (else this repo is unaffected).
+        let repo_scoped = self.lsp_scope_active()
+            && compiled.iter().any(|abs| {
+                abs.strip_prefix(&canon_repo)
+                    .ok()
+                    .map(|rel| {
+                        self.lsp_scope_matches(&rel.to_string_lossy(), &abs.to_string_lossy())
+                    })
+                    .unwrap_or(false)
+            });
+
         // Newly-included sources: parse, augment, insert.
         for abs_path in &compiled {
             let relative_path = match abs_path.strip_prefix(&canon_repo) {
@@ -3322,7 +3440,7 @@ impl CodeIntelEngine {
                 symbol.file_path = relative_path.clone();
             }
             let symbols = self
-                .augment_cxx_symbols(abs_path, &relative_path, repo_path, symbols)
+                .augment_cxx_symbols(abs_path, &relative_path, repo_path, repo_scoped, symbols)
                 .await;
 
             if let Some(mut entry) = self.symbols.get_mut(&repo_name) {
