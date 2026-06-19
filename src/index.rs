@@ -261,6 +261,12 @@ pub struct CodeIntelEngine {
     /// Background task that periodically flushes lifetime metrics to disk.
     /// Aborted on shutdown after a final synchronous flush.
     metrics_flush_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-repo cached `.gitignore` matcher, so the watch path rejects the same
+    /// paths the index-time WalkBuilder would (built lazily on first use).
+    gitignore_matchers: DashMap<PathBuf, Arc<ignore::gitignore::Gitignore>>,
+    /// Last time a `global -u` ran per repo, to debounce gtags refreshes under
+    /// a burst of file events.
+    gtags_last_refresh: DashMap<PathBuf, std::time::Instant>,
 }
 
 impl CodeIntelEngine {
@@ -439,6 +445,8 @@ impl CodeIntelEngine {
             #[cfg(feature = "graph")]
             knowledge_graph,
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
+            gitignore_matchers: DashMap::new(),
+            gtags_last_refresh: DashMap::new(),
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -881,6 +889,49 @@ impl CodeIntelEngine {
             && repo_path.join("GTAGS").exists()
     }
 
+    /// Per-repo `.gitignore` matcher (repo `.gitignore` + `.git/info/exclude`),
+    /// built once and cached. Mirrors the `git_ignore`/`git_exclude` flags the
+    /// index-time `ignore::WalkBuilder` uses so the watch path can reject the
+    /// same paths the indexer would.
+    fn gitignore_for(&self, repo_path: &Path) -> Arc<ignore::gitignore::Gitignore> {
+        if let Some(matcher) = self.gitignore_matchers.get(repo_path) {
+            return matcher.clone();
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_path);
+        builder.add(repo_path.join(".gitignore"));
+        builder.add(repo_path.join(".git/info/exclude"));
+        let matcher = Arc::new(
+            builder
+                .build()
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()),
+        );
+        self.gitignore_matchers
+            .insert(repo_path.to_path_buf(), matcher.clone());
+        matcher
+    }
+
+    /// True when the indexer would never have indexed `abs_path` under
+    /// `repo_path` — a dotfile/dir or a `.gitignore`d path — mirroring the
+    /// index-time `WalkBuilder` (`hidden(true)` + git ignores). The watch path
+    /// consults this so build output written into a watched tree never triggers
+    /// a re-index or a gtags refresh (an in-tree kernel build emits `*.o`,
+    /// `*.o.d`, `include/generated/*.h`, `*.mod.c`, …).
+    fn is_ignored_for_index(&self, repo_path: &Path, abs_path: &Path) -> bool {
+        let rel = abs_path.strip_prefix(repo_path).unwrap_or(abs_path);
+        // hidden(true): the indexer skips any entry whose name starts with '.'.
+        // Covers .git, .ccls-cache, .cache/clangd and hidden Kbuild deps such as
+        // arch/x86/boot/.early_serial_console.o.d.
+        if rel
+            .components()
+            .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')))
+        {
+            return true;
+        }
+        self.gitignore_for(repo_path)
+            .matched_path_or_any_parents(rel, false)
+            .is_ignore()
+    }
+
     /// Refresh the GTAGS database for `repo_path` when gtags is the active C/C++
     /// backend, mirroring index_repo's refresh gating. The watch path calls this
     /// wherever it brings clangd back in sync (compile_commands change, source edit)
@@ -891,8 +942,24 @@ impl CodeIntelEngine {
         if !self.gtags_repo_enabled(repo_path) {
             return;
         }
+        // Debounce: a burst of edits (e.g. a branch switch touching many files)
+        // must not spawn back-to-back full-tree `global -u` passes, each of which
+        // re-stats the whole repo. Skip when one ran for this repo recently.
+        const GTAGS_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+        if let Some(last) = self.gtags_last_refresh.get(repo_path) {
+            if last.elapsed() < GTAGS_REFRESH_DEBOUNCE {
+                debug!(
+                    "gtags: refresh for {:?} debounced ({:?} since last)",
+                    repo_path,
+                    last.elapsed()
+                );
+                return;
+            }
+        }
         if self.options.gtags_generate && crate::gtags::gtags_binary_present() {
             if let Some(gtags) = &self.gtags_manager {
+                self.gtags_last_refresh
+                    .insert(repo_path.to_path_buf(), std::time::Instant::now());
                 gtags.update_database(repo_path).await; // global -u, incremental
             }
         } else {
@@ -3348,9 +3415,10 @@ impl CodeIntelEngine {
         let mut pending: HashMap<String, RepoPending> = HashMap::new();
 
         let mut count = 0;
-        // Repos whose C/C++ sources changed this batch: their GTAGS db drifts on every
-        // edit, so refresh it once per repo after the loop (not per file).
-        let mut gtags_dirty: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        // Repos whose C/C++ sources changed this batch, mapped to the changed
+        // source paths: their GTAGS db drifts on every edit, so refresh it once
+        // per repo after the loop (not per file), and only when actually stale.
+        let mut gtags_dirty: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
         for change in changes {
             // compile_commands.json regenerated → clangd holds stale flags. Restart
@@ -3394,6 +3462,14 @@ impl CodeIntelEngine {
                 None => continue,
             };
 
+            // Build artifacts written into a watched tree (e.g. an in-tree kernel
+            // build) must never trigger a re-index or a gtags refresh. Mirror the
+            // index-time WalkBuilder(hidden + git_ignore) filter so the watch path
+            // tracks exactly the files the indexer would.
+            if self.is_ignored_for_index(repo_path, &change.path) {
+                continue;
+            }
+
             let repo_name = match canonical_repo_key(repo_path) {
                 Ok(k) => k,
                 Err(e) => {
@@ -3408,7 +3484,10 @@ impl CodeIntelEngine {
                 get_language_from_path(&change.path.to_string_lossy()).as_str(),
                 "c" | "cpp"
             ) {
-                gtags_dirty.insert(repo_path.to_path_buf());
+                gtags_dirty
+                    .entry(repo_path.to_path_buf())
+                    .or_default()
+                    .push(change.path.clone());
             }
 
             match change.change_type {
@@ -3533,8 +3612,19 @@ impl CodeIntelEngine {
 
         // Bring the gtags peer backend in sync for every repo whose C/C++ sources
         // changed — once per repo, since the watcher already debounces/batches.
-        for repo_path in &gtags_dirty {
-            self.refresh_gtags_if_active(repo_path).await;
+        // Only pay for a full-tree `global -u` when the DB is actually behind the
+        // changed sources (or one was deleted); the refresh itself is debounced.
+        for (repo_path, changed) in &gtags_dirty {
+            let any_deleted = changed.iter().any(|p| !p.exists());
+            if any_deleted || gtags_database_stale(repo_path, changed) {
+                self.refresh_gtags_if_active(repo_path).await;
+            } else {
+                debug!(
+                    "gtags: {:?} already current vs {} changed source(s); skip global -u",
+                    repo_path,
+                    changed.len()
+                );
+            }
         }
 
         // Re-measure only when something was actually re-indexed (a lone
