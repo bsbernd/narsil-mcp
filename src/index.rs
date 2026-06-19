@@ -669,6 +669,8 @@ impl CodeIntelEngine {
         // For repos not in the cache: do a full fresh index and save afterwards.
         let mut any_freshly_indexed = false;
 
+        let total_repos = self.repo_paths.len();
+        let mut done_repos = 0;
         for repo_path in &self.repo_paths {
             let repo_name = match canonical_repo_key(repo_path) {
                 Ok(k) => k,
@@ -700,6 +702,8 @@ impl CodeIntelEngine {
             } else {
                 warn!("Repository path does not exist: {:?}", repo_path);
             }
+            done_repos += 1;
+            info!("Indexed {}/{} repositories: {}", done_repos, total_repos, repo_name);
         }
 
         // Persist the freshly-built index so subsequent startups skip embedding
