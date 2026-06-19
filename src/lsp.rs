@@ -283,7 +283,21 @@ impl LspManager {
                 let mut buffer = vec![0u8; content_length];
                 tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buffer).await?;
 
-                let message: LspMessage = Self::parse_lsp_message(&buffer)?;
+                // A single unparseable message must not take down the reader:
+                // returning here would orphan every later request on this
+                // server, each then waiting out its full timeout. Skip it.
+                let message: LspMessage = match Self::parse_lsp_message(&buffer) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            "LSP: skipping unparseable message ({} bytes): {}",
+                            buffer.len(),
+                            e
+                        );
+                        content_length = 0;
+                        continue;
+                    }
+                };
                 debug!("Received LSP message: {:?}", message);
 
                 // Handle response
