@@ -1259,6 +1259,7 @@ impl CodeIntelEngine {
         }
 
         // Parse files in parallel
+        let parse_phase_start = std::time::Instant::now();
         let metrics = Arc::clone(&self.metrics);
         let parsed_results: Vec<_> = files
             .par_iter()
@@ -1360,6 +1361,13 @@ impl CodeIntelEngine {
             }
         }
 
+        info!(
+            "timing: parsed {} files in {:?} for {}",
+            file_count,
+            parse_phase_start.elapsed(),
+            repo_name
+        );
+
         // Now that parsing has revealed the language set, decide per repo which
         // backends actually run (Auto needs compile_commands.json / a GTAGS db).
         // gtags can build its database on demand first, size-gated, since it
@@ -1427,6 +1435,8 @@ impl CodeIntelEngine {
                 symbols_vec.extend(group.symbols);
             }
         } else if !cxx_groups.is_empty() {
+            let doc_sym_start = std::time::Instant::now();
+            let doc_sym_files = cxx_groups.len();
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
             // When --lsp-scope is given, gate the LSP pass to files under it (only
             // for repos that actually contain a matching file). gtags is unaffected.
@@ -1509,6 +1519,12 @@ impl CodeIntelEngine {
                     Err(e) => warn!("C/C++ symbol augmentation task failed: {}", e),
                 }
             }
+            info!(
+                "timing: cxx documentSymbol+gtags: {} files in {:?} for {}",
+                doc_sym_files,
+                doc_sym_start.elapsed(),
+                repo_name
+            );
         }
 
         // Batch-insert all pre-tokenized search documents under a single write lock.
@@ -1577,13 +1593,15 @@ impl CodeIntelEngine {
         // Build call graph if enabled
         if self.options.call_graph_enabled && !trees_for_callgraph.is_empty() {
             if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+                let call_graph_start = std::time::Instant::now();
                 if let Err(e) = call_graph.build_from_files(&trees_for_callgraph) {
                     warn!("Failed to build call graph for {}: {}", repo_name, e);
                 } else {
                     info!(
-                        "Built call graph for {} with {} files",
+                        "Built call graph for {} with {} files in {:?}",
                         repo_name,
-                        trees_for_callgraph.len()
+                        trees_for_callgraph.len(),
+                        call_graph_start.elapsed()
                     );
                 }
             }
@@ -1596,8 +1614,14 @@ impl CodeIntelEngine {
             && (lsp_for_repo.is_some() || gtags_for_repo.is_some())
             && self.call_graphs.contains_key(&repo_name)
         {
+            let call_hierarchy_start = std::time::Instant::now();
             self.augment_call_graph_cxx(&repo_name, path, &lsp_for_repo, &gtags_for_repo)
                 .await;
+            info!(
+                "timing: cxx callHierarchy augmentation in {:?} for {}",
+                call_hierarchy_start.elapsed(),
+                repo_name
+            );
         }
 
         // Transform symbols to RDF knowledge graph if enabled
@@ -1678,6 +1702,7 @@ impl CodeIntelEngine {
         // Phase 5: one task per (function, backend) querying callHierarchy
         // outgoing calls. Each returns its backend bit and the resolved edges;
         // the graph mutation happens serially below.
+        let lsp_phase_start = std::time::Instant::now();
         let mut lsp_edges: Vec<(SourceSet, Vec<(String, CallEdge)>)> = Vec::new();
         if let Some(lsp) = lsp {
             let backends = lsp.active_cxx_backends();
