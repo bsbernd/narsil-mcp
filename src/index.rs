@@ -2047,12 +2047,28 @@ impl CodeIntelEngine {
         // caller); the queried function is the callee.
         if !gtags_refs.is_empty() {
             if let Some(symbols) = self.symbols.get(repo_name) {
+                // enclosing_function_at scans every symbol; calling it per gtags
+                // reference is O(refs × symbols) and dominates indexing on large
+                // trees. Group function/method symbols by file once so each
+                // reference scans only its own file's functions.
+                let mut funcs_by_file: std::collections::HashMap<&str, Vec<&Symbol>> =
+                    std::collections::HashMap::new();
+                for sym in symbols.value() {
+                    if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+                        funcs_by_file
+                            .entry(sym.file_path.as_str())
+                            .or_default()
+                            .push(sym);
+                    }
+                }
                 for (callee_name, refs) in gtags_refs {
                     let edges: Vec<(String, CallEdge)> = refs
                         .into_iter()
                         .filter_map(|(rel_file, line, _text)| {
-                            let caller =
-                                Self::enclosing_function_at(symbols.value(), &rel_file, line)?;
+                            let caller = funcs_by_file
+                                .get(rel_file.as_str())?
+                                .iter()
+                                .find(|sym| sym.start_line <= line && line <= sym.end_line)?;
                             Some((
                                 CallGraph::qualified_key(&caller.file_path, &caller.name),
                                 CallEdge {
