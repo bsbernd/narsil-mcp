@@ -402,7 +402,12 @@ impl CodeIntelEngine {
             // canonical repo root so it matches the repo encoded in server keys.
             let mut disabled = std::collections::HashSet::new();
             for entry in &options.repo_settings {
-                if entry.background_index == Some(false) {
+                // The split per-backend blocks replace the old single toggle:
+                // either backend opting out of background indexing disables it
+                // for the repo's server keys (per-backend args land in a later patch).
+                let bg_off = entry.clangd.as_ref().and_then(|c| c.background_index) == Some(false)
+                    || entry.ccls.as_ref().and_then(|c| c.background_index) == Some(false);
+                if bg_off {
                     match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
                         Ok(key) => {
                             disabled.insert(PathBuf::from(key));
@@ -566,7 +571,11 @@ impl CodeIntelEngine {
         // (tree-sitter + gtags only), keyed by canonical repo path.
         let mut lsp_augment_disabled_repos = std::collections::HashSet::new();
         for entry in &options.repo_settings {
-            if entry.lsp == Some(false) {
+            // The old `lsp: false` ("tree-sitter + gtags only") is now both
+            // backends disabled; independent per-backend selection lands later.
+            let clangd_off = entry.clangd.as_ref().and_then(|c| c.enabled) == Some(false);
+            let ccls_off = entry.ccls.as_ref().and_then(|c| c.enabled) == Some(false);
+            if clangd_off && ccls_off {
                 if let Ok(key) = expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
                     lsp_augment_disabled_repos.insert(key);
                 }

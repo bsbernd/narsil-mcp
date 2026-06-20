@@ -742,7 +742,18 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
         server_args.repos = profile.repos.iter().map(|e| e.path().to_path_buf()).collect();
         // Carry per-repo overrides alongside the flat path list so the path code
         // below stays untouched; the engine keys these by canonical repo path.
-        server_args.repo_settings = profile.repos.iter().map(|e| e.settings()).collect();
+        // Fold the profile-group backend defaults into each entry's unset fields.
+        server_args.repo_settings = profile
+            .repos
+            .iter()
+            .map(|e| {
+                e.settings().with_group_defaults(
+                    profile.clangd.as_ref(),
+                    profile.ccls.as_ref(),
+                    profile.gtags.as_ref(),
+                )
+            })
+            .collect();
     }
     if server_args.discover.is_none() {
         server_args.discover = profile.discover.clone();

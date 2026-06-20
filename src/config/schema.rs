@@ -65,28 +65,76 @@ impl Default for ToolConfig {
 pub enum RepoEntry {
     /// `- ~/src/foo` — index the whole repo with the global defaults.
     Path(PathBuf),
-    /// `- { path: ..., index_filter: [...], background_index: false }`.
+    /// `- { path: ..., index_filter: [...], clangd: { jobs: 2 } }`.
     Detailed(RepoEntrySettings),
+}
+
+/// clangd tuning for a repo or profile group. Every field None = inherit the
+/// group default, then the global/compiled default. The dials bound clangd's
+/// parallelism, not its absolute RSS — clangd has no hard memory-cap flag.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClangdSettings {
+    /// Run clangd for this repo. None/true = run; false = skip clangd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// clangd `-j N`: async worker count, which also bounds background-index
+    /// parallelism — the biggest RSS/CPU lever. None = clangd default (= ncpu).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs: Option<usize>,
+
+    /// `--background-index`. None/true = on; false adds `--background-index=false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_index: Option<bool>,
+}
+
+/// ccls tuning for a repo or profile group. None on a field = inherit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CclsSettings {
+    /// Run ccls for this repo. None/true = run; false = skip ccls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// ccls `index.threads`: indexer thread count (the ccls analog of clangd -j).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<usize>,
+
+    /// ccls `cache.retainInMemory`: file caches kept resident. 0 = none (reload
+    /// from disk, lowest memory, higher per-query latency). None = ccls default (2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_in_memory: Option<usize>,
+
+    /// Background indexing. None/true = on; false sets index.initialBlacklist [".*"].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_index: Option<bool>,
+}
+
+/// gtags tuning for a repo or profile group. global(1)/gtags(1) are short-lived
+/// subprocesses — no steady-state memory dial, only on/off and DB generation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GtagsSettings {
+    /// Run gtags ref/def augmentation here. None = inherit --gtags/--no-gtags intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Auto-build GTAGS when absent (writes into the tree). None = inherit --gtags-generate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<bool>,
 }
 
 /// Per-repo overrides for a profile entry. `index_filter`/`lsp_scope` accept
 /// paths relative to the repo root (no need to repeat the absolute prefix);
-/// absolute entries are also matched against the absolute path.
+/// absolute entries are also matched against the absolute path. The clangd/ccls/
+/// gtags blocks tune each backend independently; an unset field inherits the
+/// profile-group default (see `with_group_defaults`) then the global default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoEntrySettings {
     /// Repository path.
     pub path: PathBuf,
-
-    /// clangd/ccls background indexing for this repo. None = use the default
-    /// (enabled). Set false on huge C repos to bound the language server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background_index: Option<bool>,
-
-    /// clangd/ccls augment passes (documentSymbol + callHierarchy) for this
-    /// repo. None = enabled. Set false to index with tree-sitter + gtags only,
-    /// skipping the language server entirely (no warm-up, no server start).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lsp: Option<bool>,
 
     /// Restrict the base (tree-sitter) index to these paths for this repo.
     /// Overrides the global --index-filter when non-empty.
@@ -97,6 +145,86 @@ pub struct RepoEntrySettings {
     /// Overrides the global --lsp-scope when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lsp_scope: Vec<String>,
+
+    /// Per-repo clangd tuning. None = inherit the group/global default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clangd: Option<ClangdSettings>,
+
+    /// Per-repo ccls tuning. None = inherit the group/global default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ccls: Option<CclsSettings>,
+
+    /// Per-repo gtags tuning. None = inherit the group/global default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gtags: Option<GtagsSettings>,
+}
+
+/// A per-backend block whose unset (None) fields can inherit from a group
+/// default. Implemented by the three backend settings structs so
+/// `RepoEntrySettings::with_group_defaults` can fold them uniformly.
+trait InheritFrom {
+    /// Return a copy of `self` with each unset field filled from `group`;
+    /// fields `self` already set win.
+    fn inherit_from(&self, group: &Self) -> Self;
+}
+
+impl InheritFrom for ClangdSettings {
+    fn inherit_from(&self, group: &ClangdSettings) -> ClangdSettings {
+        ClangdSettings {
+            enabled: self.enabled.or(group.enabled),
+            jobs: self.jobs.or(group.jobs),
+            background_index: self.background_index.or(group.background_index),
+        }
+    }
+}
+
+impl InheritFrom for CclsSettings {
+    fn inherit_from(&self, group: &CclsSettings) -> CclsSettings {
+        CclsSettings {
+            enabled: self.enabled.or(group.enabled),
+            threads: self.threads.or(group.threads),
+            retain_in_memory: self.retain_in_memory.or(group.retain_in_memory),
+            background_index: self.background_index.or(group.background_index),
+        }
+    }
+}
+
+impl InheritFrom for GtagsSettings {
+    fn inherit_from(&self, group: &GtagsSettings) -> GtagsSettings {
+        GtagsSettings {
+            enabled: self.enabled.or(group.enabled),
+            generate: self.generate.or(group.generate),
+        }
+    }
+}
+
+/// Combine a repo-entry block with a group default: a present entry block
+/// inherits the group's unset fields; an absent entry block takes the group
+/// block whole; absent on both stays None.
+fn merge_block<T: InheritFrom + Clone>(repo: Option<T>, group: Option<&T>) -> Option<T> {
+    match (repo, group) {
+        (Some(repo), Some(group)) => Some(repo.inherit_from(group)),
+        (Some(repo), None) => Some(repo),
+        (None, Some(group)) => Some(group.clone()),
+        (None, None) => None,
+    }
+}
+
+impl RepoEntrySettings {
+    /// Fold profile-group backend defaults into this entry's unset per-backend
+    /// fields. The entry's own values win field by field; group values fill the
+    /// gaps. `path`/`index_filter`/`lsp_scope` are per-repo only and untouched.
+    pub fn with_group_defaults(
+        mut self,
+        clangd: Option<&ClangdSettings>,
+        ccls: Option<&CclsSettings>,
+        gtags: Option<&GtagsSettings>,
+    ) -> RepoEntrySettings {
+        self.clangd = merge_block(self.clangd, clangd);
+        self.ccls = merge_block(self.ccls, ccls);
+        self.gtags = merge_block(self.gtags, gtags);
+        self
+    }
 }
 
 impl RepoEntry {
@@ -155,6 +283,19 @@ pub struct RepoProfile {
     /// Enable LSP integration for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<bool>,
+
+    /// Group-default clangd tuning. Each repo entry inherits the unset fields
+    /// (see `RepoEntrySettings::with_group_defaults`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clangd: Option<ClangdSettings>,
+
+    /// Group-default ccls tuning. Inherited by each repo entry's unset fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ccls: Option<CclsSettings>,
+
+    /// Group-default gtags tuning. Inherited by each repo entry's unset fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gtags: Option<GtagsSettings>,
 
     /// Enable remote GitHub repository support for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,8 +536,8 @@ profiles:
     repos:
       - ~/src/liburing
       - path: ~/src/linux
-        background_index: false
-        lsp: false
+        clangd: { enabled: false, background_index: false }
+        ccls: { enabled: false }
         index_filter: [fs, mm, io_uring]
         lsp_scope: [fs/fuse]
 "#;
@@ -406,17 +547,79 @@ profiles:
 
         // Bare path -> all defaults.
         let bare = profile.repos[0].settings();
-        assert_eq!(bare.background_index, None);
-        assert_eq!(bare.lsp, None);
+        assert!(bare.clangd.is_none());
+        assert!(bare.ccls.is_none());
         assert!(bare.index_filter.is_empty());
 
         // Detailed entry -> overrides carried through.
         let detailed = profile.repos[1].settings();
         assert_eq!(detailed.path, PathBuf::from("~/src/linux"));
-        assert_eq!(detailed.background_index, Some(false));
-        assert_eq!(detailed.lsp, Some(false));
+        let clangd = detailed.clangd.unwrap();
+        assert_eq!(clangd.enabled, Some(false));
+        assert_eq!(clangd.background_index, Some(false));
+        assert_eq!(detailed.ccls.unwrap().enabled, Some(false));
         assert_eq!(detailed.index_filter, vec!["fs", "mm", "io_uring"]);
         assert_eq!(detailed.lsp_scope, vec!["fs/fuse"]);
+    }
+
+    #[test]
+    fn test_with_group_defaults_merge() {
+        let yaml = r#"
+profiles:
+  work:
+    clangd: { jobs: 4, background_index: true }
+    ccls: { enabled: false }
+    repos:
+      - ~/src/libA
+      - path: ~/src/linux
+        clangd: { jobs: 2, background_index: false }
+        gtags: { enabled: true }
+"#;
+        let config: ToolConfig = serde_saphyr::from_str(yaml).unwrap();
+        let profile = config.profiles.get("work").unwrap();
+
+        // Bare entry inherits the whole group block.
+        let bare = profile.repos[0].settings().with_group_defaults(
+            profile.clangd.as_ref(),
+            profile.ccls.as_ref(),
+            profile.gtags.as_ref(),
+        );
+        let clangd = bare.clangd.unwrap();
+        assert_eq!(clangd.jobs, Some(4));
+        assert_eq!(clangd.background_index, Some(true));
+        assert_eq!(bare.ccls.unwrap().enabled, Some(false));
+        assert!(bare.gtags.is_none());
+
+        // Detailed entry wins field by field; group fills the gaps.
+        let linux = profile.repos[1].settings().with_group_defaults(
+            profile.clangd.as_ref(),
+            profile.ccls.as_ref(),
+            profile.gtags.as_ref(),
+        );
+        let clangd = linux.clangd.unwrap();
+        assert_eq!(clangd.jobs, Some(2)); // repo overrides group's 4
+        assert_eq!(clangd.background_index, Some(false)); // repo overrides group's true
+        assert_eq!(linux.ccls.unwrap().enabled, Some(false)); // inherited from group
+        assert_eq!(linux.gtags.unwrap().enabled, Some(true)); // repo-only block kept
+    }
+
+    #[test]
+    fn test_stale_keys_rejected() {
+        // The pre-split lsp:/background_index: keys no longer exist on a repo
+        // entry; deny_unknown_fields turns them into a hard parse error instead
+        // of a silent no-op, prompting migration to the new clangd/ccls blocks.
+        let yaml = r#"
+profiles:
+  work:
+    repos:
+      - path: ~/src/linux
+        background_index: false
+"#;
+        let parsed: Result<ToolConfig, _> = serde_saphyr::from_str(yaml);
+        assert!(
+            parsed.is_err(),
+            "stale background_index: key must be rejected"
+        );
     }
 
     #[test]
