@@ -239,8 +239,7 @@ impl LspManager {
     fn primary_server_key(&self, language: &str, repo: &Path) -> String {
         if matches!(language, "c" | "cpp") {
             let backend = self
-                .config
-                .cxx_lsp_backends
+                .cxx_backends_for_repo(repo)
                 .first()
                 .copied()
                 .unwrap_or(CxxLspBackend::Clangd);
@@ -638,7 +637,7 @@ impl LspManager {
         let repo = self.repo_for_path(file_path);
         let mut servers: Vec<(String, Arc<LspProcess>)> = Vec::new();
         if matches!(language, "c" | "cpp") {
-            for &backend in &self.config.cxx_lsp_backends {
+            for backend in self.cxx_backends_for_repo(&repo) {
                 let key = Self::server_key(language, backend, &repo);
                 match self.get_or_start_server_for_key(&key).await {
                     Ok(s) => servers.push((backend.label().to_string(), s)),
@@ -992,18 +991,34 @@ impl LspManager {
         Ok(Some(locations))
     }
 
-    /// Single-bit `SourceSet` for each configured C/C++ LSP backend
-    /// (`SourceSet::CLANGD` and/or `SourceSet::CCLS`). Empty when LSP is
-    /// disabled. Drives the per-backend documentSymbol (Phase 2) and
-    /// callHierarchy (Phase 5) index passes; results from each are merged, not
-    /// stored separately.
-    pub fn active_cxx_backends(&self) -> Vec<SourceSet> {
-        if !self.config.enabled {
-            return Vec::new();
-        }
+    /// Backends to run for `repo`: the globally-configured list minus those the
+    /// repo disabled via its clangd/ccls block. Empty means the repo is indexed
+    /// with tree-sitter + gtags only — no language server starts. `repo` must be
+    /// the canonical repo root used to key `lsp_tuning`.
+    fn cxx_backends_for_repo(&self, repo: &Path) -> Vec<CxxLspBackend> {
+        let tuning = self.config.lsp_tuning.get(repo);
         self.config
             .cxx_lsp_backends
             .iter()
+            .copied()
+            .filter(|backend| match backend {
+                CxxLspBackend::Clangd => tuning.is_none_or(|t| t.clangd_enabled),
+                CxxLspBackend::Ccls => tuning.is_none_or(|t| t.ccls_enabled),
+            })
+            .collect()
+    }
+
+    /// Single-bit `SourceSet` for each C/C++ backend `repo` enables
+    /// (`SourceSet::CLANGD` and/or `SourceSet::CCLS`). Empty when LSP is disabled
+    /// or the repo disabled every configured backend. Drives the per-backend
+    /// documentSymbol (Phase 2) and callHierarchy (Phase 5) index passes;
+    /// results from each are merged, not stored separately.
+    pub fn active_cxx_backends_for(&self, repo: &Path) -> Vec<SourceSet> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
+        self.cxx_backends_for_repo(repo)
+            .into_iter()
             .map(|backend| match backend {
                 CxxLspBackend::Clangd => SourceSet::CLANGD,
                 CxxLspBackend::Ccls => SourceSet::CCLS,
@@ -1268,7 +1283,7 @@ impl LspManager {
     /// Called when compile_commands.json changes.
     pub async fn restart_server(&self, repo: &Path, language: &str) {
         if matches!(language, "c" | "cpp") {
-            for &backend in &self.config.cxx_lsp_backends {
+            for backend in self.cxx_backends_for_repo(repo) {
                 let key = Self::server_key(language, backend, repo);
                 if let Some((_, process)) = self.servers.remove(&key) {
                     info!(
@@ -1313,7 +1328,7 @@ impl LspManager {
             return;
         }
         if matches!(language, "c" | "cpp") {
-            for &backend in &self.config.cxx_lsp_backends {
+            for backend in self.cxx_backends_for_repo(repo) {
                 let key = Self::server_key(language, backend, repo);
                 if let Err(e) = self.get_or_start_server_for_key(&key).await {
                     warn!(
@@ -1554,6 +1569,49 @@ mod tests {
         assert!(!args[0].contains("initialBlacklist"));
         assert!(!args[0].contains("retainInMemory"));
         assert!(!args[0].contains("threads"));
+    }
+
+    #[test]
+    fn test_active_cxx_backends_for_repo() {
+        let clangd_off = PathBuf::from("/work/ccls-only");
+        let both_off = PathBuf::from("/work/gtags-only");
+        let config = LspConfig {
+            enabled: true,
+            cxx_lsp_backends: vec![CxxLspBackend::Clangd, CxxLspBackend::Ccls],
+            lsp_tuning: HashMap::from([
+                (
+                    clangd_off.clone(),
+                    RepoLspTuning {
+                        clangd_enabled: false,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    both_off.clone(),
+                    RepoLspTuning {
+                        clangd_enabled: false,
+                        ccls_enabled: false,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let manager = LspManager::new(config, vec![]);
+
+        // clangd disabled -> ccls only.
+        assert_eq!(
+            manager.active_cxx_backends_for(&clangd_off),
+            vec![SourceSet::CCLS]
+        );
+        // both disabled -> no language server (gtags/tree-sitter only).
+        assert!(manager.active_cxx_backends_for(&both_off).is_empty());
+        // untuned repo -> full configured list.
+        let untuned = PathBuf::from("/work/full");
+        assert_eq!(
+            manager.active_cxx_backends_for(&untuned),
+            vec![SourceSet::CLANGD, SourceSet::CCLS]
+        );
     }
 
     #[test]

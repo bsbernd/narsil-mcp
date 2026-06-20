@@ -346,9 +346,6 @@ pub struct CodeIntelEngine {
     /// Per-repo compiled scope rules and flags, keyed by canonical repo path.
     /// A repo absent here falls back to the global defaults above.
     repo_settings: std::collections::HashMap<String, CompiledRepoSettings>,
-    /// Canonical repo paths whose clangd/ccls augment passes are disabled
-    /// (`lsp: false`). Such a repo is indexed with tree-sitter + gtags only.
-    lsp_augment_disabled_repos: std::collections::HashSet<String>,
     /// Per-repo memo: true when the repo had >=1 file under `--index-filter`, so
     /// the watch path can drop changes to out-of-scope files. Absent = not
     /// scoped (full index), which keeps unrelated repos untouched.
@@ -583,27 +580,6 @@ impl CodeIntelEngine {
             );
         }
 
-        // Repos that opted out of the clangd/ccls augment passes entirely
-        // (tree-sitter + gtags only), keyed by canonical repo path.
-        let mut lsp_augment_disabled_repos = std::collections::HashSet::new();
-        for entry in &options.repo_settings {
-            // The old `lsp: false` ("tree-sitter + gtags only") is now both
-            // backends disabled; independent per-backend selection lands later.
-            let clangd_off = entry.clangd.as_ref().and_then(|c| c.enabled) == Some(false);
-            let ccls_off = entry.ccls.as_ref().and_then(|c| c.enabled) == Some(false);
-            if clangd_off && ccls_off {
-                if let Ok(key) = expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
-                    lsp_augment_disabled_repos.insert(key);
-                }
-            }
-        }
-        if !lsp_augment_disabled_repos.is_empty() {
-            info!(
-                "clangd/ccls augment disabled (gtags only) for: {:?}",
-                lsp_augment_disabled_repos
-            );
-        }
-
         let engine = Self {
             _index_path: expanded_index,
             repo_paths: expanded_repos.clone(),
@@ -636,7 +612,6 @@ impl CodeIntelEngine {
             default_lsp_scope,
             default_index_filter,
             repo_settings,
-            lsp_augment_disabled_repos,
             index_filtered_repos: DashMap::new(),
         };
 
@@ -1127,10 +1102,14 @@ impl CodeIntelEngine {
         scope_matches(self.repo_lsp_scope_rules(repo_name), rel, abs)
     }
 
-    /// Whether this repo opted out of the clangd/ccls augment passes
-    /// (`lsp: false`) — indexed with tree-sitter + gtags only.
+    /// Whether the clangd/ccls augment passes are off for this repo: true when
+    /// it enables no C/C++ backend (clangd and ccls both disabled), so it is
+    /// indexed with tree-sitter + gtags only.
     fn lsp_augment_disabled(&self, repo_name: &str) -> bool {
-        self.lsp_augment_disabled_repos.contains(repo_name)
+        self.lsp_manager
+            .as_ref()
+            .map(|lsp| lsp.active_cxx_backends_for(Path::new(repo_name)).is_empty())
+            .unwrap_or(true)
     }
 
     /// Whether `--index-filter` restricted this repo's base index (memoized at
@@ -1256,7 +1235,7 @@ impl CodeIntelEngine {
         if is_cxx {
             if self.lsp_repo_enabled(repo_path) {
                 if let Some(lsp) = &self.lsp_manager {
-                    for backend in lsp.active_cxx_backends() {
+                    for backend in lsp.active_cxx_backends_for(repo_path) {
                         set.insert(backend);
                     }
                 }
@@ -1608,6 +1587,12 @@ impl CodeIntelEngine {
                         &g.abs_path.to_string_lossy(),
                     )
                 });
+            // The repo's enabled C/C++ backends, resolved once; each
+            // documentSymbol task filters its calls to these.
+            let active_backends = lsp_for_repo
+                .as_ref()
+                .map(|lsp| lsp.active_cxx_backends_for(Path::new(&repo_name)))
+                .unwrap_or_default();
             let mut tasks = tokio::task::JoinSet::new();
             for group in cxx_groups {
                 let permit = semaphore.clone().acquire_owned().await?;
@@ -1623,6 +1608,7 @@ impl CodeIntelEngine {
                 };
                 let gtags = gtags_for_repo.clone();
                 let repo_path = path.to_path_buf();
+                let active_backends = active_backends.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     let CxxFileSymbols {
@@ -1633,7 +1619,7 @@ impl CodeIntelEngine {
                     let lang = get_language_from_path(&abs_path.to_string_lossy());
 
                     if let Some(lsp) = &lsp {
-                        for backend in lsp.active_cxx_backends() {
+                        for &backend in &active_backends {
                             match lsp.get_document_symbols(backend, &abs_path, &lang).await {
                                 Ok(mut lsp_symbols) => {
                                     for symbol in &mut lsp_symbols {
@@ -1874,7 +1860,7 @@ impl CodeIntelEngine {
         // which is ruinous on a huge tree. Phase 6 (gtags) below still runs.
         let lsp = lsp.as_ref().filter(|_| !self.lsp_augment_disabled(repo_name));
         if let Some(lsp) = lsp {
-            let backends = lsp.active_cxx_backends();
+            let backends = lsp.active_cxx_backends_for(Path::new(repo_name));
             // Same --lsp-scope gate as the documentSymbol pass: skip callHierarchy
             // for functions outside the scoped paths in a scoped repo.
             let repo_scoped = self.lsp_scope_active(repo_name)
@@ -3604,7 +3590,7 @@ impl CodeIntelEngine {
         {
             if let Some(lsp) = &self.lsp_manager {
                 let lang = get_language_from_path(&abs_path.to_string_lossy());
-                for backend in lsp.active_cxx_backends() {
+                for backend in lsp.active_cxx_backends_for(Path::new(repo_name)) {
                     match lsp.get_document_symbols(backend, abs_path, &lang).await {
                         Ok(mut lsp_symbols) => {
                             for symbol in &mut lsp_symbols {
@@ -5111,7 +5097,7 @@ impl CodeIntelEngine {
                                     // C/C++ backends; tag agreement with the primary
                                     // backend's bit as a coarse "LSP-confirmed" marker.
                                     let lsp_bit = lsp
-                                        .active_cxx_backends()
+                                        .active_cxx_backends_for(&repo_path)
                                         .first()
                                         .copied()
                                         .unwrap_or(SourceSet::CLANGD);
