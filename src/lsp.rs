@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use lsp_types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -51,6 +51,43 @@ impl CxxLspBackend {
     }
 }
 
+/// Per-repo clangd/ccls tuning, keyed by canonical repo root in
+/// `LspConfig.lsp_tuning`. A repo absent from that map runs every backend with
+/// compiled defaults; the bool fields default to true so an unset block means
+/// "on". The dials bound parallelism (clangd `-j`, ccls `index.threads`) and
+/// resident cache (ccls `cache.retainInMemory`) — clangd has no hard RSS cap.
+#[derive(Debug, Clone)]
+pub struct RepoLspTuning {
+    /// Run clangd for this repo.
+    pub clangd_enabled: bool,
+    /// clangd `-j N` worker/background-index parallelism. None = clangd default.
+    pub clangd_jobs: Option<usize>,
+    /// clangd `--background-index`. false adds `--background-index=false`.
+    pub clangd_background_index: bool,
+    /// Run ccls for this repo.
+    pub ccls_enabled: bool,
+    /// ccls `index.threads` indexer count. None = ccls default.
+    pub ccls_threads: Option<usize>,
+    /// ccls `cache.retainInMemory` resident file caches. None = ccls default (2).
+    pub ccls_retain_in_memory: Option<usize>,
+    /// ccls background indexing. false sets index.initialBlacklist [".*"].
+    pub ccls_background_index: bool,
+}
+
+impl Default for RepoLspTuning {
+    fn default() -> Self {
+        Self {
+            clangd_enabled: true,
+            clangd_jobs: None,
+            clangd_background_index: true,
+            ccls_enabled: true,
+            ccls_threads: None,
+            ccls_retain_in_memory: None,
+            ccls_background_index: true,
+        }
+    }
+}
+
 /// Configuration for LSP integration
 #[derive(Debug, Clone)]
 pub struct LspConfig {
@@ -69,10 +106,9 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Which C/C++ LSP backends to start (defaults to clangd only)
     pub cxx_lsp_backends: Vec<CxxLspBackend>,
-    /// Canonical repo roots whose clangd/ccls should NOT build a background
-    /// index (from a profile's `background_index: false`). Empty = all repos
-    /// keep background indexing on (the default).
-    pub background_index_disabled: HashSet<PathBuf>,
+    /// Per-repo clangd/ccls tuning, keyed by canonical repo root. A repo absent
+    /// here runs every backend with compiled defaults (see `RepoLspTuning`).
+    pub lsp_tuning: HashMap<PathBuf, RepoLspTuning>,
 }
 
 impl Default for LspConfig {
@@ -86,7 +122,7 @@ impl Default for LspConfig {
             index_timeout_ms: 60000,
             enabled: false,
             cxx_lsp_backends: vec![CxxLspBackend::Clangd],
-            background_index_disabled: HashSet::new(),
+            lsp_tuning: HashMap::new(),
         }
     }
 }
@@ -776,9 +812,9 @@ impl LspManager {
             return Ok((path.clone(), vec![]));
         }
 
-        // Per-repo background-index decision (the repo is encoded in the key).
+        // Per-repo tuning (the repo is encoded in the key); absent = defaults.
         let (_, repo) = Self::parse_server_key(server_key);
-        let bg_disabled = self.config.background_index_disabled.contains(repo);
+        let tuning = self.config.lsp_tuning.get(repo);
 
         match lang_backend {
             "rust" => Ok((PathBuf::from("rust-analyzer"), vec![])),
@@ -798,22 +834,38 @@ impl LspManager {
             // whole.
             "c:clangd" | "cpp:clangd" => {
                 let mut args = vec!["--pch-storage=disk".to_string()];
-                if bg_disabled {
+                if tuning.is_some_and(|t| !t.clangd_background_index) {
                     args.push("--background-index=false".to_string());
+                }
+                // -j bounds clangd's async worker pool, which also caps
+                // background-index parallelism — the main RSS/CPU lever.
+                if let Some(jobs) = tuning.and_then(|t| t.clangd_jobs) {
+                    args.push(format!("-j={}", jobs));
                 }
                 Ok((PathBuf::from("clangd"), args))
             }
             // ccls writes its index to cache.directory; point it under the user
             // cache dir so it never drops a .ccls-cache/ into the repo. When the
             // repo opted out of background indexing, blacklist everything so only
-            // files opened on demand are parsed.
+            // files opened on demand are parsed; threads/retainInMemory tune the
+            // indexer's parallelism and resident cache.
             "c:ccls" | "cpp:ccls" => {
                 let cache_dir = Self::ccls_cache_dir(repo);
                 let mut init = serde_json::json!({
                     "cache": { "directory": cache_dir.to_string_lossy() },
                 });
-                if bg_disabled {
-                    init["index"] = serde_json::json!({ "initialBlacklist": [".*"] });
+                if let Some(retain) = tuning.and_then(|t| t.ccls_retain_in_memory) {
+                    init["cache"]["retainInMemory"] = retain.into();
+                }
+                let mut index = serde_json::Map::new();
+                if tuning.is_some_and(|t| !t.ccls_background_index) {
+                    index.insert("initialBlacklist".to_string(), serde_json::json!([".*"]));
+                }
+                if let Some(threads) = tuning.and_then(|t| t.ccls_threads) {
+                    index.insert("threads".to_string(), threads.into());
+                }
+                if !index.is_empty() {
+                    init["index"] = serde_json::Value::Object(index);
                 }
                 Ok((PathBuf::from("ccls"), vec![format!("--init={}", init)]))
             }
@@ -1456,33 +1508,52 @@ mod tests {
     #[test]
     fn test_background_index_toggle_per_repo() {
         let off_repo = PathBuf::from("/work/linux");
+        let tuning = RepoLspTuning {
+            clangd_jobs: Some(2),
+            clangd_background_index: false,
+            ccls_threads: Some(3),
+            ccls_retain_in_memory: Some(0),
+            ccls_background_index: false,
+            ..Default::default()
+        };
         let config = LspConfig {
-            background_index_disabled: HashSet::from([off_repo.clone()]),
+            lsp_tuning: HashMap::from([(off_repo.clone(), tuning)]),
             ..Default::default()
         };
         let manager = LspManager::new(config, vec![]);
 
-        // Opted-out repo: clangd is told not to build a background index.
+        // Tuned repo: clangd gets --background-index=false and the -j cap.
         let key_off = LspManager::server_key("c", CxxLspBackend::Clangd, &off_repo);
         let (cmd, args) = manager.get_server_command_for_key(&key_off).unwrap();
         assert_eq!(cmd, PathBuf::from("clangd"));
         assert!(args.iter().any(|a| a == "--background-index=false"));
+        assert!(args.iter().any(|a| a == "-j=2"));
 
-        // A different repo keeps the background index on.
+        // A different repo keeps clangd defaults: no bg-index flag, no -j.
         let on_repo = PathBuf::from("/work/libfuse");
         let key_on = LspManager::server_key("c", CxxLspBackend::Clangd, &on_repo);
         let (_, args) = manager.get_server_command_for_key(&key_on).unwrap();
         assert!(!args.iter().any(|a| a == "--background-index=false"));
+        assert!(!args.iter().any(|a| a.starts_with("-j")));
 
-        // ccls for the opted-out repo blacklists everything and relocates its
-        // cache out of the repo tree.
+        // ccls for the tuned repo blacklists everything, sets threads and
+        // retainInMemory, and relocates its cache out of the repo tree.
         let key_ccls = LspManager::server_key("c", CxxLspBackend::Ccls, &off_repo);
         let (cmd, args) = manager.get_server_command_for_key(&key_ccls).unwrap();
         assert_eq!(cmd, PathBuf::from("ccls"));
         assert_eq!(args.len(), 1);
         assert!(args[0].starts_with("--init="));
         assert!(args[0].contains("initialBlacklist"));
+        assert!(args[0].contains("\"threads\":3"));
+        assert!(args[0].contains("\"retainInMemory\":0"));
         assert!(!args[0].contains("/work/linux/.ccls-cache"));
+
+        // An untuned repo's ccls --init carries only the relocated cache dir.
+        let key_ccls_on = LspManager::server_key("c", CxxLspBackend::Ccls, &on_repo);
+        let (_, args) = manager.get_server_command_for_key(&key_ccls_on).unwrap();
+        assert!(!args[0].contains("initialBlacklist"));
+        assert!(!args[0].contains("retainInMemory"));
+        assert!(!args[0].contains("threads"));
     }
 
     #[test]

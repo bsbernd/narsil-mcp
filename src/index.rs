@@ -398,31 +398,47 @@ impl CodeIntelEngine {
         // Initialize LSP manager if enabled
         let lsp_manager = if options.lsp_config.enabled {
             info!("LSP integration enabled");
-            // Repos that opted out of clangd/ccls background indexing. Keyed by
-            // canonical repo root so it matches the repo encoded in server keys.
-            let mut disabled = std::collections::HashSet::new();
+            // Per-repo clangd/ccls tuning, keyed by canonical repo root so it
+            // matches the repo encoded in server keys. A field left unset on the
+            // config block keeps the RepoLspTuning default (backend on, no dial).
+            let mut tuning_map = std::collections::HashMap::new();
             for entry in &options.repo_settings {
-                // The split per-backend blocks replace the old single toggle:
-                // either backend opting out of background indexing disables it
-                // for the repo's server keys (per-backend args land in a later patch).
-                let bg_off = entry.clangd.as_ref().and_then(|c| c.background_index) == Some(false)
-                    || entry.ccls.as_ref().and_then(|c| c.background_index) == Some(false);
-                if bg_off {
-                    match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
-                        Ok(key) => {
-                            disabled.insert(PathBuf::from(key));
-                        }
-                        Err(e) => warn!(
-                            "background_index setting ignored for {:?}: {}",
-                            entry.path, e
-                        ),
-                    }
+                if entry.clangd.is_none() && entry.ccls.is_none() {
+                    continue;
                 }
+                let key = match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
+                    Ok(key) => PathBuf::from(key),
+                    Err(e) => {
+                        warn!("per-repo LSP tuning ignored for {:?}: {}", entry.path, e);
+                        continue;
+                    }
+                };
+                let clangd = entry.clangd.as_ref();
+                let ccls = entry.ccls.as_ref();
+                tuning_map.insert(
+                    key,
+                    crate::lsp::RepoLspTuning {
+                        clangd_enabled: clangd.and_then(|c| c.enabled).unwrap_or(true),
+                        clangd_jobs: clangd.and_then(|c| c.jobs),
+                        clangd_background_index: clangd
+                            .and_then(|c| c.background_index)
+                            .unwrap_or(true),
+                        ccls_enabled: ccls.and_then(|c| c.enabled).unwrap_or(true),
+                        ccls_threads: ccls.and_then(|c| c.threads),
+                        ccls_retain_in_memory: ccls.and_then(|c| c.retain_in_memory),
+                        ccls_background_index: ccls
+                            .and_then(|c| c.background_index)
+                            .unwrap_or(true),
+                    },
+                );
             }
-            if !disabled.is_empty() {
-                info!("clangd/ccls background index disabled for: {:?}", disabled);
+            if !tuning_map.is_empty() {
+                info!(
+                    "per-repo clangd/ccls tuning for {} repo(s)",
+                    tuning_map.len()
+                );
             }
-            options.lsp_config.background_index_disabled = disabled;
+            options.lsp_config.lsp_tuning = tuning_map;
             Some(Arc::new(LspManager::new(
                 options.lsp_config.clone(),
                 expanded_repos.clone(),
