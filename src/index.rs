@@ -231,14 +231,18 @@ enum ScopeRule {
     Glob(glob::Pattern),
 }
 
-/// Per-repo compiled scope rules. Built once per repo in `with_options` from
-/// the profile entry (falling back to the global `--index-filter`/`--lsp-scope`
-/// defaults when the entry omits them).
+/// Per-repo compiled scope rules and gtags overrides. Built once per repo in
+/// `with_options` from the profile entry (falling back to the global
+/// `--index-filter`/`--lsp-scope`/`--gtags*` defaults when the entry omits them).
 struct CompiledRepoSettings {
     /// Effective `--index-filter` rules for this repo (empty = whole repo).
     index_filter: Vec<ScopeRule>,
     /// Effective `--lsp-scope` rules for this repo (empty = whole repo).
     lsp_scope: Vec<ScopeRule>,
+    /// Per-repo gtags enable override (`gtags: { enabled }`). None = global intent.
+    gtags_enabled: Option<bool>,
+    /// Per-repo gtags auto-generate override (`gtags: { generate }`). None = global flag.
+    gtags_generate: Option<bool>,
 }
 
 /// Compile raw scope entries (paths or globs) into matchers. Invalid globs are
@@ -576,6 +580,8 @@ impl CodeIntelEngine {
                     } else {
                         compile_scope(&entry.lsp_scope)
                     },
+                    gtags_enabled: entry.gtags.as_ref().and_then(|g| g.enabled),
+                    gtags_generate: entry.gtags.as_ref().and_then(|g| g.generate),
                 },
             );
         }
@@ -1060,12 +1066,45 @@ impl CodeIntelEngine {
             }
     }
 
+    /// Per-repo compiled settings for `repo_path`, looked up by canonical key
+    /// (matching how `repo_settings` was built). None = no profile entry, so the
+    /// global defaults apply.
+    fn repo_settings_for_path(&self, repo_path: &Path) -> Option<&CompiledRepoSettings> {
+        canonical_repo_key(repo_path)
+            .ok()
+            .and_then(|key| self.repo_settings.get(&key))
+    }
+
+    /// Whether gtags is intended for `repo_path`, ignoring whether a GTAGS db
+    /// exists yet (used by the auto-generate gate, which runs before the db is
+    /// built). The per-repo `gtags: { enabled }` override wins over the global
+    /// `--gtags`/`--no-gtags` intent.
+    fn gtags_repo_intended(&self, repo_path: &Path) -> bool {
+        match self
+            .repo_settings_for_path(repo_path)
+            .and_then(|s| s.gtags_enabled)
+        {
+            Some(enabled) => enabled,
+            None => self.options.gtags_intent != BackendIntent::Off,
+        }
+    }
+
+    /// Whether GTAGS should be auto-generated/refreshed for `repo_path`: the
+    /// per-repo `gtags: { generate }` override wins over the global
+    /// `--gtags-generate` flag.
+    fn gtags_generate_for_repo(&self, repo_path: &Path) -> bool {
+        self.repo_settings_for_path(repo_path)
+            .and_then(|s| s.gtags_generate)
+            .unwrap_or(self.options.gtags_generate)
+    }
+
     /// Whether gtags augmentation applies to `repo_path`. A GTAGS database is
     /// required even when intent is `On` (global cannot query without one);
-    /// `On` only forces the manager to exist at startup.
+    /// `On` only forces the manager to exist at startup. The per-repo enable
+    /// override is folded in via `gtags_repo_intended`.
     fn gtags_repo_enabled(&self, repo_path: &Path) -> bool {
         self.gtags_manager.is_some()
-            && self.options.gtags_intent != BackendIntent::Off
+            && self.gtags_repo_intended(repo_path)
             && repo_path.join("GTAGS").exists()
     }
 
@@ -1210,7 +1249,7 @@ impl CodeIntelEngine {
                 return;
             }
         }
-        if self.options.gtags_generate && crate::gtags::gtags_binary_present() {
+        if self.gtags_generate_for_repo(repo_path) && crate::gtags::gtags_binary_present() {
             if let Some(gtags) = &self.gtags_manager {
                 self.gtags_last_refresh
                     .insert(repo_path.to_path_buf(), std::time::Instant::now());
@@ -1513,8 +1552,8 @@ impl CodeIntelEngine {
         // writes into the repo tree.
         let cxx_present = languages.keys().any(|lang| is_cxx_language(lang));
         if cxx_present
-            && self.options.gtags_generate
-            && self.options.gtags_intent != BackendIntent::Off
+            && self.gtags_generate_for_repo(path)
+            && self.gtags_repo_intended(path)
             && !path.join("GTAGS").exists()
         {
             if file_count > GTAGS_GENERATE_MAX_FILES {
@@ -1533,11 +1572,11 @@ impl CodeIntelEngine {
         // cross-validation. Refresh it (writes into the repo, so opt-in via
         // --gtags-generate) before the augment runs, else warn.
         if cxx_present
-            && self.options.gtags_intent != BackendIntent::Off
+            && self.gtags_repo_intended(path)
             && path.join("GTAGS").exists()
             && gtags_database_stale(path, &files)
         {
-            if self.options.gtags_generate && crate::gtags::gtags_binary_present() {
+            if self.gtags_generate_for_repo(path) && crate::gtags::gtags_binary_present() {
                 if let Some(gtags) = &self.gtags_manager {
                     gtags.update_database(path).await;
                 }
