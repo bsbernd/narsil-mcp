@@ -285,6 +285,10 @@ impl LspManager {
         let (language, repo) = Self::parse_server_key(server_key);
         let (command, args) = self.get_server_command_for_key(server_key)?;
 
+        // Run the server with its cwd at the repo root, matching the root_uri
+        // sent at initialize. Without this the child inherits narsil's own cwd.
+        let workspace_root = self.workspace_root_for(repo);
+
         info!(
             "Starting LSP server for {}: {} {:?}",
             server_key,
@@ -294,6 +298,7 @@ impl LspManager {
 
         let mut child = tokio::process::Command::new(command.as_os_str())
             .args(&args)
+            .current_dir(&workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -718,6 +723,21 @@ impl LspManager {
         .await
     }
 
+    /// Resolve a server-key repo to its workspace root: a key without an
+    /// `@<repo>` suffix yields "" or "." (see `parse_server_key`), which falls
+    /// back to the first workspace root. Single source for both the child's cwd
+    /// and the initialize `root_uri`, keeping the two consistent.
+    fn workspace_root_for(&self, repo: &Path) -> PathBuf {
+        if repo.as_os_str().is_empty() || repo == Path::new(".") {
+            self.workspace_roots
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            repo.to_path_buf()
+        }
+    }
+
     /// Initialize the LSP server, rooted at `repo`.
     async fn initialize_server(
         &self,
@@ -725,14 +745,7 @@ impl LspManager {
         language: &str,
         repo: &Path,
     ) -> Result<()> {
-        let workspace_root = if repo.as_os_str().is_empty() || repo == Path::new(".") {
-            self.workspace_roots
-                .first()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            repo.to_path_buf()
-        };
+        let workspace_root = self.workspace_root_for(repo);
 
         let workspace_folder = WorkspaceFolder {
             uri: Url::from_file_path(&workspace_root).unwrap(),
