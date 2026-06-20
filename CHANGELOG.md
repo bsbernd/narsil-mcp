@@ -9,16 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Per-repo profile overrides for scope and background indexing**. A repo
-  entry in a `--profile` may now be a map (`{ path, index_filter, lsp_scope,
-  background_index }`) instead of a bare path. `index_filter`/`lsp_scope` are
-  repo-relative and override the global `--index-filter`/`--lsp-scope` flags for
-  that repo only; `background_index: false` launches clangd
-  (`--background-index=false`) / ccls (`index.initialBlacklist`) for a huge tree
-  so it is not indexed whole, while other repos keep it on. Language servers are
-  now keyed and rooted per repository (fixing a multi-repo bug where every
-  C/C++ query ran against whichever repo was listed first), and ccls writes its
-  cache under the user cache directory instead of a `.ccls-cache/` in the repo.
+- **Per-repo and per-group backend tuning in profiles**. A repo entry in a
+  `--profile` may be a map instead of a bare path, and each C/C++ backend has
+  its own block — `clangd { enabled, jobs, background_index }`,
+  `ccls { enabled, threads, retain_in_memory, background_index }`,
+  `gtags { enabled, generate }` — settable on the entry or as a profile-group
+  default that each repo inherits field by field. clangd and ccls can be enabled
+  independently per repo (disabling both indexes a repo with tree-sitter + gtags
+  only), and `jobs` / `threads` / `retain_in_memory` are the memory/CPU dials
+  (clangd has no hard RSS cap). `index_filter` / `lsp_scope` stay repo-relative
+  overrides of the global `--index-filter` / `--lsp-scope` flags. Language
+  servers are keyed and rooted per repository (fixing a multi-repo bug where
+  every C/C++ query ran against whichever repo was listed first), and ccls
+  writes its cache under the user cache directory instead of a `.ccls-cache/` in
+  the repo. The earlier per-repo `lsp:` / `background_index:` keys are replaced
+  by these blocks and rejected at startup.
 - **Symbolic heap-overflow detection (CWE-122-001)**. A new `heap_size`
   subsystem builds a `SizeExpr` algebra for allocator calls
   (`malloc`/`calloc`/`realloc`/`asprintf`/`vasprintf`/`strdup`/`strndup`)

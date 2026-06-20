@@ -1,0 +1,64 @@
+# Per-repo and per-group C/C++ backend tuning
+#
+# narsil-mcp can run up to three C/C++ backends per repository: clangd and ccls
+# (language servers) and GNU Global / gtags. Each backend has its own settings
+# block, settable either as a profile-group default — inherited by every repo in
+# the profile — or on a single repo entry, which wins field by field.
+#
+# The primary use is to bound memory. clangd has no hard RSS-cap flag, so on a
+# very large tree the firm levers are turning a backend off or disabling its
+# background index; clangd.jobs / ccls.threads / ccls.retain_in_memory bound
+# parallelism and resident cache but are not absolute limits.
+#
+# Select this profile at startup:
+#   narsil-mcp --profile dev
+#
+# Full field reference: docs/configuration.md, section
+# "Per-repo and per-group backend tuning".
+
+version: "1.0"
+
+profiles:
+  dev:
+    preset: full
+    git: true
+    call_graph: true
+    lsp: true
+    use_compile_commands: true
+
+    # Group defaults: every repo below inherits these unless it sets the field
+    # itself. Here, prefer ccls (lighter resident memory than clangd) and keep
+    # gtags on; leave clangd off across the whole group.
+    clangd: { enabled: false }
+    ccls:   { enabled: true }
+    gtags:  { enabled: true }
+
+    repos:
+      # Huge tree (e.g. an OS kernel): run neither language server and answer
+      # structure queries from tree-sitter + gtags only. index_filter limits the
+      # tree-sitter index to a few subtrees (paths are relative to the repo
+      # root). generate builds the GTAGS database if it is absent.
+      - path: ~/src/linux
+        clangd: { enabled: false }
+        ccls:   { enabled: false }
+        gtags:  { enabled: true, generate: true }
+        index_filter: [fs, mm, drivers/block, io_uring]
+
+      # Mid-size C/C++ project: keep ccls but cap its footprint — 3 indexer
+      # threads and no resident file caches (retain_in_memory: 0 reloads from
+      # disk, trading per-query latency for lower memory).
+      - path: ~/src/database-engine
+        ccls: { threads: 3, retain_in_memory: 0 }
+
+      # A project where clangd is wanted for its cross-TU accuracy, but throttled
+      # to 2 async workers to bound peak RSS during the initial background index.
+      # This entry's clangd block overrides the group's clangd: { enabled: false }.
+      - path: ~/src/graphics-lib
+        clangd: { enabled: true, jobs: 2, background_index: true }
+        ccls:   { enabled: false }
+        lsp_scope: [src, include]
+
+      # Bare paths inherit the group defaults verbatim: ccls on, clangd off,
+      # gtags on.
+      - ~/src/cli-tools
+      - ~/src/web-service

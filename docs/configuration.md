@@ -99,11 +99,15 @@ narsil-mcp config profiles
 CLI flags still win, so `narsil-mcp --profile platform --repos ~/src/one-off`
 uses the explicit `--repos` value while keeping profile feature defaults.
 
-#### Per-repo overrides
+#### Per-repo and per-group backend tuning
 
 A repo entry can be either a bare path (all defaults) or a map carrying
-overrides for that repo alone. This is how a single large C repo is bounded
-without affecting the others in the profile:
+overrides for that repo alone. Each C/C++ backend — `clangd`, `ccls`, `gtags` —
+has its own block, settable on a repo entry **or** as a profile-group default
+that every repo in the profile inherits. A repo entry's own value wins field by
+field; an unset field falls back to the group default, then the compiled
+default. This is how a single large C repo is bounded without affecting the
+others in the profile:
 
 ```yaml
 version: "1.0"
@@ -111,29 +115,52 @@ profiles:
   platform:
     lsp: true
     use_compile_commands: true
+    # Group defaults: every repo below inherits these unless it overrides them.
+    clangd: { jobs: 4, background_index: true }
+    ccls:   { enabled: false }            # ccls off across the whole group
     repos:
-      # Huge C tree: index only these subtrees and stop clangd/ccls from
-      # indexing the whole compile_commands.json in the background.
+      # Huge C tree: cap clangd harder and route references through gtags.
       - path: ~/src/bigkernel
-        background_index: false
+        clangd: { jobs: 2, background_index: false }  # overrides the group jobs: 4
+        gtags:  { enabled: true, generate: true }
         index_filter: [fs, mm, drivers/block]
         lsp_scope: [fs]
-      # A C++ repo keeps the background index on (it needs cross-file
-      # resolution that gtags cannot provide).
+      # Inherits the group clangd (jobs: 4, background index on) and ccls (off).
       - path: ~/src/cpp-engine
       # A bare path uses all defaults.
       - ~/src/liburing
 ```
 
+- **`clangd`** — `enabled` (default true; `false` skips clangd for this repo),
+  `jobs` (clangd `-j N`: async worker count, which also bounds background-index
+  parallelism — the main memory/CPU lever), `background_index` (default true;
+  `false` adds `--background-index=false`).
+- **`ccls`** — `enabled`, `threads` (ccls `index.threads`, the indexer-thread
+  analog of clangd `-j`), `retain_in_memory` (ccls `cache.retainInMemory`:
+  resident file caches; `0` keeps none — lowest memory, more per-query disk
+  reads — versus the ccls default of 2), `background_index`.
+- **`gtags`** — `enabled` (override the global `--gtags`/`--no-gtags` intent for
+  this repo; a GTAGS database is still required to answer), `generate` (override
+  `--gtags-generate`: auto-build GTAGS when absent, writing into the tree).
+- Disabling **both** clangd and ccls for a repo indexes it with tree-sitter +
+  gtags only — no language server starts for it.
 - `index_filter` / `lsp_scope` accept paths **relative to the repo root**
   (absolute paths also work). They override the global `--index-filter` /
   `--lsp-scope` flags for that repo; a repo without its own list falls back to
   those flags.
-- `background_index` defaults to `true`. Set it `false` on very large trees so
-  the language server does not index every translation unit; the on-demand
-  documentSymbol / callHierarchy passes and gtags still cover the repo.
 - ccls always writes its cache under the user cache directory, never a
   `.ccls-cache/` inside the repository.
+
+> **Memory note:** clangd has no hard RSS-cap flag. `clangd.jobs`,
+> `ccls.threads`, and `ccls.retain_in_memory` bound parallelism and resident
+> cache — they lower peak memory but are not absolute limits. Turning a backend
+> off, or `background_index: false`, is the firm lever on a very large tree.
+
+> The pre-split per-repo `lsp:` and `background_index:` keys have been replaced
+> by these blocks and are now rejected at startup. Move a `background_index:
+> false` to `clangd: { background_index: false }` (plus `ccls: {
+> background_index: false }` if ccls runs), and a `lsp: false` to
+> `clangd: { enabled: false }` + `ccls: { enabled: false }`.
 
 ## Configuration Levels
 
