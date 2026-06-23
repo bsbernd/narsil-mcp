@@ -157,8 +157,8 @@ impl LanguageParser {
                 extensions: vec!["c", "h"],
                 symbol_query: r#"
                     (function_definition declarator: (function_declarator declarator: (identifier) @function.name)) @function.def
-                    (struct_specifier name: (type_identifier) @struct.name) @struct.def
-                    (enum_specifier name: (type_identifier) @enum.name) @enum.def
+                    (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
+                    (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
                     (type_definition declarator: (type_identifier) @type.name) @type.def
                 "#,
             },
@@ -172,9 +172,9 @@ impl LanguageParser {
                     (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name)) @function.def
                     (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @function.name))) @function.def
                     (template_declaration (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name))) @function.def
-                    (class_specifier name: (type_identifier) @class.name) @class.def
-                    (struct_specifier name: (type_identifier) @struct.name) @struct.def
-                    (enum_specifier name: (type_identifier) @enum.name) @enum.def
+                    (class_specifier name: (type_identifier) @class.name body: (field_declaration_list)) @class.def
+                    (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
+                    (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
                     (namespace_definition name: (namespace_identifier) @namespace.name) @namespace.def
                 "#,
             },
@@ -859,6 +859,12 @@ namespace MyNamespace {
         VALUE_A,
         VALUE_B
     };
+
+    // Opaque type only referenced, never defined here. Must not be emitted as a
+    // struct definition (regression: bare struct_specifier type references were
+    // captured as @struct.def).
+    struct Opaque;
+    void useOpaque(struct Opaque *o);
 }
 
 void standaloneFunction() {
@@ -886,6 +892,84 @@ void standaloneFunction() {
             names.contains(&&"standaloneFunction".to_string()),
             "Should find function"
         );
+        // Forward declaration + type reference must not produce a definition.
+        assert!(
+            !names.contains(&&"Opaque".to_string()),
+            "Opaque is only forward-declared/referenced, not defined: {:?}",
+            names
+        );
+    }
+
+    /// Regression: a bare `struct foo`/`enum foo` used as a field or parameter
+    /// type is a `struct_specifier`/`enum_specifier` node WITHOUT a body — the
+    /// same node kind as a real definition. The symbol query must require a body
+    /// so type references and forward declarations are not recorded as
+    /// definitions (otherwise every type mention of an opaque type produces a
+    /// phantom definition).
+    #[test]
+    fn test_parse_c_definitions_only() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+struct widget {
+    int x;
+};
+
+struct widget;                        /* forward declaration */
+
+struct holder {
+    struct widget *field;             /* type reference in a field */
+};
+
+void use_widget(struct widget *w);    /* type reference in a parameter */
+
+enum phase {
+    P_A,
+    P_B
+};
+
+void use_phase(enum phase p);         /* enum type reference in a parameter */
+        "#;
+
+        let parsed = parser.parse_file(Path::new("test.c"), content).unwrap();
+        assert_eq!(parsed.language, "c");
+
+        let widget_defs = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "widget" && s.kind == SymbolKind::Struct)
+            .count();
+        assert_eq!(
+            widget_defs, 1,
+            "exactly one `struct widget` definition expected, got {}: {:?}",
+            widget_defs, parsed.symbols
+        );
+
+        let phase_defs = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.name == "phase" && s.kind == SymbolKind::Enum)
+            .count();
+        assert_eq!(
+            phase_defs, 1,
+            "exactly one `enum phase` definition expected, got {}",
+            phase_defs
+        );
+
+        // The captured definition must span its body, not a one-line reference.
+        let widget = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == "widget" && s.kind == SymbolKind::Struct)
+            .unwrap();
+        assert!(
+            widget.end_line > widget.start_line,
+            "definition node should span its body, got {}..{}",
+            widget.start_line,
+            widget.end_line
+        );
+
+        let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
+        assert!(names.contains(&&"holder".to_string()), "found: {:?}", names);
     }
 
     #[test]
