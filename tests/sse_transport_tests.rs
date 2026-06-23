@@ -9,10 +9,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -450,5 +450,225 @@ fn test_sse_rejects_non_loopback_host_header() -> Result<()> {
         .header("Host", "evil.example")
         .send()?;
     assert_eq!(resp.status().as_u16(), 403);
+    Ok(())
+}
+
+// ── stdio proxy reconnect across SSE server restart ────────────────────────
+
+/// Spawn an SSE server on a fixed `port`, indexing `repo`, registering into
+/// the discovery file under `xdg_runtime`. The returned `Child` is managed by
+/// the caller (kill + wait) so the same port can be rebound on restart.
+fn spawn_sse_on_port(port: u16, repo: &Path, xdg_runtime: &Path) -> Result<Child> {
+    Command::new(binary_path())
+        .args([
+            "--transport",
+            "sse",
+            "--sse-host",
+            "127.0.0.1",
+            "--sse-port",
+            &port.to_string(),
+            "--repos",
+            repo.to_str().expect("temp path is utf-8"),
+        ])
+        .env("XDG_RUNTIME_DIR", xdg_runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn SSE narsil-mcp; run `cargo build` first")
+}
+
+/// Poll the streamable `/mcp` endpoint with a `ping` until it answers 2xx. A
+/// success here means the engine is wired (not a bare 503) and — since the
+/// server registers for discovery before it serves — that its discovery entry
+/// is already on disk.
+fn wait_until_mcp_ready(port: u16) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let url = format!("http://127.0.0.1:{}/mcp", port);
+    while Instant::now() < deadline {
+        if let Ok(resp) = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#)
+            .send()
+        {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!("/mcp did not become ready within {:?}", STARTUP_TIMEOUT);
+}
+
+/// A stdio narsil-mcp child driven as an MCP client. Its stdout (responses)
+/// and stderr (logs) are drained on background threads into channels so the
+/// test can read responses with a timeout and watch for log markers without
+/// risking a full pipe blocking the child.
+struct StdioProxy {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: Receiver<String>,
+    stderr_rx: Receiver<String>,
+    _stdout_reader: thread::JoinHandle<()>,
+    _stderr_reader: thread::JoinHandle<()>,
+}
+
+impl StdioProxy {
+    /// Spawn `narsil-mcp --repos <repo>` in stdio mode (the default), sharing
+    /// `xdg_runtime` so it discovers the SSE server registered there.
+    fn spawn(repo: &Path, xdg_runtime: &Path) -> Result<Self> {
+        let mut child = Command::new(binary_path())
+            .args(["--repos", repo.to_str().expect("temp path is utf-8")])
+            .env("XDG_RUNTIME_DIR", xdg_runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn stdio narsil-mcp")?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stdout_reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(text) = line else { return };
+                if stdout_tx.send(text).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let stderr_reader = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(text) = line else { return };
+                if stderr_tx.send(text).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_rx,
+            stderr_rx,
+            _stdout_reader: stdout_reader,
+            _stderr_reader: stderr_reader,
+        })
+    }
+
+    fn send(&mut self, msg: &Value) -> Result<()> {
+        let line = serde_json::to_string(msg)?;
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    /// Next response line from the proxy's stdout, or an error on timeout.
+    fn next_response(&self, timeout: Duration) -> Result<String> {
+        self.stdout_rx
+            .recv_timeout(timeout)
+            .map_err(|_| anyhow!("timeout waiting for proxy stdout response"))
+    }
+
+    /// Wait until a stderr line contains `needle`, draining log lines until
+    /// then. Used to confirm the process entered proxy (delegate) mode.
+    fn wait_for_stderr_contains(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match self
+                .stderr_rx
+                .recv_timeout(remaining.min(Duration::from_millis(500)))
+            {
+                Ok(line) if line.contains(needle) => return true,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+}
+
+impl Drop for StdioProxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// End-to-end: a stdio client delegating to a shared SSE server must survive
+/// that server restarting mid-session. The proxy is expected to reconnect
+/// transparently — rediscover the restarted server, replay the handshake, and
+/// replay the request — so the post-restart request returns a valid response
+/// instead of the '-32000 Connection closed' the editor used to see.
+#[test]
+fn test_stdio_proxy_reconnects_after_server_restart() -> Result<()> {
+    // Isolated discovery registry shared by both subprocesses, so the test
+    // never touches the developer's real $XDG_RUNTIME_DIR/narsil-mcp.
+    let xdg = TempDir::new()?;
+    let repo = TempDir::new()?;
+    let repo_path = repo.path().canonicalize()?;
+    let port = ephemeral_port()?;
+
+    // Bring up the SSE server; readiness implies it has registered itself.
+    let mut server = spawn_sse_on_port(port, &repo_path, xdg.path())?;
+    wait_until_mcp_ready(port)?;
+
+    // The stdio process must discover the server and run as a proxy, not
+    // build its own local index.
+    let mut proxy = StdioProxy::spawn(&repo_path, xdg.path())?;
+    assert!(
+        proxy.wait_for_stderr_contains("delegating stdio to", STARTUP_TIMEOUT),
+        "stdio process did not delegate to the SSE server (proxy mode not entered)"
+    );
+
+    // Handshake plus one request that round-trips to the live server.
+    proxy.send(&initialize(1, "reconnect-test"))?;
+    assert_eq!(response_id(&proxy.next_response(EVENT_TIMEOUT)?)?, json!(1));
+    proxy.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
+
+    proxy.send(&tools_list(2))?;
+    let before = proxy.next_response(EVENT_TIMEOUT)?;
+    assert_eq!(response_id(&before)?, json!(2));
+    assert!(
+        tools_count(&before)? > 0,
+        "pre-restart tools/list must return tools"
+    );
+
+    // Restart the server on the SAME port. kill + wait first so the listening
+    // socket is fully released before the replacement binds it.
+    let _ = server.kill();
+    let _ = server.wait();
+    server = spawn_sse_on_port(port, &repo_path, xdg.path())?;
+    wait_until_mcp_ready(port)?;
+
+    // The next request hits a dead session; the proxy must reconnect and
+    // return a valid response. Allow generously for the reconnect backoff.
+    proxy.send(&tools_list(3))?;
+    let after = proxy.next_response(Duration::from_secs(40))?;
+    assert_eq!(
+        response_id(&after)?,
+        json!(3),
+        "post-restart tools/list must return the matching id via reconnect"
+    );
+    assert!(
+        tools_count(&after)? > 0,
+        "post-restart tools/list must return tools via reconnect"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
     Ok(())
 }
