@@ -4007,7 +4007,7 @@ impl CodeIntelEngine {
 
                             // Build this file's symbols once and reuse them for
                             // both the in-memory index and the persisted record.
-                            let file_symbols: Vec<_> = parsed
+                            let mut file_symbols: Vec<_> = parsed
                                 .symbols
                                 .into_iter()
                                 .map(|mut symbol| {
@@ -4015,6 +4015,51 @@ impl CodeIntelEngine {
                                     symbol
                                 })
                                 .collect();
+
+                            // Augment with LSP for C/C++ files, mirroring index_repo
+                            // phase 2. LSP servers are always current; gtags
+                            // augmentation happens after GTAGS is refreshed below.
+                            let lang = get_language_from_path(&change.path.to_string_lossy());
+                            if matches!(lang.as_str(), "c" | "cpp") {
+                                if let Some(lsp) = &self.lsp_manager {
+                                    let abs_str = change.path.to_string_lossy();
+                                    let repo_scoped = self.lsp_scope_active(&repo_name);
+                                    if self.lsp_augment_allows(
+                                        &repo_name,
+                                        repo_scoped,
+                                        &rel_path,
+                                        &abs_str,
+                                    ) {
+                                        let active_backends =
+                                            lsp.active_cxx_backends_for(repo_path);
+                                        for &backend in &active_backends {
+                                            match lsp
+                                                .get_document_symbols(
+                                                    backend,
+                                                    &change.path,
+                                                    &lang,
+                                                )
+                                                .await
+                                            {
+                                                Ok(mut lsp_syms) => {
+                                                    for s in &mut lsp_syms {
+                                                        s.file_path = rel_path.clone();
+                                                    }
+                                                    merge_symbols(
+                                                        &mut file_symbols,
+                                                        lsp_syms,
+                                                        backend,
+                                                    );
+                                                }
+                                                Err(e) => debug!(
+                                                    "LSP documentSymbol failed for {:?}: {}",
+                                                    change.path, e
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
                             // Update symbols for this file
                             if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
@@ -4127,6 +4172,63 @@ impl CodeIntelEngine {
                     repo_path,
                     changed.len()
                 );
+            }
+        }
+
+        // Augment changed C/C++ file symbols from gtags, now that global -u has
+        // run and the GTAGS database reflects the current sources. Mirrors
+        // index_repo phase 3 for the incremental path.
+        if let Some(gtags) = &self.gtags_manager {
+            for (repo_path, changed) in &gtags_dirty {
+                if !self.gtags_repo_enabled(repo_path) {
+                    continue;
+                }
+                let repo_name = match canonical_repo_key(repo_path) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                for abs_path in changed {
+                    if !abs_path.exists() {
+                        continue; // deleted — symbols already removed above
+                    }
+                    let rel_path = abs_path
+                        .strip_prefix(repo_path)
+                        .unwrap_or(abs_path)
+                        .to_string_lossy()
+                        .to_string();
+                    let gtags_syms: Vec<Symbol> = gtags
+                        .list_file_symbols(abs_path, repo_path)
+                        .await
+                        .into_iter()
+                        .map(|(name, line)| Symbol {
+                            name,
+                            kind: SymbolKind::Unknown,
+                            file_path: rel_path.clone(),
+                            start_line: line,
+                            end_line: line,
+                            signature: None,
+                            qualified_name: None,
+                            doc_comment: None,
+                            confirmed_by: SourceSet::GTAGS,
+                            line_conflicts: Vec::new(),
+                        })
+                        .collect();
+                    if gtags_syms.is_empty() {
+                        continue;
+                    }
+                    if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
+                        // Extract the file's current symbols (tree-sitter + LSP),
+                        // merge gtags in, then put the merged set back.
+                        let mut file_syms: Vec<Symbol> = symbols
+                            .iter()
+                            .filter(|s| s.file_path == rel_path)
+                            .cloned()
+                            .collect();
+                        merge_symbols(&mut file_syms, gtags_syms, SourceSet::GTAGS);
+                        symbols.retain(|s| s.file_path != rel_path);
+                        symbols.extend(file_syms);
+                    }
+                }
             }
         }
 
