@@ -1897,7 +1897,13 @@ impl CodeIntelEngine {
         // gtags-only repos skip the callHierarchy pass entirely: with the
         // background index off it re-parses every TU cold to resolve callees,
         // which is ruinous on a huge tree. Phase 6 (gtags) below still runs.
-        let lsp = lsp.as_ref().filter(|_| !self.lsp_augment_disabled(repo_name));
+        // The same cold-reparse bars clangd/ccls without a compile_commands.json:
+        // every call then reparses its TU cold, so the pass costs ~one request
+        // timeout per function (136s on a 22-file repo) yet every call times out
+        // → zero edges. gtags + tree-sitter still build the graph.
+        let lsp = lsp.as_ref().filter(|_| {
+            !self.lsp_augment_disabled(repo_name) && self.compile_commands_present(repo_path)
+        });
         if let Some(lsp) = lsp {
             let backends = lsp.active_cxx_backends_for(Path::new(repo_name));
             // Same --lsp-scope gate as the documentSymbol pass: skip callHierarchy
@@ -1920,6 +1926,9 @@ impl CodeIntelEngine {
             if !backends.is_empty() {
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
                 let mut tasks = tokio::task::JoinSet::new();
+                // Files skipped because the wall-clock budget elapsed before
+                // they could be queried; reported so the truncation is visible.
+                let mut budget_skipped: usize = 0;
                 // One task per (file, backend); the semaphore runs files in
                 // parallel up to CXX_AUGMENT_CONCURRENCY.
                 for (rel_path, file_funcs) in by_file {
@@ -1935,6 +1944,13 @@ impl CodeIntelEngine {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+                    // Stop launching new files once the phase budget is spent;
+                    // in-flight tasks drain below. Granularity is one file, so a
+                    // file with many functions may overhang the budget slightly.
+                    if lsp_phase_start.elapsed() > CXX_CALLHIERARCHY_BUDGET {
+                        budget_skipped += 1;
+                        continue;
+                    }
                     for backend in &backends {
                         let permit = match semaphore.clone().acquire_owned().await {
                             Ok(p) => p,
@@ -1983,6 +1999,13 @@ impl CodeIntelEngine {
                         Ok(_) => {}
                         Err(e) => warn!("LSP callHierarchy task failed: {}", e),
                     }
+                }
+                if budget_skipped > 0 {
+                    warn!(
+                        "callHierarchy (LSP) budget {:?} exceeded for {}: {} file(s) \
+                         skipped; tree-sitter/gtags edges retained",
+                        CXX_CALLHIERARCHY_BUDGET, repo_name, budget_skipped
+                    );
                 }
             }
         }
@@ -11430,6 +11453,13 @@ const SYMBOL_MATCH_WINDOW: usize = 3;
 /// Kept small to overlap subprocesses and server round-trips without flooding a
 /// single clangd/ccls process.
 const CXX_AUGMENT_CONCURRENCY: usize = 6;
+
+/// Wall-clock cap on the per-repo callHierarchy (LSP) augment phase. clangd/ccls
+/// answer cold first-opens slowly; on a large tree the per-function round-trips
+/// can otherwise run for minutes. Once exceeded, remaining files are skipped and
+/// the graph keeps its tree-sitter/gtags edges plus whatever callHierarchy
+/// already completed.
+const CXX_CALLHIERARCHY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One C/C++ file's tree-sitter baseline symbols, queued for the async LSP/gtags
 /// augmentation pass that cannot run inside the rayon parse closure.
