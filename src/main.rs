@@ -334,9 +334,18 @@ async fn main() -> Result<()> {
     // anything that fails (no registry file, no matching repos, transport
     // error) falls through to the normal local-index path.
     if matches!(server_args.transport, Transport::Stdio) {
-        if let Some(proxy_url) = sse_discovery::find_server_for_repos(&repos) {
+        // The discovery probe uses a blocking HTTP client whose own runtime is
+        // dropped when the call returns; run it via spawn_blocking so that drop
+        // does not happen inside this async context (which would panic).
+        let probe_repos = repos.clone();
+        let discovered =
+            tokio::task::spawn_blocking(move || sse_discovery::find_server_for_repos(&probe_repos))
+                .await
+                .ok()
+                .flatten();
+        if let Some(proxy_url) = discovered {
             info!("SSE discovery: delegating stdio to {}", proxy_url);
-            return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url).await;
+            return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url, &repos).await;
         }
         info!("SSE discovery: no matching server, building local index");
     }
