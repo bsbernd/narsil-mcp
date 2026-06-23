@@ -243,6 +243,8 @@ struct CompiledRepoSettings {
     gtags_enabled: Option<bool>,
     /// Per-repo gtags auto-generate override (`gtags: { generate }`). None = global flag.
     gtags_generate: Option<bool>,
+    /// Per-repo compile_commands coverage threshold (percent). None = global default.
+    compile_commands_min_coverage_pct: Option<usize>,
 }
 
 /// Compile raw scope entries (paths or globs) into matchers. Invalid globs are
@@ -582,6 +584,7 @@ impl CodeIntelEngine {
                     },
                     gtags_enabled: entry.gtags.as_ref().and_then(|g| g.enabled),
                     gtags_generate: entry.gtags.as_ref().and_then(|g| g.generate),
+                    compile_commands_min_coverage_pct: entry.compile_commands_min_coverage_pct,
                 },
             );
         }
@@ -1075,6 +1078,15 @@ impl CodeIntelEngine {
             .and_then(|key| self.repo_settings.get(&key))
     }
 
+    /// Effective compile_commands coverage threshold (percent) for `repo_path`:
+    /// the per-repo `compile_commands_min_coverage_pct` override wins over the
+    /// global default.
+    fn compile_commands_min_coverage_pct(&self, repo_path: &Path) -> usize {
+        self.repo_settings_for_path(repo_path)
+            .and_then(|s| s.compile_commands_min_coverage_pct)
+            .unwrap_or(COMPILE_COMMANDS_DEFAULT_MIN_COVERAGE_PCT)
+    }
+
     /// Whether gtags is intended for `repo_path`, ignoring whether a GTAGS db
     /// exists yet (used by the auto-generate gate, which runs before the db is
     /// built). The per-repo `gtags: { enabled }` override wins over the global
@@ -1413,27 +1425,49 @@ impl CodeIntelEngine {
                 )
             };
             let patterns = compile_include_patterns(&self.options.include);
-            let before = files.len();
-            files.retain(|abs_path| {
-                let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if is_c_header_ext(ext) {
-                    return true;
-                }
-                if !is_c_source_ext(ext) {
-                    return true;
-                }
-                if compiled.contains(abs_path.as_path()) {
-                    return true;
-                }
-                let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
-                patterns.iter().any(|p| p.matches_path(rel))
-            });
-            info!(
-                "compile_commands filter: {} → {} files ({} filtered out)",
-                before,
-                files.len(),
-                before - files.len()
-            );
+
+            // A manifest covering only a sliver of the repo's C sources is
+            // stale/partial (e.g. an incremental `bear -- make` that recompiled
+            // one TU); honouring it would silently drop nearly every source, so
+            // fall back to indexing all sources. clangd still gets the manifest.
+            let min_coverage_pct = self.compile_commands_min_coverage_pct(path);
+            let covered = files
+                .iter()
+                .filter(|abs_path| {
+                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    is_c_source_ext(ext) && compiled.contains(abs_path.as_path())
+                })
+                .count();
+
+            if covered * 100 < cxx_source_count * min_coverage_pct {
+                warn!(
+                    "compile_commands.json covers only {}/{} C sources (<{}%) for {} — \
+                     treating as stale; indexing all sources",
+                    covered, cxx_source_count, min_coverage_pct, repo_name
+                );
+            } else {
+                let before = files.len();
+                files.retain(|abs_path| {
+                    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if is_c_header_ext(ext) {
+                        return true;
+                    }
+                    if !is_c_source_ext(ext) {
+                        return true;
+                    }
+                    if compiled.contains(abs_path.as_path()) {
+                        return true;
+                    }
+                    let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
+                    patterns.iter().any(|p| p.matches_path(rel))
+                });
+                info!(
+                    "compile_commands filter: {} → {} files ({} filtered out)",
+                    before,
+                    files.len(),
+                    before - files.len()
+                );
+            }
         }
 
         // Parse files in parallel
@@ -10678,6 +10712,13 @@ impl CodeIntelEngine {
 /// (e.g. a plain-Makefile project) rather than an error worth filtering or
 /// warning for.
 const COMPILE_COMMANDS_MIN_CXX_SOURCES: usize = 5;
+
+/// Default minimum percent of a repo's C sources that compile_commands.json must
+/// cover to be trusted as the index filter (per-repo overridable via
+/// `compile_commands_min_coverage_pct`). Below this the manifest is treated as
+/// stale/partial and ignored so a one-off `bear` capture of a single TU cannot
+/// silently gut the index.
+const COMPILE_COMMANDS_DEFAULT_MIN_COVERAGE_PCT: usize = 25;
 
 fn is_c_source_ext(ext: &str) -> bool {
     matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")

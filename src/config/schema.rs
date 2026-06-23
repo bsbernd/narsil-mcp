@@ -146,6 +146,14 @@ pub struct RepoEntrySettings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lsp_scope: Vec<String>,
 
+    /// Minimum percent of this repo's C sources that compile_commands.json must
+    /// cover to be trusted as the index filter. Below this the manifest is
+    /// treated as stale/partial and ignored (all sources indexed), so a one-off
+    /// `bear` capture of a single TU cannot silently gut the index. 0 disables
+    /// the check (always honour the manifest). Unset = global default (25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_commands_min_coverage_pct: Option<usize>,
+
     /// Per-repo clangd tuning. None = inherit the group/global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clangd: Option<ClangdSettings>,
