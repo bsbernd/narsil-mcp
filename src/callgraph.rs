@@ -423,10 +423,25 @@ impl CallGraph {
         path: &str,
         current_function: &mut Option<String>,
     ) {
+        // Saved (function-node depth, enclosing scope) pairs. A function's scope
+        // is only valid for nodes deeper than its definition node, so it must be
+        // popped once the walk returns to that depth or shallower — otherwise
+        // top-level calls after a function body get charged to that function.
+        let mut scope_stack: Vec<(usize, Option<String>)> = Vec::new();
         let mut depth: usize = 0;
         loop {
             let node = cursor.node();
             let kind = node.kind();
+
+            // Leave any function scope whose definition node sits at or above the
+            // current depth: a node at depth d cannot be inside such a function.
+            while let Some(&(scope_depth, _)) = scope_stack.last() {
+                if scope_depth >= depth {
+                    *current_function = scope_stack.pop().unwrap().1;
+                } else {
+                    break;
+                }
+            }
 
             // Update current function context (use qualified key)
             if matches!(
@@ -445,6 +460,7 @@ impl CallGraph {
                     extract_function_name(node, source)
                 };
                 if let Some(name) = name {
+                    scope_stack.push((depth, current_function.clone()));
                     *current_function = Some(Self::qualified_key(path, &name));
                 }
             }
@@ -1714,6 +1730,50 @@ mod tests {
 
         let callers = graph.get_callers("nonexistent");
         assert_eq!(callers.len(), 0);
+    }
+
+    #[test]
+    fn test_top_level_call_not_attributed_to_preceding_function() {
+        // A trailing top-level call (in the module's `if __name__` block) sits
+        // outside any function. Without scope restoration it leaked into the
+        // lexically preceding function `target`, producing a phantom self-call.
+        let source = "\
+def helper():
+    return 1
+
+def target():
+    helper()
+
+if __name__ == \"__main__\":
+    target()
+";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let graph = CallGraph::new();
+        graph
+            .build_from_files(&[("mod.py".to_string(), source.to_string(), tree)])
+            .unwrap();
+
+        // No function calls `target`; `helper` is `target`'s only callee.
+        assert!(graph.get_callers("target").is_empty());
+
+        let target_callees: Vec<String> = graph
+            .get_callees("target")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(target_callees, vec!["mod.py::helper".to_string()]);
+
+        let helper_callers: Vec<String> = graph
+            .get_callers("helper")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(helper_callers, vec!["mod.py::target".to_string()]);
     }
 
     #[test]
