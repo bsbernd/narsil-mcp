@@ -296,6 +296,15 @@ fn tools_list(id: i64) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {} })
 }
 
+fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    })
+}
+
 fn tools_count(response_data: &str) -> Result<usize> {
     let v: Value = serde_json::from_str(response_data)?;
     let tools = v
@@ -309,6 +318,19 @@ fn tools_count(response_data: &str) -> Result<usize> {
 fn response_id(response_data: &str) -> Result<Value> {
     let v: Value = serde_json::from_str(response_data)?;
     Ok(v.get("id").cloned().unwrap_or(Value::Null))
+}
+
+fn tool_text(response_data: &str) -> Result<String> {
+    let v: Value = serde_json::from_str(response_data)?;
+    let text = v
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("response did not contain result.content[0].text"))?;
+    Ok(text.to_string())
 }
 
 /// Spec smoke test: open SSE, observe `endpoint` event, drive
@@ -330,12 +352,7 @@ fn test_sse_smoke_flow() -> Result<()> {
     assert_eq!(response_id(&ev.data)?, json!(2));
     assert!(tools_count(&ev.data)? > 0, "tools/list should return tools");
 
-    let call = json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": { "name": "list_repos", "arguments": {} }
-    });
+    let call = tool_call(3, "list_repos", json!({}));
     assert_eq!(client.post(&call)?, 202);
     let ev = client.next_event(EVENT_TIMEOUT)?;
     assert_eq!(response_id(&ev.data)?, json!(3));
@@ -666,6 +683,44 @@ fn test_stdio_proxy_reconnects_after_server_restart() -> Result<()> {
     assert!(
         tools_count(&after)? > 0,
         "post-restart tools/list must return tools via reconnect"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    Ok(())
+}
+
+#[test]
+fn test_stdio_proxy_translates_dot_repo() -> Result<()> {
+    let xdg = TempDir::new()?;
+    let repo = TempDir::new()?;
+    let repo_path = repo.path().canonicalize()?;
+    let port = ephemeral_port()?;
+
+    let mut server = spawn_sse_on_port(port, &repo_path, xdg.path())?;
+    wait_until_mcp_ready(port)?;
+
+    let mut proxy = StdioProxy::spawn(&repo_path, xdg.path())?;
+    assert!(
+        proxy.wait_for_stderr_contains("delegating stdio to", STARTUP_TIMEOUT),
+        "stdio process did not delegate to the SSE server (proxy mode not entered)"
+    );
+
+    proxy.send(&initialize(1, "dot-repo-test"))?;
+    assert_eq!(response_id(&proxy.next_response(EVENT_TIMEOUT)?)?, json!(1));
+    proxy.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
+
+    proxy.send(&tool_call(
+        2,
+        "get_project_structure",
+        json!({ "repo": "." }),
+    ))?;
+    let response = proxy.next_response(EVENT_TIMEOUT)?;
+    assert_eq!(response_id(&response)?, json!(2));
+    let text = tool_text(&response)?;
+    assert!(
+        text.contains(&repo_path.display().to_string()),
+        "repo='.' should resolve to the stdio proxy's resolved repo path"
     );
 
     let _ = server.kill();

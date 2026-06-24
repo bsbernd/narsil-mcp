@@ -2,11 +2,10 @@
 //!
 //! When the stdio entry-point finds a running SSE narsil-mcp that already
 //! covers the requested repositories, it skips engine construction and
-//! runs this proxy instead. The proxy is byte-level: it reads
-//! newline-delimited JSON-RPC from stdin, forwards each line as a POST to
-//! the streamable HTTP `/mcp` endpoint, captures the `Mcp-Session-Id`
-//! header from the first response, and writes successful response bodies
-//! back to stdout as new lines.
+//! runs this proxy instead. The proxy reads newline-delimited JSON-RPC from
+//! stdin, forwards each line as a POST to the streamable HTTP `/mcp`
+//! endpoint, captures the `Mcp-Session-Id` header from the first response,
+//! and writes successful response bodies back to stdout as new lines.
 //!
 //! Requests are serialised — one stdin line, one POST, one response
 //! written, repeat. The MCP stdio framing technically allows pipelining
@@ -16,7 +15,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
@@ -53,6 +53,10 @@ struct ProxySession {
     /// Repos this stdio process serves; used to rediscover the restarted
     /// server, which may have rebound an ephemeral port.
     repos: Vec<PathBuf>,
+    /// Repo that a `repo: "."` argument maps to: the served repo containing
+    /// this proxy's cwd, else the sole repo. The daemon cannot resolve "."
+    /// itself — its cwd is its own, not the client's project.
+    default_repo: Option<String>,
     session_header_name: HeaderName,
     /// Session id captured from the first response; cleared on reconnect.
     session_id: Option<HeaderValue>,
@@ -82,11 +86,40 @@ impl ProxySession {
             client,
             endpoint,
             repos: repos.to_vec(),
+            default_repo: Self::resolve_dot_repo(repos),
             session_header_name: HeaderName::from_static(MCP_SESSION_HEADER),
             session_id: None,
             init_request: None,
             initialized_notification: None,
         })
+    }
+
+    /// Resolve which served repo a `repo: "."` argument refers to. The proxy
+    /// runs in the client's project dir, so its own cwd disambiguates; the
+    /// daemon's cwd cannot. Falls back to the sole repo when cwd is outside
+    /// every served repo, preserving single-repo behaviour.
+    fn resolve_dot_repo(repos: &[PathBuf]) -> Option<String> {
+        let cwd = std::env::current_dir()
+            .and_then(|cwd| cwd.canonicalize())
+            .ok();
+        Self::dot_repo_for_cwd(repos, cwd.as_deref())
+    }
+
+    /// The served repo a `repo: "."` argument maps to given the proxy's `cwd`:
+    /// the most specific served repo enclosing cwd, else the sole repo.
+    fn dot_repo_for_cwd(repos: &[PathBuf], cwd: Option<&Path>) -> Option<String> {
+        if let Some(cwd) = cwd {
+            // Indexed repos are roots; the client's cwd sits inside one. Pick
+            // the most specific (longest) enclosing root.
+            if let Some(repo) = repos
+                .iter()
+                .filter(|repo| cwd.starts_with(repo))
+                .max_by_key(|repo| repo.as_os_str().len())
+            {
+                return Some(repo.to_string_lossy().into_owned());
+            }
+        }
+        (repos.len() == 1).then(|| repos[0].to_string_lossy().into_owned())
     }
 
     fn request_headers(&self) -> HeaderMap {
@@ -124,11 +157,12 @@ impl ProxySession {
     /// POST one line to the current endpoint, capturing `Mcp-Session-Id` from
     /// the response while we do not yet hold one.
     async fn post_once(&mut self, line: &str) -> reqwest::Result<reqwest::Response> {
+        let body = self.rewrite_default_repo(line);
         let response = self
             .client
             .post(&self.endpoint)
             .headers(self.request_headers())
-            .body(line.to_string())
+            .body(body)
             .send()
             .await?;
         if self.session_id.is_none() {
@@ -140,6 +174,33 @@ impl ProxySession {
             }
         }
         Ok(response)
+    }
+
+    fn rewrite_default_repo(&self, line: &str) -> String {
+        let Some(default_repo) = &self.default_repo else {
+            return line.to_string();
+        };
+
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            return line.to_string();
+        };
+        if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+            return line.to_string();
+        }
+
+        let Some(arguments) = value
+            .get_mut("params")
+            .and_then(|params| params.get_mut("arguments"))
+            .and_then(Value::as_object_mut)
+        else {
+            return line.to_string();
+        };
+        if arguments.get("repo").and_then(Value::as_str) != Some(".") {
+            return line.to_string();
+        }
+
+        arguments.insert("repo".to_string(), Value::String(default_repo.clone()));
+        serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
     }
 
     /// Forward one line, retrying transparently across a server restart. A
@@ -377,4 +438,59 @@ async fn wait_for_terminate_signal() {
 #[cfg(not(unix))]
 async fn wait_for_terminate_signal() {
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_repo_picks_enclosing_repo_among_many() {
+        let repos = vec![PathBuf::from("/repos/alpha"), PathBuf::from("/repos/beta")];
+        // Multi-repo proxy: cwd inside beta resolves to beta, not forwarded verbatim.
+        let cwd = PathBuf::from("/repos/beta/src/sub");
+        assert_eq!(
+            ProxySession::dot_repo_for_cwd(&repos, Some(&cwd)),
+            Some("/repos/beta".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_repo_prefers_most_specific_root() {
+        // Nested served repos: cwd in the inner one resolves to the inner one.
+        let repos = vec![
+            PathBuf::from("/repos/alpha"),
+            PathBuf::from("/repos/alpha/vendor/lib"),
+        ];
+        let cwd = PathBuf::from("/repos/alpha/vendor/lib/src");
+        assert_eq!(
+            ProxySession::dot_repo_for_cwd(&repos, Some(&cwd)),
+            Some("/repos/alpha/vendor/lib".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_repo_falls_back_to_sole_repo_when_cwd_outside() {
+        let repos = vec![PathBuf::from("/repos/alpha")];
+        // A single served repo is unambiguous even when cwd is elsewhere or absent.
+        assert_eq!(
+            ProxySession::dot_repo_for_cwd(&repos, Some(&PathBuf::from("/somewhere/else"))),
+            Some("/repos/alpha".to_string())
+        );
+        assert_eq!(
+            ProxySession::dot_repo_for_cwd(&repos, None),
+            Some("/repos/alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn dot_repo_none_when_ambiguous_and_cwd_outside() {
+        let repos = vec![PathBuf::from("/repos/alpha"), PathBuf::from("/repos/beta")];
+        // Several repos and cwd inside none: ambiguous, leave "." untouched.
+        assert_eq!(
+            ProxySession::dot_repo_for_cwd(&repos, Some(&PathBuf::from("/elsewhere"))),
+            None
+        );
+        assert_eq!(ProxySession::dot_repo_for_cwd(&repos, None), None);
+    }
 }
