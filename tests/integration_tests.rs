@@ -187,6 +187,16 @@ impl TestRepo {
         Ok(())
     }
 
+    /// Add a C file to the repository
+    fn add_c_file(&self, name: &str, content: &str) -> Result<()> {
+        let path = self.dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
     /// Add a .gitignore file
     fn add_gitignore(&self, content: &str) -> Result<()> {
         std::fs::write(self.dir.path().join(".gitignore"), content)?;
@@ -390,6 +400,122 @@ fn test_find_symbols_rust() -> Result<()> {
 
     assert!(content.contains("User"));
     assert!(!content.contains("process_user"));
+
+    Ok(())
+}
+
+/// Regression: pointer-returning C functions were missed because tree-sitter-c
+/// wraps the function_declarator in a pointer_declarator, which the flat symbol
+/// query did not descend. Covers plain, single-pointer (the reported
+/// writeback_get_folio case, with the return type on its own line), and
+/// double-pointer return types.
+#[test]
+fn test_find_symbols_c() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_c_file(
+        "page-writeback.c",
+        r#"
+struct folio;
+
+int plain_function(int x)
+{
+    return x;
+}
+
+static struct folio *
+writeback_get_folio(void *mapping, void *wbc)
+{
+    return 0;
+}
+
+char **double_pointer_function(void)
+{
+    return 0;
+}
+"#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "symbol_type": "function"
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert!(content.contains("plain_function"));
+    assert!(content.contains("writeback_get_folio"));
+    assert!(content.contains("double_pointer_function"));
+
+    Ok(())
+}
+
+/// Guards the C++ symbol query, which shares the pointer_declarator fix and
+/// additionally handles reference returns and qualified (out-of-class) names.
+/// A malformed query would silently yield no C++ symbols, so this also acts as
+/// a compile check for the query string.
+#[test]
+fn test_find_symbols_cpp() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_c_file(
+        "widget.cpp",
+        r#"
+struct Widget {
+    int value();
+};
+
+int plain_function(int x)
+{
+    return x;
+}
+
+Widget *make_widget()
+{
+    return 0;
+}
+
+const char &first_char(const char *s)
+{
+    return *s;
+}
+
+int Widget::value()
+{
+    return 0;
+}
+"#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "symbol_type": "function"
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert!(content.contains("plain_function"));
+    assert!(content.contains("make_widget"));
+    assert!(content.contains("first_char"));
+    assert!(content.contains("Widget::value"));
 
     Ok(())
 }

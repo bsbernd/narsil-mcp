@@ -156,7 +156,12 @@ impl LanguageParser {
                 language: tree_sitter_c::LANGUAGE.into(),
                 extensions: vec!["c", "h"],
                 symbol_query: r#"
-                    (function_definition declarator: (function_declarator declarator: (identifier) @function.name)) @function.def
+                    (function_definition
+                      declarator: [
+                        (function_declarator declarator: (identifier) @function.name)
+                        (pointer_declarator (function_declarator declarator: (identifier) @function.name))
+                        (pointer_declarator (pointer_declarator (function_declarator declarator: (identifier) @function.name)))
+                      ]) @function.def
                     (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
                     (type_definition declarator: (type_identifier) @type.name) @type.def
@@ -168,10 +173,20 @@ impl LanguageParser {
                 language: tree_sitter_cpp::LANGUAGE.into(),
                 extensions: vec!["cpp", "cc", "cxx", "hpp", "hxx", "hh"],
                 symbol_query: r#"
-                    (function_definition declarator: (function_declarator declarator: (identifier) @function.name)) @function.def
-                    (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name)) @function.def
-                    (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @function.name))) @function.def
-                    (template_declaration (function_definition declarator: (function_declarator declarator: (qualified_identifier) @function.name))) @function.def
+                    (function_definition
+                      declarator: [
+                        (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name)
+                        (pointer_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name))
+                        (pointer_declarator (pointer_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name)))
+                        (reference_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name))
+                      ]) @function.def
+                    (template_declaration (function_definition
+                      declarator: [
+                        (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name)
+                        (pointer_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name))
+                        (pointer_declarator (pointer_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name)))
+                        (reference_declarator (function_declarator declarator: [(identifier) (qualified_identifier)] @function.name))
+                      ])) @function.def
                     (class_specifier name: (type_identifier) @class.name body: (field_declaration_list)) @class.def
                     (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
