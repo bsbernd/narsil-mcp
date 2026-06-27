@@ -2352,12 +2352,20 @@ impl CodeIntelEngine {
             }
         } else {
             let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            anyhow!(
-                "Repository '{}' not found. Available repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                repo,
-                repo_names.join(", ")
-            )
+            if repo_names.is_empty() {
+                anyhow!(
+                    "Repository '{}' not found. No repositories are indexed yet. \
+                     Use --repos flag when starting the server.",
+                    repo
+                )
+            } else {
+                anyhow!(
+                    "Repository '{}' not found. Available repositories: {}. \
+                     Use list_repos to see all indexed repositories.",
+                    repo,
+                    repo_names.join(", ")
+                )
+            }
         }
     }
 
