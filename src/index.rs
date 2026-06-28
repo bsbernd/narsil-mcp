@@ -2438,6 +2438,19 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
+    /// Per-repo `(repo_key, symbol_count, file_count)` for every indexed repo.
+    /// Repos still indexing have no symbol entry yet and report zero.
+    pub fn repo_status_snapshot(&self) -> Vec<(String, usize, usize)> {
+        self.repos
+            .iter()
+            .map(|entry| {
+                let key = entry.key().clone();
+                let symbol_count = self.symbols.get(&key).map(|s| s.len()).unwrap_or(0);
+                (key, symbol_count, entry.value().file_count)
+            })
+            .collect()
+    }
+
     pub async fn get_project_structure(&self, repo: &str, max_depth: usize) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let path = PathBuf::from(&repo_key);

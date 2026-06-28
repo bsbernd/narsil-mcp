@@ -16,6 +16,7 @@ pub mod hybrid_search;
 pub mod incremental;
 pub mod metrics;
 pub mod parser;
+pub mod pid_status;
 pub mod repo;
 pub mod search;
 pub mod security_config;

@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use narsil_mcp::lsp::CxxLspBackend;
 use narsil_mcp::{
-    config, http_server, index, lsp, mcp, neural, persist, repo, sse_discovery, stats_cli,
-    stdio_proxy, streaming,
+    config, http_server, index, lsp, mcp, neural, persist, pid_status, repo, sse_discovery,
+    stats_cli, stdio_proxy, streaming,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -345,6 +345,17 @@ async fn main() -> Result<()> {
                 .flatten();
         if let Some(proxy_url) = discovered {
             info!("SSE discovery: delegating stdio to {}", proxy_url);
+            // Record this delegating process so `narsil-mcp stats` can show the
+            // stdio→SSE link; the guard removes the file on a clean return.
+            let _pid_status_entry = pid_status::write_status(&pid_status::PidStatus::new(
+                "stdio",
+                pid_status::ProcessRole::StdioProxy {
+                    upstream_url: proxy_url.clone(),
+                },
+                &repos,
+            ))
+            .map_err(|e| warn!("pid status: could not write: {}", e))
+            .ok();
             return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url, &repos).await;
         }
         info!("SSE discovery: no matching server, building local index");
@@ -545,9 +556,37 @@ async fn main() -> Result<()> {
 
     let engine = Arc::new(engine);
 
+    // Publish this process's status so `narsil-mcp stats` (and a human
+    // diagnosing the stdio↔SSE path) can see its role, URL, and repos. The
+    // guard removes the file on a clean return; the background task below
+    // refreshes it with real symbol counts once indexing finishes.
+    let pid_status_role = match server_args.transport {
+        Transport::Stdio => pid_status::ProcessRole::StdioLocal,
+        Transport::Sse => {
+            let host = server_args
+                .sse_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = server_args.sse_port.unwrap_or(7557);
+            pid_status::ProcessRole::Sse {
+                url: format_discovery_url(&host, port),
+            }
+        }
+    };
+    let pid_status_transport = match server_args.transport {
+        Transport::Stdio => "stdio",
+        Transport::Sse => "sse",
+    };
+    let base_pid_status =
+        pid_status::PidStatus::new(pid_status_transport, pid_status_role, &repos);
+    let _pid_status_entry = pid_status::write_status(&base_pid_status)
+        .map_err(|e| warn!("pid status: could not write: {}", e))
+        .ok();
+
     // Start background initialization task (indexing repos, git init)
     let init_engine = Arc::clone(&engine);
     let reindex_flag = server_args.reindex;
+    let refresh_pid_status = base_pid_status.clone();
     tokio::spawn(async move {
         if reindex_flag {
             info!("Re-indexing all repositories...");
@@ -559,6 +598,12 @@ async fn main() -> Result<()> {
             if let Err(e) = init_engine.complete_initialization().await {
                 warn!("Error during background initialization: {}", e);
             }
+        }
+        // Rewrite the status with post-indexing symbol counts. update_status
+        // overwrites in place so the main-scope guard still owns removal.
+        let updated = refresh_pid_status.with_repo_counts(init_engine.repo_status_snapshot());
+        if let Err(e) = pid_status::update_status(&updated) {
+            warn!("pid status: could not refresh counts: {}", e);
         }
     });
 
