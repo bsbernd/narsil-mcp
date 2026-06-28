@@ -773,6 +773,11 @@ impl CodeIntelEngine {
         // skips the expensive embedding indexing since symbols are already cached.
         // For repos not in the cache: do a full fresh index and save afterwards.
         let mut any_freshly_indexed = false;
+        // A cache-loaded repo whose fingerprint went stale is rebuilt in memory
+        // by index_repo but, unlike a fresh repo, would otherwise never be
+        // written back — so the rebuilt symbols and the new fingerprint must be
+        // persisted too, else the same rebuild repeats on every startup.
+        let mut any_rebuilt = false;
 
         let total_repos = self.repo_paths.len();
         let mut done_repos = 0;
@@ -786,6 +791,8 @@ impl CodeIntelEngine {
             };
 
             let from_cache = self.repos.contains_key(&repo_name);
+            // Checked before index_repo, which updates the in-memory fingerprint.
+            let fingerprint_stale = from_cache && !self.fingerprint_matches(&repo_name, repo_path);
             if from_cache {
                 info!(
                     "Repository {} loaded from cache; rebuilding search index and call graph",
@@ -802,6 +809,8 @@ impl CodeIntelEngine {
                     self.indexed_repos_count.fetch_add(1, Ordering::Release);
                     if !from_cache {
                         any_freshly_indexed = true;
+                    } else if fingerprint_stale {
+                        any_rebuilt = true;
                     }
                 }
             } else {
@@ -813,7 +822,7 @@ impl CodeIntelEngine {
 
         // Persist the freshly-built index so subsequent startups skip embedding
         // re-indexing (the expensive serial part).
-        if self.options.persist_enabled && any_freshly_indexed {
+        if self.options.persist_enabled && (any_freshly_indexed || any_rebuilt) {
             if let Err(e) = self.save_index().await {
                 warn!("Failed to save index to disk: {}", e);
             }

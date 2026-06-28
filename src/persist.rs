@@ -54,10 +54,12 @@ pub struct PersistedIndex {
 }
 
 impl PersistedIndex {
+    // v5: redb RepoMeta header gained head_hash/cdb_hash so the fingerprint
+    // round-trips through the per-file store (postcard layout change).
     // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 4;
+    const CURRENT_VERSION: u32 = 5;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -201,6 +203,11 @@ struct RepoMeta {
     repo_root: PathBuf,
     created_at: u64,
     updated_at: u64,
+    /// Mirrors PersistedIndex::head_hash so the freshness fingerprint survives
+    /// the redb round-trip; without it every repo rebuilds on every startup.
+    head_hash: Option<String>,
+    /// Mirrors PersistedIndex::cdb_hash for the same reason.
+    cdb_hash: Option<String>,
 }
 
 /// Index storage manager.
@@ -412,6 +419,8 @@ impl IndexStore {
                     index.created_at = meta.created_at;
                     index.updated_at = meta.updated_at;
                     index.repo_root = meta.repo_root;
+                    index.head_hash = meta.head_hash;
+                    index.cdb_hash = meta.cdb_hash;
                 }
             }
         }
@@ -452,6 +461,8 @@ impl IndexStore {
                 repo_root: index.repo_root.clone(),
                 created_at: index.created_at,
                 updated_at: now_secs(),
+                head_hash: index.head_hash.clone(),
+                cdb_hash: index.cdb_hash.clone(),
             };
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
         }
@@ -494,11 +505,16 @@ impl IndexStore {
                 Some(guard) => postcard::from_bytes::<RepoMeta>(guard.value()).ok(),
                 None => None,
             };
+            // The existing branch preserves head_hash/cdb_hash (only updated_at
+            // is touched below); the fallback runs only before any full save, so
+            // the fingerprint is filled in by the next save_full.
             let mut meta = existing.unwrap_or_else(|| RepoMeta {
                 version: PersistedIndex::CURRENT_VERSION,
                 repo_root: repo_root.to_path_buf(),
                 created_at: now_secs(),
                 updated_at: 0,
+                head_hash: None,
+                cdb_hash: None,
             });
             meta.updated_at = now_secs();
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
@@ -1083,6 +1099,36 @@ mod tests {
         let loaded = store.load_repo(&root).unwrap();
         assert_eq!(loaded.files.len(), 1);
         assert!(loaded.files.contains_key(&root.join("c.rs")));
+    }
+
+    // Regression: the freshness fingerprint must survive the redb round-trip.
+    // When it was dropped, fingerprint_matches always saw None and every repo
+    // rebuilt on every startup.
+    #[test]
+    fn test_redb_round_trips_fingerprint() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut idx = PersistedIndex::new(root.clone());
+        idx.head_hash = Some("deadbeef".to_string());
+        idx.cdb_hash = Some("cafef00d".to_string());
+        idx.files
+            .insert(root.join("a.rs"), meta(root.join("a.rs"), "h1"));
+        store.save_full(&idx).unwrap();
+
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.head_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(loaded.cdb_hash.as_deref(), Some("cafef00d"));
+
+        // An incremental edit preserves the fingerprint (only updated_at moves).
+        store
+            .apply_file_changes(&root, &[meta(root.join("a.rs"), "h1b")], &[])
+            .unwrap();
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.head_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(loaded.cdb_hash.as_deref(), Some("cafef00d"));
     }
 
     #[test]
