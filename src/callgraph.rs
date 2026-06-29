@@ -282,6 +282,75 @@ impl CallGraph {
         format!("{}::{}", file_path, name)
     }
 
+    /// Outgoing edges that a non-tree-sitter backend (clangd/ccls/gtags)
+    /// confirmed, as `(caller_key, edge)`. These are the expensive product of
+    /// [`CallGraph::merge_edges`]; persisting them lets an unchanged repo replay
+    /// the augmentation on restart instead of re-querying the backends. Pure
+    /// tree-sitter edges are omitted — `build_from_files` reproduces them.
+    pub fn export_augmentation_edges(&self) -> Vec<(String, CallEdge)> {
+        let mut edges = Vec::new();
+        for node in self.nodes.iter() {
+            let caller_key = node.key();
+            for edge in &node.value().calls {
+                if edge.confirmed_by.contains(SourceSet::CLANGD)
+                    || edge.confirmed_by.contains(SourceSet::CCLS)
+                    || edge.confirmed_by.contains(SourceSet::GTAGS)
+                {
+                    edges.push((caller_key.clone(), edge.clone()));
+                }
+            }
+        }
+        edges
+    }
+
+    /// Replay persisted augmentation edges onto a freshly-built baseline,
+    /// reproducing the end state of [`CallGraph::merge_edges`] without the
+    /// backend round-trips. Each input edge is already fully folded (its
+    /// `target` is the resolved callee key, its `confirmed_by`/`line` final), so
+    /// it overwrites the matching tree-sitter baseline edge or is inserted when
+    /// no backend-only edge exists yet. The callee's `called_by` mirror is
+    /// derived from the same edge, matching how `merge_edges` keeps both sides in
+    /// sync. Only existing caller/callee nodes are touched.
+    pub fn restore_augmentation_edges(&self, edges: Vec<(String, CallEdge)>) {
+        for (caller_key, edge) in edges {
+            let callee_key = edge.target.clone();
+
+            if let Some(mut caller_node) = self.nodes.get_mut(&caller_key) {
+                match caller_node
+                    .calls
+                    .iter_mut()
+                    .find(|e| e.target == callee_key)
+                {
+                    Some(existing) => *existing = edge.clone(),
+                    None => caller_node.calls.push(edge.clone()),
+                }
+            }
+
+            // The callee's incoming edge keyed by the caller; scope_hint is not
+            // carried on the called_by side (matches `merge_edges`).
+            if let Some(mut callee_node) = self.nodes.get_mut(callee_key.as_str()) {
+                let incoming = CallEdge {
+                    target: caller_key.clone(),
+                    file_path: edge.file_path.clone(),
+                    line: edge.line,
+                    column: edge.column,
+                    call_type: edge.call_type.clone(),
+                    scope_hint: None,
+                    confirmed_by: edge.confirmed_by,
+                    line_conflicts: edge.line_conflicts.clone(),
+                };
+                match callee_node
+                    .called_by
+                    .iter_mut()
+                    .find(|e| e.target == caller_key)
+                {
+                    Some(existing) => *existing = incoming,
+                    None => callee_node.called_by.push(incoming),
+                }
+            }
+        }
+    }
+
     fn extract_functions(&self, path: &str, content: &str, tree: &Tree) -> Result<()> {
         let source = content.as_bytes();
         let mut cursor = tree.walk();
@@ -1658,6 +1727,134 @@ mod tests {
         let callee_node = graph.nodes.get("callee").unwrap();
         assert_eq!(callee_node.called_by.len(), 1);
         assert_eq!(callee_node.called_by[0].target, "caller");
+    }
+
+    // A node with the given outgoing/incoming edges, for replay tests.
+    fn node_with(name: &str, calls: Vec<CallEdge>, called_by: Vec<CallEdge>) -> CallNode {
+        CallNode {
+            name: name.to_string(),
+            file_path: "f.c".to_string(),
+            line: 1,
+            calls,
+            called_by,
+            metrics: FunctionMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn test_export_restore_augmentation_edges() {
+        // The folded augmentation edge as merge_edges(CCLS) would leave it: CCLS
+        // outranks tree-sitter, so its line wins and the tree-sitter line drops
+        // into line_conflicts.
+        let augmented = CallEdge {
+            target: "f.c::b".to_string(),
+            file_path: "f.c".to_string(),
+            line: 5,
+            column: 2,
+            call_type: CallType::Unknown,
+            scope_hint: None,
+            confirmed_by: {
+                let mut s = SourceSet::TREE_SITTER;
+                s.insert(SourceSet::CCLS);
+                s
+            },
+            line_conflicts: vec![SourceLine {
+                source: SourceSet::TREE_SITTER,
+                line: 4,
+            }],
+        };
+        // A pure tree-sitter edge must NOT be exported (build_from_files rebuilds it).
+        let baseline_only = CallEdge {
+            target: "f.c::c".to_string(),
+            file_path: "f.c".to_string(),
+            line: 7,
+            column: 0,
+            call_type: CallType::Direct,
+            scope_hint: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
+        };
+
+        let src = CallGraph::new();
+        src.nodes.insert(
+            "f.c::a".to_string(),
+            node_with(
+                "a",
+                vec![augmented.clone(), baseline_only.clone()],
+                Vec::new(),
+            ),
+        );
+        src.nodes
+            .insert("f.c::b".to_string(), node_with("b", Vec::new(), Vec::new()));
+        src.nodes
+            .insert("f.c::c".to_string(), node_with("c", Vec::new(), Vec::new()));
+
+        let exported = src.export_augmentation_edges();
+        assert_eq!(
+            exported.len(),
+            1,
+            "only the backend-confirmed edge is exported"
+        );
+        assert_eq!(exported[0].0, "f.c::a");
+        assert_eq!(exported[0].1.target, "f.c::b");
+
+        // Replay onto a fresh baseline: caller carries the tree-sitter version of
+        // the same pair (as build_from_files would have produced) plus a
+        // backend-only pair not seen by tree-sitter.
+        let ts_baseline = CallEdge {
+            target: "f.c::b".to_string(),
+            file_path: "f.c".to_string(),
+            line: 4,
+            column: 0,
+            call_type: CallType::Direct,
+            scope_hint: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
+        };
+        let backend_only = CallEdge {
+            target: "f.c::d".to_string(),
+            file_path: "f.c".to_string(),
+            line: 9,
+            column: 0,
+            call_type: CallType::Unknown,
+            scope_hint: None,
+            confirmed_by: SourceSet::GTAGS,
+            line_conflicts: Vec::new(),
+        };
+        let dst = CallGraph::new();
+        dst.nodes.insert(
+            "f.c::a".to_string(),
+            node_with("a", vec![ts_baseline], Vec::new()),
+        );
+        dst.nodes
+            .insert("f.c::b".to_string(), node_with("b", Vec::new(), Vec::new()));
+        dst.nodes
+            .insert("f.c::d".to_string(), node_with("d", Vec::new(), Vec::new()));
+
+        let mut replay = exported;
+        replay.push(("f.c::a".to_string(), backend_only));
+        dst.restore_augmentation_edges(replay);
+
+        // Existing tree-sitter edge is overwritten with the folded version.
+        let a = dst.nodes.get("f.c::a").unwrap();
+        assert_eq!(
+            a.calls.len(),
+            2,
+            "no duplicate edge for the overwritten pair"
+        );
+        let to_b = a.calls.iter().find(|e| e.target == "f.c::b").unwrap();
+        assert_eq!(to_b.line, 5);
+        assert!(to_b.confirmed_by.contains(SourceSet::CCLS));
+        assert_eq!(to_b.line_conflicts.len(), 1);
+        // Callee gains the mirrored incoming edge.
+        let b = dst.nodes.get("f.c::b").unwrap();
+        assert_eq!(b.called_by.len(), 1);
+        assert_eq!(b.called_by[0].target, "f.c::a");
+        assert!(b.called_by[0].confirmed_by.contains(SourceSet::CCLS));
+        // Backend-only pair is inserted; its callee gets the incoming edge.
+        let d = dst.nodes.get("f.c::d").unwrap();
+        assert_eq!(d.called_by.len(), 1);
+        assert_eq!(d.called_by[0].target, "f.c::a");
     }
 
     #[test]

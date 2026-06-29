@@ -25,7 +25,18 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::callgraph::CallEdge;
 use crate::symbols::Symbol;
+
+/// A persisted call-graph augmentation edge: the resolved caller key paired with
+/// the outgoing edge that a non-tree-sitter backend confirmed. Stored on the
+/// caller's file record so an unchanged repo can replay augmentation on restart
+/// instead of re-querying clangd/ccls/gtags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedCallEdge {
+    pub caller_key: String,
+    pub edge: CallEdge,
+}
 
 /// File metadata for change detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +46,11 @@ pub struct FileMetadata {
     pub modified_time: u64,
     pub size: u64,
     pub symbols: Vec<Symbol>,
+    /// Augmentation edges whose caller lives in this file. Empty for files with
+    /// no cross-validated calls and for watch-path upserts (those drop the
+    /// edges; a fingerprint mismatch or reindex rebuilds them).
+    #[serde(default)]
+    pub call_edges: Vec<PersistedCallEdge>,
 }
 
 /// Persisted index structure
@@ -54,12 +70,14 @@ pub struct PersistedIndex {
 }
 
 impl PersistedIndex {
+    // v6: FileMetadata gained call_edges (persisted call-graph augmentation), a
+    // postcard layout change — older records fail to decode and rebuild.
     // v5: redb RepoMeta header gained head_hash/cdb_hash so the fingerprint
     // round-trips through the per-file store (postcard layout change).
     // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 5;
+    const CURRENT_VERSION: u32 = 6;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -145,6 +163,7 @@ impl PersistedIndex {
                     .as_secs(),
                 size: metadata.len(),
                 symbols,
+                call_edges: Vec::new(),
             },
         );
 
@@ -1034,6 +1053,7 @@ mod tests {
             modified_time: 0,
             size: 0,
             symbols: Vec::new(),
+            call_edges: Vec::new(),
         }
     }
 
@@ -1129,6 +1149,46 @@ mod tests {
         let loaded = store.load_repo(&root).unwrap();
         assert_eq!(loaded.head_hash.as_deref(), Some("deadbeef"));
         assert_eq!(loaded.cdb_hash.as_deref(), Some("cafef00d"));
+    }
+
+    // Persisted call-graph augmentation edges must survive the redb round-trip,
+    // else a cache-loaded repo has nothing to replay and re-queries the backends.
+    #[test]
+    fn test_redb_round_trips_call_edges() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut file_meta = meta(root.join("a.c"), "h1");
+        file_meta.call_edges.push(PersistedCallEdge {
+            caller_key: "a.c::caller".to_string(),
+            edge: CallEdge {
+                target: "a.c::callee".to_string(),
+                file_path: "a.c".to_string(),
+                line: 12,
+                column: 3,
+                call_type: crate::callgraph::CallType::Unknown,
+                scope_hint: None,
+                confirmed_by: crate::symbols::SourceSet::CCLS,
+                line_conflicts: Vec::new(),
+            },
+        });
+
+        let mut idx = PersistedIndex::new(root.clone());
+        idx.files.insert(root.join("a.c"), file_meta);
+        store.save_full(&idx).unwrap();
+
+        let loaded = store.load_repo(&root).unwrap();
+        let edges = &loaded.files.get(&root.join("a.c")).unwrap().call_edges;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].caller_key, "a.c::caller");
+        assert_eq!(edges[0].edge.target, "a.c::callee");
+        assert_eq!(edges[0].edge.line, 12);
+        assert!(edges[0]
+            .edge
+            .confirmed_by
+            .contains(crate::symbols::SourceSet::CCLS));
     }
 
     #[test]

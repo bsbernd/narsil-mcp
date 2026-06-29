@@ -1066,6 +1066,22 @@ impl CodeIntelEngine {
         Some(by_rel)
     }
 
+    /// Persisted call-graph augmentation edges for a repo as `(caller_key, edge)`,
+    /// flattened across all files. Replayed onto the freshly-built baseline when
+    /// the fingerprint matches, sparing the clangd/ccls/gtags round-trips. None
+    /// when persistence is off or no prior index exists.
+    fn load_prior_call_edges(&self, repo_path: &Path) -> Option<Vec<(String, CallEdge)>> {
+        let store = self.index_store.as_ref()?;
+        let persisted = store.load_repo(repo_path).ok()?;
+        let edges = persisted
+            .files
+            .into_values()
+            .flat_map(|file_meta| file_meta.call_edges)
+            .map(|persisted_edge| (persisted_edge.caller_key, persisted_edge.edge))
+            .collect();
+        Some(edges)
+    }
+
     /// Whether LSP augmentation applies to `repo_path` given the recorded intent
     /// and what the repo ships. Does not test for C/C++ presence — callers gate
     /// that per file/symbol.
@@ -1841,20 +1857,36 @@ impl CodeIntelEngine {
         }
 
         // Phases 5/6: augment the C/C++ call graph from LSP callHierarchy and
-        // gtags references. Same enable gate as the symbol pass; the baseline
-        // graph built above provides the nodes merge_edges folds edges onto.
-        if self.options.call_graph_enabled
-            && (lsp_for_repo.is_some() || gtags_for_repo.is_some())
-            && self.call_graphs.contains_key(&repo_name)
-        {
-            let call_hierarchy_start = std::time::Instant::now();
-            self.augment_call_graph_cxx(&repo_name, path, &lsp_for_repo, &gtags_for_repo)
-                .await;
-            info!(
-                "timing: cxx callHierarchy augmentation in {:?} for {}",
-                call_hierarchy_start.elapsed(),
-                repo_name
-            );
+        // gtags references. The baseline graph built above provides the nodes
+        // merge_edges folds edges onto. A fingerprint-matching repo replays the
+        // edges persisted last run instead of re-querying the backends — the
+        // dominant cost of startup, and redundant when no source changed.
+        if self.options.call_graph_enabled && self.call_graphs.contains_key(&repo_name) {
+            if symbols_cached {
+                let restored = self.load_prior_call_edges(path).unwrap_or_default();
+                if !restored.is_empty() {
+                    if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+                        let restore_start = std::time::Instant::now();
+                        let edge_count = restored.len();
+                        call_graph.restore_augmentation_edges(restored);
+                        info!(
+                            "restored {} call-graph augmentation edge(s) in {:?} for {}",
+                            edge_count,
+                            restore_start.elapsed(),
+                            repo_name
+                        );
+                    }
+                }
+            } else if lsp_for_repo.is_some() || gtags_for_repo.is_some() {
+                let call_hierarchy_start = std::time::Instant::now();
+                self.augment_call_graph_cxx(&repo_name, path, &lsp_for_repo, &gtags_for_repo)
+                    .await;
+                info!(
+                    "timing: cxx callHierarchy augmentation in {:?} for {}",
+                    call_hierarchy_start.elapsed(),
+                    repo_name
+                );
+            }
         }
 
         // Transform symbols to RDF knowledge graph if enabled
@@ -3520,6 +3552,19 @@ impl CodeIntelEngine {
             persisted.head_hash = self.git_head_hash(repo_path);
             persisted.cdb_hash = self.compile_commands_hash(repo_path);
 
+            // Group augmentation edges by the caller's file so each rides its
+            // file's record (and the incremental watch path's keying).
+            let mut edges_by_file: HashMap<String, Vec<crate::persist::PersistedCallEdge>> =
+                HashMap::new();
+            if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+                for (caller_key, edge) in call_graph.export_augmentation_edges() {
+                    edges_by_file
+                        .entry(edge.file_path.clone())
+                        .or_default()
+                        .push(crate::persist::PersistedCallEdge { caller_key, edge });
+                }
+            }
+
             // Populate with current symbols
             if let Some(symbols) = self.symbols.get(&repo_name) {
                 // Group symbols by file path
@@ -3533,6 +3578,7 @@ impl CodeIntelEngine {
 
                 // Create file metadata for each file
                 for (file_path, file_symbols) in by_file {
+                    let call_edges = edges_by_file.remove(&file_path).unwrap_or_default();
                     let full_path = repo_path.join(&file_path);
                     if let Ok(metadata) = std::fs::metadata(&full_path) {
                         let modified = metadata
@@ -3559,6 +3605,7 @@ impl CodeIntelEngine {
                                 modified_time: modified,
                                 size: metadata.len(),
                                 symbols: file_symbols,
+                                call_edges,
                             },
                         );
                     }
@@ -3909,6 +3956,9 @@ impl CodeIntelEngine {
                 modified_time,
                 size,
                 symbols,
+                // Watch upserts drop augmentation edges; a later reindex or a
+                // fingerprint mismatch rebuilds them.
+                call_edges: Vec::new(),
             });
         }
 
@@ -4191,6 +4241,10 @@ impl CodeIntelEngine {
                                     modified_time,
                                     size,
                                     symbols: file_symbols,
+                                    // Watch upserts drop augmentation edges; a
+                                    // later reindex or fingerprint mismatch
+                                    // rebuilds them.
+                                    call_edges: Vec::new(),
                                 },
                             );
 
