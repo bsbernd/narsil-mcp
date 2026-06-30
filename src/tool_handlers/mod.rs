@@ -196,8 +196,9 @@ impl ToolRegistry {
         &self,
         name: &str,
         engine: &CodeIntelEngine,
-        args: Value,
+        mut args: Value,
     ) -> Result<String> {
+        normalize_arg_aliases(&mut args);
         self.handlers
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?
@@ -263,6 +264,22 @@ impl ArgExtractor for Value {
     }
 }
 
+/// Map well-known argument-name aliases onto the canonical names used by the
+/// handlers, in place. Clients commonly send `file_path` for the path
+/// argument, but the schema (and every handler) reads `path`; without this an
+/// unrecognised `file_path` would leave `path` absent and silently degrade to
+/// an empty path downstream (git blame -- '' etc.). An explicit `path` always
+/// wins.
+fn normalize_arg_aliases(args: &mut Value) {
+    if let Some(obj) = args.as_object_mut() {
+        if !obj.contains_key("path") {
+            if let Some(file_path) = obj.get("file_path").cloned() {
+                obj.insert("path".to_string(), file_path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +318,28 @@ mod tests {
 
         assert_eq!(args.get_bool("enabled"), Some(true));
         assert!(!args.get_bool_or("missing", false));
+    }
+
+    #[test]
+    fn test_file_path_aliases_to_path() {
+        // Regression: a caller sending `file_path` must reach the handler as
+        // `path`, not an empty string (git blame -- '' "no such path ''").
+        let mut args = serde_json::json!({"repo": "r", "file_path": "src/x.rs"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("path"), Some("src/x.rs"));
+    }
+
+    #[test]
+    fn test_explicit_path_wins_over_file_path() {
+        let mut args = serde_json::json!({"path": "real", "file_path": "alias"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("path"), Some("real"));
+    }
+
+    #[test]
+    fn test_no_path_alias_leaves_args_untouched() {
+        let mut args = serde_json::json!({"repo": "r"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("path"), None);
     }
 }
