@@ -17,13 +17,23 @@ impl ToolHandler for GetCallGraphHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = function_arg(&args);
         let depth = args.get_u64_or("depth", 3) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
             .get_call_graph(repo, function, depth, exclude_tests)
             .await
     }
+}
+
+/// The function/symbol name for a call-graph tool. The schema names this
+/// `function`, but `symbol` (used by the definition/reference tools) is a very
+/// natural mistake, so accept it as an alias rather than silently resolving an
+/// empty name to a wrong node.
+fn function_arg(args: &Value) -> &str {
+    args.get_str("function")
+        .or_else(|| args.get_str("symbol"))
+        .unwrap_or("")
 }
 
 /// Handler for get_callers tool
@@ -37,7 +47,7 @@ impl ToolHandler for GetCallersHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = function_arg(&args);
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
@@ -58,7 +68,7 @@ impl ToolHandler for GetCalleesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = function_arg(&args);
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");

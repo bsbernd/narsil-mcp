@@ -5341,6 +5341,12 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
 
+        if function.trim().is_empty() {
+            return Err(anyhow!(
+                "get_callers requires a non-empty 'function' argument (the function/symbol name)"
+            ));
+        }
+
         if !self.is_fully_initialized() {
             return Err(anyhow!(
                 "Call graph not yet available — initialization in progress. \
@@ -5498,6 +5504,12 @@ impl CodeIntelEngine {
         _exclude_tests: Option<bool>,
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
+
+        if function.trim().is_empty() {
+            return Err(anyhow!(
+                "get_callees requires a non-empty 'function' argument (the function/symbol name)"
+            ));
+        }
 
         if !self.is_fully_initialized() {
             return Err(anyhow!(

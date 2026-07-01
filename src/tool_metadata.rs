@@ -763,7 +763,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "function": {"type": "string", "description": "Function name to find callers of"},
+                    "function": {"type": "string", "description": "Function name to find callers of (alias: symbol)"},
                     "transitive": {"type": "boolean", "description": "Include transitive callers (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
@@ -786,7 +786,7 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "function": {"type": "string", "description": "Function name to find callees of"},
+                    "function": {"type": "string", "description": "Function name to find callees of (alias: symbol)"},
                     "transitive": {"type": "boolean", "description": "Include transitive callees (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}

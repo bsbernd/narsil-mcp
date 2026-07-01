@@ -1048,6 +1048,15 @@ impl CallGraph {
     ///
     /// Returns the actual qualified key in the graph, or None if not found.
     pub fn find_function(&self, query: &str) -> Option<String> {
+        // An empty/blank query must not resolve to anything: the suffix and
+        // contains fallbacks below both treat "" as matching every node
+        // (`key.ends_with("")` / `key.contains("")` are always true), so without
+        // this guard a caller that forgot the function name would silently get
+        // the alphabetically-first node's edges instead of nothing.
+        if query.trim().is_empty() {
+            return None;
+        }
+
         // 1. Exact match on qualified key
         if self.nodes.contains_key(query) {
             return Some(query.to_string());
@@ -3067,6 +3076,14 @@ if __name__ == \"__main__\":
         let result2 = graph.find_function("run");
         assert_eq!(result1, result2, "find_function must be deterministic");
         assert_eq!(result1, Some("src/agents/mod.rs::run".to_string()));
+
+        // An empty or blank query must not fuzzy-match any node: the suffix and
+        // contains fallbacks treat "" as matching every key, so without the guard
+        // this would resolve to the alphabetically-first node instead of None.
+        assert_eq!(graph.find_function(""), None);
+        assert_eq!(graph.find_function("   "), None);
+        assert!(graph.get_callees("").is_empty());
+        assert!(graph.get_callers("").is_empty());
     }
 
     #[test]
