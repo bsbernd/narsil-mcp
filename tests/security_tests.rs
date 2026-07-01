@@ -281,6 +281,35 @@ async fn test_resolve_repo_subdirectory_resolves_to_root() {
     );
 }
 
+/// Test that resolve_repo accepts a configured repo path immediately after
+/// construction, before complete_initialization() has ever run. Previously
+/// resolve_repo only matched `self.repos`, which complete_initialization
+/// populates per-repo inside its (potentially slow) indexing loop — a
+/// request landing before that insert got a misleading "repo not found".
+#[tokio::test]
+async fn test_resolve_repo_succeeds_before_initialization() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("my-project");
+    fs::create_dir_all(&repo_path).unwrap();
+    fs::write(repo_path.join("root.rs"), "fn root() {}").unwrap();
+
+    let index_path = temp_dir.path().join("index");
+    let engine = CodeIntelEngine::new(index_path, vec![repo_path.clone()])
+        .await
+        .unwrap();
+
+    // Deliberately do NOT call complete_initialization() — this is the exact
+    // startup race window, before the background task has indexed anything.
+    let result = engine
+        .get_project_structure(repo_path.to_str().unwrap(), 3)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a configured repo must resolve before background indexing completes, got: {:?}",
+        result.err()
+    );
+}
+
 /// Test that a nested git checkout (e.g. a linked worktree) inside an
 /// indexed repo does not silently resolve to the outer repo's index — it is
 /// a distinct checkout with its own files and must not be merged in.

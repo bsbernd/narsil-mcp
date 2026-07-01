@@ -194,3 +194,49 @@ async fn test_mcp_initialize_responds_quickly() {
         "Should return data even during initialization"
     );
 }
+
+#[tokio::test]
+async fn test_get_branch_info_works_before_indexing_completes() {
+    // GIVEN: a real git repo, with git integration enabled, that has NOT yet
+    // run complete_initialization() — the exact startup race window where a
+    // request could previously land before self.repos/git_repos were populated.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_path = temp_dir.path().to_path_buf();
+    std::fs::write(repo_path.join("test.rs"), "fn main() {}").unwrap();
+
+    let run_git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.email", "test@example.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "init"]);
+
+    let index_path = temp_dir.path().join("index");
+    let options = EngineOptions {
+        git_enabled: true,
+        ..Default::default()
+    };
+    let engine = CodeIntelEngine::with_options(index_path, vec![repo_path.clone()], options)
+        .await
+        .unwrap();
+
+    // WHEN: get_branch_info is called immediately, without ever calling
+    // complete_initialization().
+    let result = engine.get_branch_info(repo_path.to_str().unwrap()).await;
+
+    // THEN: it must succeed rather than fail with the "repo not found" error
+    // resolve_repo used to produce while self.repos was still empty.
+    assert!(
+        result.is_ok(),
+        "get_branch_info should succeed before background indexing completes, got: {:?}",
+        result.err()
+    );
+    assert!(result.unwrap().contains("Git Status"));
+}

@@ -721,6 +721,34 @@ impl CodeIntelEngine {
             }
         }
 
+        // Initialize git repos BEFORE returning, same as call graphs above:
+        // GitRepo::new is a single fast `git rev-parse` subprocess call, unlike
+        // the deferred embedding/symbol indexing, so there's no reason to make
+        // get_branch_info/get_modified_files callers race complete_initialization().
+        if options.git_enabled {
+            for repo_path in &expanded_repos {
+                if repo_path.exists() {
+                    let repo_name = match canonical_repo_key(repo_path) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!("Skipping git init for {:?}: {}", repo_path, e);
+                            continue;
+                        }
+                    };
+
+                    match GitRepo::new(repo_path) {
+                        Ok(git_repo) => {
+                            info!("Git enabled for repository: {}", repo_name);
+                            engine.git_repos.insert(repo_name, git_repo);
+                        }
+                        Err(e) => {
+                            warn!("Failed to initialize git for {}: {}", repo_name, e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Initialize watch mode if enabled
         if options.watch_enabled {
             info!("Watch mode enabled - monitoring for file changes");
@@ -830,31 +858,6 @@ impl CodeIntelEngine {
         if self.options.persist_enabled && (any_freshly_indexed || any_rebuilt) {
             if let Err(e) = self.save_index().await {
                 warn!("Failed to save index to disk: {}", e);
-            }
-        }
-
-        // Initialize git repos if enabled
-        if self.options.git_enabled {
-            for repo_path in &self.repo_paths {
-                if repo_path.exists() {
-                    let repo_name = match canonical_repo_key(repo_path) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            warn!("Skipping git init for {:?}: {}", repo_path, e);
-                            continue;
-                        }
-                    };
-
-                    match GitRepo::new(repo_path) {
-                        Ok(git_repo) => {
-                            info!("Git enabled for repository: {}", repo_name);
-                            self.git_repos.insert(repo_name, git_repo);
-                        }
-                        Err(e) => {
-                            warn!("Failed to initialize git for {}: {}", repo_name, e);
-                        }
-                    }
-                }
             }
         }
 
@@ -2269,6 +2272,15 @@ impl CodeIntelEngine {
         false
     }
 
+    /// Whether `candidate` is `root` itself, or a subdirectory of it that
+    /// doesn't cross a nested git checkout boundary (see
+    /// [`crosses_git_boundary`](Self::crosses_git_boundary)). Both arguments
+    /// must already be canonicalized.
+    fn path_matches_repo_root(root: &Path, candidate: &Path) -> bool {
+        candidate == root
+            || (candidate.starts_with(root) && !Self::crosses_git_boundary(root, candidate))
+    }
+
     /// Resolve a user-supplied repo argument to the canonical absolute path of
     /// an indexed repository.
     ///
@@ -2326,10 +2338,23 @@ impl CodeIntelEngine {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            if canonical_input == stored_canonical
-                || (canonical_input.starts_with(&stored_canonical)
-                    && !Self::crosses_git_boundary(&stored_canonical, &canonical_input))
-            {
+            if Self::path_matches_repo_root(&stored_canonical, &canonical_input) {
+                return Ok(stored_canonical.to_string_lossy().into_owned());
+            }
+        }
+
+        // Fall back to the configured repo paths (set synchronously at
+        // construction) for a repo that hasn't reached the front of
+        // complete_initialization()'s indexing loop yet — self.repos above is
+        // only populated once that repo's (potentially slow) index_repo() call
+        // finishes. Without this, a request landing during startup gets a
+        // misleading "repo not found" for a repo that IS configured.
+        for repo_path in &self.repo_paths {
+            let stored_canonical = match repo_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if Self::path_matches_repo_root(&stored_canonical, &canonical_input) {
                 return Ok(stored_canonical.to_string_lossy().into_owned());
             }
         }
