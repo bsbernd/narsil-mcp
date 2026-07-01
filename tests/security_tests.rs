@@ -281,6 +281,45 @@ async fn test_resolve_repo_subdirectory_resolves_to_root() {
     );
 }
 
+/// Test that a nested git checkout (e.g. a linked worktree) inside an
+/// indexed repo does not silently resolve to the outer repo's index — it is
+/// a distinct checkout with its own files and must not be merged in.
+#[tokio::test]
+async fn test_resolve_repo_nested_git_checkout_not_merged() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_path = temp_dir.path().join("my-project");
+    fs::create_dir_all(&repo_path).unwrap();
+    fs::write(repo_path.join("root.rs"), "fn root() {}").unwrap();
+
+    // A nested directory that is itself a distinct git checkout, as a linked
+    // worktree would be — not merely a subdirectory of the indexed repo.
+    let nested_repo = repo_path.join(".claude").join("worktrees").join("agent-x");
+    fs::create_dir_all(&nested_repo).unwrap();
+    fs::write(nested_repo.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+    fs::write(
+        nested_repo.join("worktree_only.rs"),
+        "fn worktree_only() {}",
+    )
+    .unwrap();
+
+    let index_path = temp_dir.path().join("index");
+    let engine = CodeIntelEngine::new(index_path, vec![repo_path.clone()])
+        .await
+        .unwrap();
+    engine.complete_initialization().await.unwrap();
+
+    // The nested checkout was never indexed on its own, so it must not
+    // silently resolve to the outer repo's index.
+    let result = engine
+        .get_project_structure(nested_repo.to_str().unwrap(), 3)
+        .await;
+    assert!(
+        result.is_err(),
+        "nested git checkout must not silently resolve to the outer repo, got: {:?}",
+        result.ok()
+    );
+}
+
 #[tokio::test]
 async fn test_check_type_errors_accepts_directory_path() {
     let temp_dir = TempDir::new().unwrap();

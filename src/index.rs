@@ -2248,6 +2248,27 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Returns true if any directory from `target` up to (but excluding)
+    /// `root` has its own `.git` entry.
+    ///
+    /// A `.git` there means `target` sits inside a distinct git checkout —
+    /// e.g. a linked worktree or a nested clone — rather than a plain
+    /// subdirectory of `root`; resolving it to `root`'s index would silently
+    /// answer from the wrong checkout's files.
+    fn crosses_git_boundary(root: &Path, target: &Path) -> bool {
+        let mut current = target;
+        while current != root {
+            if current.join(".git").exists() {
+                return true;
+            }
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        false
+    }
+
     /// Resolve a user-supplied repo argument to the canonical absolute path of
     /// an indexed repository.
     ///
@@ -2305,7 +2326,9 @@ impl CodeIntelEngine {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            if canonical_input == stored_canonical || canonical_input.starts_with(&stored_canonical)
+            if canonical_input == stored_canonical
+                || (canonical_input.starts_with(&stored_canonical)
+                    && !Self::crosses_git_boundary(&stored_canonical, &canonical_input))
             {
                 return Ok(stored_canonical.to_string_lossy().into_owned());
             }
