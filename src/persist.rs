@@ -53,6 +53,16 @@ pub struct FileMetadata {
     pub call_edges: Vec<PersistedCallEdge>,
 }
 
+/// Extraction-logic version of the indexer. Distinct from
+/// [`PersistedIndex::CURRENT_VERSION`], which tracks the on-disk *serialization*
+/// layout: this tracks the *content* the indexer produces (symbol extraction,
+/// call-graph construction). Bump it whenever a code change means an unchanged
+/// source file would now index differently — e.g. recognising a new definition
+/// form — so an already-indexed repo rebuilds on next load even though its git
+/// HEAD, compile_commands.json, and serialization layout are all unchanged. The
+/// value is persisted in the redb header and compared at load time.
+pub const INDEX_LOGIC_VERSION: u32 = 2;
+
 /// Persisted index structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedIndex {
@@ -67,9 +77,14 @@ pub struct PersistedIndex {
     /// sha256 of the resolved compile_commands.json at index time, when
     /// compile_commands filtering is on. Detects a CDB regen with no commit.
     pub cdb_hash: Option<String>,
+    /// [`INDEX_LOGIC_VERSION`] the records were produced under. A mismatch with
+    /// the running binary's value forces a rebuild, independent of the fingerprint.
+    pub logic_version: u32,
 }
 
 impl PersistedIndex {
+    // v7: PersistedIndex/RepoMeta gained logic_version (postcard layout change);
+    // older records fail to decode and rebuild.
     // v6: FileMetadata gained call_edges (persisted call-graph augmentation), a
     // postcard layout change — older records fail to decode and rebuild.
     // v5: redb RepoMeta header gained head_hash/cdb_hash so the fingerprint
@@ -77,7 +92,7 @@ impl PersistedIndex {
     // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 6;
+    const CURRENT_VERSION: u32 = 7;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -93,6 +108,7 @@ impl PersistedIndex {
             files: HashMap::new(),
             head_hash: None,
             cdb_hash: None,
+            logic_version: INDEX_LOGIC_VERSION,
         }
     }
 
@@ -227,6 +243,9 @@ struct RepoMeta {
     head_hash: Option<String>,
     /// Mirrors PersistedIndex::cdb_hash for the same reason.
     cdb_hash: Option<String>,
+    /// [`INDEX_LOGIC_VERSION`] these records were produced under; a mismatch with
+    /// the running binary forces a rebuild even when head/cdb are unchanged.
+    logic_version: u32,
 }
 
 /// Index storage manager.
@@ -440,6 +459,7 @@ impl IndexStore {
                     index.repo_root = meta.repo_root;
                     index.head_hash = meta.head_hash;
                     index.cdb_hash = meta.cdb_hash;
+                    index.logic_version = meta.logic_version;
                 }
             }
         }
@@ -482,6 +502,7 @@ impl IndexStore {
                 updated_at: now_secs(),
                 head_hash: index.head_hash.clone(),
                 cdb_hash: index.cdb_hash.clone(),
+                logic_version: index.logic_version,
             };
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
         }
@@ -534,6 +555,7 @@ impl IndexStore {
                 updated_at: 0,
                 head_hash: None,
                 cdb_hash: None,
+                logic_version: INDEX_LOGIC_VERSION,
             });
             meta.updated_at = now_secs();
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
@@ -1149,6 +1171,29 @@ mod tests {
         let loaded = store.load_repo(&root).unwrap();
         assert_eq!(loaded.head_hash.as_deref(), Some("deadbeef"));
         assert_eq!(loaded.cdb_hash.as_deref(), Some("cafef00d"));
+    }
+
+    // The indexer logic-version must survive the redb round-trip so a load can
+    // detect an index built by an older indexer and force a rebuild.
+    #[test]
+    fn test_redb_round_trips_logic_version() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // A fresh index carries the running binary's logic version.
+        let mut idx = PersistedIndex::new(root.clone());
+        assert_eq!(idx.logic_version, INDEX_LOGIC_VERSION);
+
+        // Simulate an index produced by an older indexer.
+        idx.logic_version = INDEX_LOGIC_VERSION - 1;
+        idx.files
+            .insert(root.join("a.rs"), meta(root.join("a.rs"), "h1"));
+        store.save_full(&idx).unwrap();
+
+        let loaded = store.load_repo(&root).unwrap();
+        assert_eq!(loaded.logic_version, INDEX_LOGIC_VERSION - 1);
     }
 
     // Persisted call-graph augmentation edges must survive the redb round-trip,

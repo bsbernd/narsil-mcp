@@ -45,6 +45,10 @@ pub struct RepoMetadata {
     /// against; a mismatch on startup means the cached symbols are stale.
     pub head_hash: Option<String>,
     pub cdb_hash: Option<String>,
+    /// Indexer extraction-logic version (`crate::persist::INDEX_LOGIC_VERSION`)
+    /// this index was built under; a mismatch forces a rebuild even when the
+    /// fingerprint is unchanged.
+    pub logic_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -687,6 +691,7 @@ impl CodeIntelEngine {
                                     + std::time::Duration::from_secs(persisted.updated_at),
                                 head_hash: persisted.head_hash.clone(),
                                 cdb_hash: persisted.cdb_hash.clone(),
+                                logic_version: persisted.logic_version,
                             };
 
                             engine.repos.insert(repo_name.clone(), metadata);
@@ -1031,10 +1036,20 @@ impl CodeIntelEngine {
     /// the repo's current git HEAD and compile_commands.json. A false result
     /// means the cached symbols are stale and must be rebuilt.
     fn fingerprint_matches(&self, repo_name: &str, repo_path: &Path) -> bool {
-        let (prior_head, prior_cdb) = match self.repos.get(repo_name) {
-            Some(meta) => (meta.head_hash.clone(), meta.cdb_hash.clone()),
+        let (prior_head, prior_cdb, prior_logic) = match self.repos.get(repo_name) {
+            Some(meta) => (
+                meta.head_hash.clone(),
+                meta.cdb_hash.clone(),
+                meta.logic_version,
+            ),
             None => return false,
         };
+        // An index built by an older indexer would produce different symbols/edges
+        // for the same source, so a logic-version bump invalidates it regardless of
+        // git HEAD / compile_commands.json.
+        if prior_logic != crate::persist::INDEX_LOGIC_VERSION {
+            return false;
+        }
         let head = self.git_head_hash(repo_path);
         let cdb = self.compile_commands_hash(repo_path);
         // With neither a git HEAD nor a compile_commands.json there is no fingerprint
@@ -1803,6 +1818,7 @@ impl CodeIntelEngine {
             last_indexed: SystemTime::now(),
             head_hash: self.git_head_hash(path),
             cdb_hash: self.compile_commands_hash(path),
+            logic_version: crate::persist::INDEX_LOGIC_VERSION,
         };
 
         info!(
