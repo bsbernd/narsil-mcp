@@ -724,6 +724,60 @@ fn test_get_symbol_definition() -> Result<()> {
 }
 
 #[test]
+fn test_get_symbol_definition_prefers_definition_over_declaration() -> Result<()> {
+    // When a name resolves to both a declaration (small span) and a definition
+    // (a body, larger span) get_symbol_definition must return the definition.
+    // The real trigger is ccls emitting a C forward-decl and its definition as
+    // separate symbols; a unit struct vs a braced struct reproduces the same
+    // span asymmetry under tree-sitter alone, with the small-span entry first.
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        mod decl {
+            pub struct Config;
+        }
+
+        mod def {
+            pub struct Config {
+                pub host: String,
+                pub port: u32,
+                pub retries: u32,
+            }
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_symbol_definition",
+        json!({
+            "repo": repo_name,
+            "symbol": "Config",
+            "context_lines": 0
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    // The braced definition's fields are only present if the definition (not the
+    // unit-struct declaration) was selected.
+    assert!(
+        content.contains("host: String"),
+        "expected the braced definition, got:\n{content}"
+    );
+    assert!(content.contains("port: u32"));
+
+    Ok(())
+}
+
+#[test]
 fn test_search_code() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_rust_file(

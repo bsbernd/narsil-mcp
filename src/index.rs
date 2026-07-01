@@ -2809,11 +2809,25 @@ impl CodeIntelEngine {
             .get(&repo)
             .ok_or_else(|| self.repo_not_found_error(&repo))?;
 
-        // Find matching symbol
+        // Find matching symbol. Prefer a real definition over a forward-decl or
+        // prototype (the C backend emits those as their own entries): a body
+        // makes the definition span strictly more lines. An `impl` block is not
+        // the definition of the type it names, so rank it below everything else
+        // (it can span more lines than the struct it implements). reduce() keeps
+        // the first match on ties and yields None when nothing matches,
+        // preserving the gtags fallback below.
+        let definition_rank =
+            |s: &Symbol| (!matches!(s.kind, SymbolKind::Implementation), s.line_count());
         let symbol = match symbols
             .iter()
-            .find(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
-        {
+            .filter(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
+            .reduce(|best, s| {
+                if definition_rank(s) > definition_rank(best) {
+                    s
+                } else {
+                    best
+                }
+            }) {
             Some(s) => s,
             None => {
                 // AST miss (e.g. a file-local static the C parser dropped): consult
