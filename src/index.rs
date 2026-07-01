@@ -5772,6 +5772,9 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         let repo_path = PathBuf::from(self.resolve_repo(repo)?);
         let file_path = validate_path(&repo_path, path)?;
+        if file_path.is_dir() {
+            return Err(anyhow!("'{}' is a directory, not a file", path));
+        }
 
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 

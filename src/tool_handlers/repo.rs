@@ -69,6 +69,16 @@ impl ToolHandler for GetExcerptHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
+        if path.is_empty() {
+            // The recurring mistake is calling this tool with get_file's
+            // arguments (file/start_line/end_line); name the real ones so the
+            // error points at the fix instead of a downstream read failure.
+            return Err(anyhow::anyhow!(
+                "get_excerpt requires 'path' (a file path) and 'lines' (an array \
+                 of line numbers to extract context around); for a literal \
+                 start/end line range use get_file instead"
+            ));
+        }
         let lines: Vec<usize> = args
             .get_array("lines")
             .map(|arr| {
@@ -77,6 +87,18 @@ impl ToolHandler for GetExcerptHandler {
                     .collect()
             })
             .unwrap_or_default();
+        if lines.is_empty() && (args.get("start_line").is_some() || args.get("end_line").is_some())
+        {
+            // Same mistake as the missing-path case, just with a valid path:
+            // start_line/end_line belong to get_file, not get_excerpt. Without
+            // this check the empty `lines` silently yields "0 excerpt(s)"
+            // instead of pointing at the fix.
+            return Err(anyhow::anyhow!(
+                "get_excerpt takes 'lines' (an array of line numbers to \
+                 extract context around), not 'start_line'/'end_line'; for a \
+                 literal start/end line range use get_file instead"
+            ));
+        }
         let config = ExcerptConfig {
             context_before: args.get_u64_or("context_before", 5) as usize,
             context_after: args.get_u64_or("context_after", 5) as usize,

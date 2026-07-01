@@ -1920,6 +1920,95 @@ fn test_get_excerpt_error_invalid_path() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_get_excerpt_error_missing_path() -> Result<()> {
+    // Reproduces a recurring misuse: callers pass get_file's arguments
+    // (file/start_line/end_line) to get_excerpt, which only understands
+    // path/lines. Before the fix, the missing `path` silently resolved to
+    // the repo root directory and failed with the generic, unhelpful
+    // "Failed to read file". It must now name the required arguments.
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "fn main() {}")?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_excerpt",
+        json!({
+            "repo": repo_name,
+            "file": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 1
+        }),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("path"));
+    assert!(error_msg.contains("lines"));
+    assert!(!error_msg.contains("Failed to read file"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_excerpt_error_directory_path() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "fn main() {}")?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_excerpt",
+        json!({
+            "repo": repo_name,
+            "path": "src",
+            "lines": [1]
+        }),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("directory"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
+    // Reproduces a second variant of the get_file/get_excerpt argument mix-up:
+    // a valid `path` but start_line/end_line instead of `lines`. Before the
+    // fix this silently produced "0 excerpt(s) from 0 match line(s)" instead
+    // of an error.
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "fn main() {}")?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_excerpt",
+        json!({
+            "repo": repo_name,
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 1
+        }),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("lines"));
+    assert!(error_msg.contains("start_line"));
+
+    Ok(())
+}
+
 // Security tests module
 mod security_tests {
     use super::*;
