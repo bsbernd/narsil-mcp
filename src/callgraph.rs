@@ -3,6 +3,7 @@
 //! This is critical for AI understanding of code flow and impact analysis.
 
 use crate::symbols::{SourceLine, SourceSet};
+use crate::syscall::{syscall_body_of, syscall_define_name, syscall_name_for_body};
 use anyhow::Result;
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -416,6 +417,25 @@ impl CallGraph {
     fn try_extract_function(&self, node: Node, source: &[u8], path: &str) -> Option<CallNode> {
         let kind = node.kind();
 
+        // Linux SYSCALL_DEFINEn: tree-sitter sees a call_expression, not a
+        // function_definition. Synthesise a node named after the syscall so the
+        // entry point and its body's callees enter the graph.
+        if kind == "call_expression" {
+            if let (Some(name), Some(body)) =
+                (syscall_define_name(node, source), syscall_body_of(node))
+            {
+                let metrics = self.compute_metrics(body, source);
+                return Some(CallNode {
+                    name,
+                    file_path: path.to_string(),
+                    line: node.start_position().row + 1,
+                    calls: Vec::new(),
+                    called_by: Vec::new(),
+                    metrics,
+                });
+            }
+        }
+
         // Match function definition patterns across languages
         let is_function = matches!(
             kind,
@@ -529,6 +549,16 @@ impl CallGraph {
                     extract_function_name(node, source)
                 };
                 if let Some(name) = name {
+                    scope_stack.push((depth, current_function.clone()));
+                    *current_function = Some(Self::qualified_key(path, &name));
+                }
+            }
+
+            // A SYSCALL_DEFINEn body is a compound_statement sibling of the macro
+            // call, not a child of any function node — scope its calls to the
+            // synthesised syscall function for the duration of the body subtree.
+            if kind == "compound_statement" {
+                if let Some(name) = syscall_name_for_body(node, source) {
                     scope_stack.push((depth, current_function.clone()));
                     *current_function = Some(Self::qualified_key(path, &name));
                 }

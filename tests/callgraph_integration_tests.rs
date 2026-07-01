@@ -576,3 +576,59 @@ niop_co_submit_and_wait(int *niops, int n)
         "find_call_path(write_co -> niop_co_submit_and_wait) returned None"
     );
 }
+
+#[test]
+fn test_c_syscall_define_call_graph() {
+    // Linux SYSCALL_DEFINEn expands to a function via macros, but tree-sitter-c
+    // sees the unexpanded macro as a call_expression followed by a sibling body.
+    // The syscall entry point must still appear as a node named after the syscall
+    // (its first macro argument), and the calls in its body must be attributed to
+    // it — not dropped.
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+static int io_submit_sqes(void *ctx, unsigned n) { return 0; }
+static int helper_fn(int x) { return x; }
+
+SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+		u32, min_complete, u32, flags, const void __user *, argp,
+		size_t, argsz)
+{
+	int ret;
+	ret = io_submit_sqes(ctx, to_submit);
+	helper_fn(ret);
+	return ret;
+}
+"#;
+
+    let tree = parser
+        .parse_to_tree(Path::new("io_uring/io_uring.c"), code)
+        .unwrap();
+    let files = vec![("io_uring/io_uring.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    // The syscall body's calls are attributed to io_uring_enter.
+    let callees = call_graph.get_callees("io_uring_enter");
+    assert!(
+        callees
+            .iter()
+            .any(|e| e.target.ends_with("::io_submit_sqes")),
+        "io_uring_enter should call io_submit_sqes — got {:?}",
+        callees.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+    assert!(
+        callees.iter().any(|e| e.target.ends_with("::helper_fn")),
+        "io_uring_enter should call helper_fn"
+    );
+
+    // io_submit_sqes must show the syscall entry point as a caller.
+    let callers = call_graph.get_callers("io_submit_sqes");
+    assert!(
+        callers
+            .iter()
+            .any(|e| e.target.ends_with("::io_uring_enter")),
+        "io_submit_sqes should be called by io_uring_enter — got {:?}",
+        callers.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+}

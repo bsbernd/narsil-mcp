@@ -5,6 +5,7 @@
 
 use crate::parser::{LanguageParser, ParsedFile};
 use crate::symbols::SymbolKind;
+use crate::syscall::{syscall_body_of, syscall_define_name};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -315,6 +316,27 @@ impl AstChunker {
         let kind = node.kind();
         let start_line = node.start_position().row + 1;
         let end_line = node.end_position().row + 1;
+
+        // Linux SYSCALL_DEFINEn: the entry point parses as a call_expression, not a
+        // function_definition, so classify_node misses it. Emit a Function boundary
+        // named after the syscall, spanning the macro line through the body's end.
+        if matches!(lang, "c" | "cpp") {
+            if let (Some(name), Some(body)) = (
+                syscall_define_name(*node, content.as_bytes()),
+                syscall_body_of(*node),
+            ) {
+                boundaries.push(SymbolBoundary {
+                    name,
+                    kind: SymbolKind::Function,
+                    chunk_type: ChunkType::Function,
+                    start_line,
+                    end_line: body.end_position().row + 1,
+                    doc_start: self.find_doc_comment_start(node, content, start_line),
+                    signature: Some(self.node_text(node, content)),
+                    parent_name: parent_name.map(String::from),
+                });
+            }
+        }
 
         // Check if this is a symbol we care about
         if let Some((chunk_type, symbol_kind)) = self.classify_node(kind, lang) {
@@ -970,6 +992,31 @@ enum MyEnum {
         );
         assert!(all_content.contains("trait MyTrait"), "Should have trait");
         assert!(all_content.contains("enum MyEnum"), "Should have enum");
+    }
+
+    #[test]
+    fn test_chunk_c_syscall_define() {
+        // A SYSCALL_DEFINEn entry point parses as a call_expression, not a
+        // function_definition, but must still yield a Function symbol named after
+        // the syscall so find_symbols can locate it.
+        let code = r#"
+SYSCALL_DEFINE3(io_uring_enter, unsigned int, fd, u32, to_submit, u32, flags)
+{
+	return io_submit_sqes(fd, to_submit);
+}
+"#;
+        let chunker = AstChunker::new();
+        let chunks = chunker.chunk_file(code, "io_uring/io_uring.c");
+
+        let syscall_chunk = chunks
+            .iter()
+            .find(|c| {
+                c.symbol_context
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.name == "io_uring_enter")
+            })
+            .expect("io_uring_enter should be indexed as a symbol");
+        assert_eq!(syscall_chunk.chunk_type, ChunkType::Function);
     }
 
     #[test]

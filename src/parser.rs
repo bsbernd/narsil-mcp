@@ -2,9 +2,10 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
+use tree_sitter::{Language, Node, Parser, Query, QueryCursor, Tree};
 
 use crate::symbols::{Symbol, SymbolKind};
+use crate::syscall::{syscall_body_of, syscall_define_name};
 
 /// Supported languages and their tree-sitter configurations
 #[derive(Debug, Clone)]
@@ -605,7 +606,47 @@ impl LanguageParser {
             }
         }
 
+        // Linux SYSCALL_DEFINEn entry points parse as a call_expression, not a
+        // function_definition, so the symbol query above never captures them. Add
+        // them explicitly, named after the syscall (the macro's first argument).
+        if matches!(lazy_config.config.name.as_str(), "c" | "cpp") {
+            collect_syscall_symbols(tree.root_node(), source_bytes, &mut symbols);
+        }
+
         Ok(symbols)
+    }
+}
+
+/// Append a Function symbol for every `SYSCALL_DEFINEn` / `COMPAT_SYSCALL_DEFINEn`
+/// definition reachable from `root`, spanning the macro line through the body's end.
+fn collect_syscall_symbols(root: Node, source: &[u8], symbols: &mut Vec<Symbol>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let (Some(name), Some(body)) =
+                (syscall_define_name(node, source), syscall_body_of(node))
+            {
+                let text = node.utf8_text(source).unwrap_or("");
+                let first_line_end = text.find('\n').unwrap_or(text.len());
+                let sig_end = text.floor_char_boundary(first_line_end.min(200));
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    file_path: String::new(), // Will be set by caller
+                    start_line: node.start_position().row + 1,
+                    end_line: body.end_position().row + 1,
+                    signature: Some(text[..sig_end].to_string()),
+                    qualified_name: None,
+                    doc_comment: None,
+                    confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+                    line_conflicts: Vec::new(),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
     }
 }
 
@@ -656,6 +697,32 @@ mod tests {
         let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
         assert!(names.contains(&&"MyStruct".to_string()));
         assert!(names.contains(&&"my_function".to_string()));
+    }
+
+    #[test]
+    fn test_parse_c_syscall_define() {
+        // A SYSCALL_DEFINEn entry point is a call_expression, not a
+        // function_definition, so the symbol query misses it; it must still be
+        // extracted as a Function symbol named after the syscall.
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+SYSCALL_DEFINE3(io_uring_enter, unsigned int, fd, u32, to_submit, u32, flags)
+{
+	return io_submit_sqes(fd, to_submit);
+}
+
+static int helper(void) { return 0; }
+"#;
+        let parsed = parser.parse_file(Path::new("io_uring.c"), content).unwrap();
+        assert_eq!(parsed.language, "c");
+
+        let names: Vec<_> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"io_uring_enter"),
+            "SYSCALL_DEFINE3 should yield an io_uring_enter symbol, got {names:?}"
+        );
+        // The ordinary function is still found by the query path.
+        assert!(names.contains(&"helper"));
     }
 
     #[test]

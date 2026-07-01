@@ -24,6 +24,7 @@ pub mod security_rules;
 pub mod stats_cli;
 pub mod supply_chain;
 pub mod symbols;
+pub mod syscall;
 pub mod taint;
 pub mod tool_metadata;
 pub mod type_inference;
