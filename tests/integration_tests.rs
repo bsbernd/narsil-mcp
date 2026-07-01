@@ -2162,6 +2162,23 @@ fn test_infer_types_error_missing_function() -> Result<()> {
 }
 
 #[test]
+fn test_get_reaching_definitions_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "get_reaching_definitions",
+        json!({"repo": repo_name, "function": "calculate_total"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_reaching_definitions"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
 fn test_get_complexity_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 

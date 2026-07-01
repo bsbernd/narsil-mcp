@@ -71,7 +71,7 @@ impl ToolHandler for GetReachingDefinitionsHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_reaching_definitions")?;
         let function = args.get_str("function").unwrap_or("");
         engine.get_reaching_definitions(repo, path, function).await
     }
