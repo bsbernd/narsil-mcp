@@ -17,7 +17,7 @@ impl ToolHandler for GetControlFlowHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_control_flow")?;
         let function = args.get_str("function").unwrap_or("");
         engine.get_control_flow(repo, path, function).await
     }
@@ -54,7 +54,7 @@ impl ToolHandler for GetDataFlowHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_data_flow")?;
         let function = args.get_str("function").unwrap_or("");
         engine.get_data_flow(repo, path, function).await
     }

@@ -2179,6 +2179,40 @@ fn test_get_reaching_definitions_error_missing_path() -> Result<()> {
 }
 
 #[test]
+fn test_get_control_flow_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "get_control_flow",
+        json!({"repo": repo_name, "function": "calculate_total"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_control_flow"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_data_flow_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "get_data_flow",
+        json!({"repo": repo_name, "function": "calculate_total"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_data_flow"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
 fn test_get_complexity_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 
