@@ -2841,9 +2841,17 @@ impl CodeIntelEngine {
         // preserving the gtags fallback below.
         let definition_rank =
             |s: &Symbol| (!matches!(s.kind, SymbolKind::Implementation), s.line_count());
+        // qualified_name is rarely populated by the extractors, so a caller-supplied
+        // "Type::method" (the natural way to name an inherent-impl method) would
+        // otherwise never match anything but the bare method name itself.
+        let method_tail = symbol_name.rsplit("::").next().unwrap_or(symbol_name);
         let symbol = match symbols
             .iter()
-            .filter(|s| s.name == symbol_name || s.qualified_name.as_deref() == Some(symbol_name))
+            .filter(|s| {
+                s.name == symbol_name
+                    || s.qualified_name.as_deref() == Some(symbol_name)
+                    || (method_tail != symbol_name && s.name == method_tail)
+            })
             .reduce(|best, s| {
                 if definition_rank(s) > definition_rank(best) {
                     s

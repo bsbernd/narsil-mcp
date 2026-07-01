@@ -778,6 +778,51 @@ fn test_get_symbol_definition_prefers_definition_over_declaration() -> Result<()
 }
 
 #[test]
+fn test_get_symbol_definition_qualified_type_method() -> Result<()> {
+    // "Type::method" is the natural way to name an inherent-impl method, but
+    // qualified_name is never populated by the extractors — the lookup must
+    // fall back to matching the bare method name after the last "::".
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub struct Widget;
+
+        impl Widget {
+            pub fn build(&self) -> u32 {
+                42
+            }
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_symbol_definition",
+        json!({
+            "repo": repo_name,
+            "symbol": "Widget::build",
+            "context_lines": 0
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert!(
+        content.contains("42"),
+        "expected Widget::build's body, got:\n{content}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_search_code() -> Result<()> {
     let repo = TestRepo::new()?;
     repo.add_rust_file(
