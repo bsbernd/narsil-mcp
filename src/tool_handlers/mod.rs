@@ -280,6 +280,21 @@ fn normalize_arg_aliases(args: &mut Value) {
     }
 }
 
+/// Require a non-empty string argument, erroring with a message naming the
+/// tool and argument. Without this, a missing or empty required argument
+/// silently flows into the engine and produces a plausible-but-wrong result
+/// (validate_path resolves "" to the repo root directory, `.contains("")`
+/// matches every line, a lookup on "" just reads as "not found") instead of
+/// a clear failure.
+fn require_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
+    match args.get_str(key) {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => Err(anyhow::anyhow!(
+            "{tool} requires a non-empty '{key}' argument"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

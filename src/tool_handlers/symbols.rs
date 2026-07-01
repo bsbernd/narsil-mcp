@@ -68,7 +68,7 @@ impl ToolHandler for FindReferencesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = super::require_arg(&args, "symbol", "find_references")?;
         let include_def = args.get_bool_or("include_definition", true);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -88,7 +88,7 @@ impl ToolHandler for GetDependenciesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_dependencies")?;
         let direction = args.get_str("direction").unwrap_or("both");
         engine.get_dependencies(repo, path, direction).await
     }
@@ -105,7 +105,7 @@ impl ToolHandler for FindSymbolUsagesHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let symbol = args.get_str("symbol").unwrap_or("");
+        let symbol = super::require_arg(&args, "symbol", "find_symbol_usages")?;
         let include_imports = args.get_bool_or("include_imports", true);
         let exclude_tests = args.get_bool("exclude_tests");
         engine
@@ -125,7 +125,7 @@ impl ToolHandler for GetExportMapHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_export_map")?;
         engine.get_export_map(repo, path).await
     }
 }

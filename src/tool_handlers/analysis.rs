@@ -129,7 +129,7 @@ impl ToolHandler for InferTypesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = super::require_arg(&args, "function", "infer_types")?;
         engine.infer_types(repo, path, function).await
     }
 }

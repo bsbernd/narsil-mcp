@@ -50,7 +50,7 @@ impl ToolHandler for GetFileHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_file")?;
         let start_line = args.get_u64("start_line").map(|v| v as usize);
         let end_line = args.get_u64("end_line").map(|v| v as usize);
         engine.get_file(repo, path, start_line, end_line).await

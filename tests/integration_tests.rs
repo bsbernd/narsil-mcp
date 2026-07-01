@@ -2009,6 +2009,276 @@ fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
     Ok(())
 }
 
+/// Shared setup for the require_arg regression tests below: a repo with one
+/// indexed Rust file, wrapped in a running server. Every test in this group
+/// calls a different tool with its required argument missing/empty and
+/// checks for a clear, named-argument error instead of a plausible-but-wrong
+/// result.
+fn require_arg_test_server() -> Result<(TestRepo, TestMcpServer, String)> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn calculate_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap().to_string();
+    server.wait_for_repo(&repo_name, Duration::from_secs(30))?;
+
+    Ok((repo, server, repo_name))
+}
+
+#[test]
+fn test_get_file_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_file", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_file"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_dependencies_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_dependencies", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_dependencies"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_export_map_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_export_map", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_export_map"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_references_error_missing_symbol() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("find_references", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("find_references"));
+    assert!(error_msg.contains("symbol"));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_symbol_usages_error_missing_symbol() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("find_symbol_usages", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("find_symbol_usages"));
+    assert!(error_msg.contains("symbol"));
+
+    Ok(())
+}
+
+#[test]
+fn test_search_code_error_missing_query() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("search_code", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("search_code"));
+    assert!(error_msg.contains("query"));
+
+    Ok(())
+}
+
+#[test]
+fn test_semantic_search_error_missing_query() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("semantic_search", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("semantic_search"));
+    assert!(error_msg.contains("query"));
+
+    Ok(())
+}
+
+#[test]
+fn test_hybrid_search_error_missing_query() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("hybrid_search", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("hybrid_search"));
+    assert!(error_msg.contains("query"));
+
+    Ok(())
+}
+
+#[test]
+fn test_infer_types_error_missing_function() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "infer_types",
+        json!({"repo": repo_name, "path": "src/lib.rs"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("infer_types"));
+    assert!(error_msg.contains("function"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_complexity_error_missing_function() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_complexity", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_complexity"));
+    assert!(error_msg.contains("function"));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_call_path_error_missing_from() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "find_call_path",
+        json!({"repo": repo_name, "to": "calculate_total"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("find_call_path"));
+    assert!(error_msg.contains("from"));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_call_path_error_missing_to() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool(
+        "find_call_path",
+        json!({"repo": repo_name, "from": "calculate_total"}),
+    )?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("find_call_path"));
+    assert!(error_msg.contains("to"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_hover_info_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_hover_info", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_hover_info"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_get_type_info_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("get_type_info", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("get_type_info"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_go_to_definition_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("go_to_definition", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("go_to_definition"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_trace_taint_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("trace_taint", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("trace_taint"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
+#[test]
+fn test_suggest_fix_error_missing_path() -> Result<()> {
+    let (_repo, server, repo_name) = require_arg_test_server()?;
+
+    let response = server.call_tool("suggest_fix", json!({"repo": repo_name}))?;
+
+    assert!(response["error"].is_object());
+    let error_msg = response["error"]["message"].as_str().unwrap();
+    assert!(error_msg.contains("suggest_fix"));
+    assert!(error_msg.contains("path"));
+
+    Ok(())
+}
+
 // Security tests module
 mod security_tests {
     use super::*;

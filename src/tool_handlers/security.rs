@@ -103,7 +103,7 @@ impl ToolHandler for TraceTaintHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "trace_taint")?;
         let line = args.get_u64_or("line", 1) as usize;
         engine.trace_taint(repo, path, line).await
     }
@@ -202,7 +202,7 @@ impl ToolHandler for SuggestFixHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "suggest_fix")?;
         let line = args.get_u64_or("line", 1) as usize;
         let rule_id = args.get_str("rule_id");
         engine.suggest_fix(repo, path, line, rule_id).await

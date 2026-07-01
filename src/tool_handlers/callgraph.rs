@@ -89,8 +89,8 @@ impl ToolHandler for FindCallPathHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let from = args.get_str("from").unwrap_or("");
-        let to = args.get_str("to").unwrap_or("");
+        let from = super::require_arg(&args, "from", "find_call_path")?;
+        let to = super::require_arg(&args, "to", "find_call_path")?;
         engine.find_call_path(repo, from, to).await
     }
 }
@@ -106,7 +106,7 @@ impl ToolHandler for GetComplexityHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
+        let function = super::require_arg(&args, "function", "get_complexity")?;
         engine.get_complexity(repo, function).await
     }
 }

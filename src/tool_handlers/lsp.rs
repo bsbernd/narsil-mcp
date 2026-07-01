@@ -17,7 +17,7 @@ impl ToolHandler for GetHoverInfoHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_hover_info")?;
         let line = args.get_u64_or("line", 1) as usize;
         let character = args.get_u64_or("character", 0) as usize;
         engine.get_hover_info(repo, path, line, character).await
@@ -35,7 +35,7 @@ impl ToolHandler for GetTypeInfoHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "get_type_info")?;
         let line = args.get_u64_or("line", 1) as usize;
         let character = args.get_u64_or("character", 0) as usize;
         engine.get_type_info(repo, path, line, character).await
@@ -53,7 +53,7 @@ impl ToolHandler for GoToDefinitionHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
+        let path = super::require_arg(&args, "path", "go_to_definition")?;
         let line = args.get_u64_or("line", 1) as usize;
         let character = args.get_u64_or("character", 0) as usize;
         engine.go_to_definition(repo, path, line, character).await

@@ -17,7 +17,7 @@ impl ToolHandler for SearchCodeHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
-        let query = args.get_str("query").unwrap_or("");
+        let query = super::require_arg(&args, "query", "search_code")?;
         let file_pattern = args.get_str("file_pattern");
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
@@ -38,7 +38,7 @@ impl ToolHandler for SemanticSearchHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
-        let query = args.get_str("query").unwrap_or("");
+        let query = super::require_arg(&args, "query", "semantic_search")?;
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let doc_type = args.get_str("doc_type");
         let exclude_tests = args.get_bool("exclude_tests");
@@ -59,7 +59,7 @@ impl ToolHandler for HybridSearchHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
-        let query = args.get_str("query").unwrap_or("");
+        let query = super::require_arg(&args, "query", "hybrid_search")?;
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let mode = args.get_str("mode").unwrap_or("hybrid");
         let exclude_tests = args.get_bool("exclude_tests");
