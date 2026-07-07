@@ -1993,6 +1993,7 @@ fn test_get_excerpt_error_missing_path() -> Result<()> {
     let error_msg = response["error"]["message"].as_str().unwrap();
     assert!(error_msg.contains("path"));
     assert!(error_msg.contains("lines"));
+    assert!(error_msg.contains("get_file("));
     assert!(!error_msg.contains("Failed to read file"));
 
     Ok(())
@@ -2050,6 +2051,7 @@ fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
     let error_msg = response["error"]["message"].as_str().unwrap();
     assert!(error_msg.contains("lines"));
     assert!(error_msg.contains("start_line"));
+    assert!(error_msg.contains("get_file("));
 
     Ok(())
 }

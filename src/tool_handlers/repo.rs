@@ -76,7 +76,8 @@ impl ToolHandler for GetExcerptHandler {
             return Err(anyhow::anyhow!(
                 "get_excerpt requires 'path' (a file path) and 'lines' (an array \
                  of line numbers to extract context around); for a literal \
-                 start/end line range use get_file instead"
+                 start/end line range use get_file instead, e.g. \
+                 get_file(repo=\"...\", path=\"src/foo.c\", start_line=100, end_line=160)"
             ));
         }
         let lines: Vec<usize> = args
@@ -96,7 +97,8 @@ impl ToolHandler for GetExcerptHandler {
             return Err(anyhow::anyhow!(
                 "get_excerpt takes 'lines' (an array of line numbers to \
                  extract context around), not 'start_line'/'end_line'; for a \
-                 literal start/end line range use get_file instead"
+                 literal start/end line range use get_file instead, e.g. \
+                 get_file(repo=\"...\", path=\"src/foo.c\", start_line=100, end_line=160)"
             ));
         }
         let config = ExcerptConfig {
