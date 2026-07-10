@@ -3019,97 +3019,167 @@ impl CodeIntelEngine {
         }
 
         let query_lower = query.to_lowercase();
+        // Whitespace-split tokens let a multi-word query match a line (or, as a
+        // fallback, a file) that contains every term without the terms being
+        // adjacent — otherwise `line.contains(query)` treats "struct foo" as an
+        // exact phrase and misses the far more common non-adjacent case.
+        let tokens: Vec<String> = query_lower.split_whitespace().map(String::from).collect();
+        let multi_token = tokens.len() > 1;
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
-        let mut results: Vec<CodeExcerpt> = Vec::new();
+        // Each hit is paired with its owning repo root so cross-repo searches
+        // can name where the hit lives.
+        let mut results: Vec<(String, CodeExcerpt)> = Vec::new();
 
         let repos_to_search: Vec<String> = match repo {
             Some(r) => vec![self.resolve_repo(r)?],
             None => self.repos.iter().map(|r| r.key().clone()).collect(),
         };
+        // Only name the owning repo per hit when the search spanned more than
+        // one repo; a single-repo search already knows where its hits live.
+        let multi_repo = repos_to_search.len() > 1;
 
         let glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
 
-        for repo_name in repos_to_search {
+        // Shared per-file gate: repo membership, test exclusion, file pattern.
+        // Returns the repo-relative path when the file is in scope.
+        let file_in_scope = |file_path: &Path, repo_path: &Path| -> Option<String> {
+            if !file_path.starts_with(repo_path) {
+                return None;
+            }
+            let rel_path = file_path
+                .strip_prefix(repo_path)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+            if exclude_tests && is_test_file(&rel_path) {
+                return None;
+            }
+            if let Some(ref g) = glob {
+                if !g.matches(&rel_path) {
+                    return None;
+                }
+            }
+            Some(rel_path)
+        };
+
+        // Build a context excerpt centred on the 0-based line index `center`.
+        let make_excerpt = |lines: &[&str], center: usize, rel_path: &str, score: f32| -> CodeExcerpt {
+            let start = center.saturating_sub(3);
+            let end = (center + 4).min(lines.len());
+            let excerpt_content: String = lines[start..end]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("{:4} | {}", start + i + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            CodeExcerpt {
+                file_path: rel_path.to_string(),
+                start_line: start + 1,
+                end_line: end,
+                content: excerpt_content,
+                language: get_language_id(rel_path).to_string(),
+                relevance_score: score,
+            }
+        };
+
+        // Pass 1: lines containing the whole phrase, or (for a multi-word
+        // query) every token in any order.
+        for repo_name in &repos_to_search {
             // After resolve_repo / iteration of self.repos, repo_name is the
             // canonical absolute path used as both the engine's map key and
             // the on-disk repository root.
-            let repo_path = PathBuf::from(&repo_name);
+            let repo_path = PathBuf::from(repo_name);
 
-            // Search through cached files
             for entry in self.file_cache.iter() {
                 let file_path = entry.key();
-
-                // Check if file is in this repo
-                if !file_path.starts_with(&repo_path) {
+                let Some(rel_path) = file_in_scope(file_path, &repo_path) else {
                     continue;
-                }
-
-                let rel_path = file_path
-                    .strip_prefix(&repo_path)
-                    .unwrap_or(file_path)
-                    .to_string_lossy();
-
-                // Skip test files if exclude_tests is enabled
-                if exclude_tests && is_test_file(&rel_path) {
-                    continue;
-                }
-
-                // Apply file pattern filter
-                if let Some(ref g) = glob {
-                    if !g.matches(&rel_path) {
-                        continue;
-                    }
-                }
+                };
 
                 let content = entry.value();
                 let lines: Vec<&str> = content.lines().collect();
 
-                // Simple text search with scoring
                 for (line_num, line) in lines.iter().enumerate() {
-                    if line.to_lowercase().contains(&query_lower) {
-                        let start = line_num.saturating_sub(3);
-                        let end = (line_num + 4).min(lines.len());
-
-                        let excerpt_content: String = lines[start..end]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, l)| format!("{:4} | {}", start + i + 1, l))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-
-                        // Calculate relevance score
+                    let line_lower = line.to_lowercase();
+                    let matched = line_lower.contains(&query_lower)
+                        || (multi_token && tokens.iter().all(|t| line_lower.contains(t.as_str())));
+                    if matched {
                         let score = calculate_relevance(line, &query_lower);
-
-                        results.push(CodeExcerpt {
-                            file_path: rel_path.to_string(),
-                            start_line: start + 1,
-                            end_line: end,
-                            content: excerpt_content,
-                            language: get_language_id(&rel_path).to_string(),
-                            relevance_score: score,
-                        });
+                        results.push((
+                            repo_name.clone(),
+                            make_excerpt(&lines, line_num, &rel_path, score),
+                        ));
                     }
+                }
+            }
+        }
+
+        // Pass 2 (fallback): if no single line matched a multi-word query, fall
+        // back to files that contain every token somewhere, anchored at the
+        // first token occurrence. Runs only when pass 1 found nothing, so it
+        // never dilutes precise single-line hits.
+        let used_fallback = results.is_empty() && multi_token;
+        if used_fallback {
+            for repo_name in &repos_to_search {
+                let repo_path = PathBuf::from(repo_name);
+
+                for entry in self.file_cache.iter() {
+                    let file_path = entry.key();
+                    let Some(rel_path) = file_in_scope(file_path, &repo_path) else {
+                        continue;
+                    };
+
+                    let content = entry.value();
+                    let content_lower = content.to_lowercase();
+                    if !tokens.iter().all(|t| content_lower.contains(t.as_str())) {
+                        continue;
+                    }
+
+                    let lines: Vec<&str> = content.lines().collect();
+                    let anchor = lines
+                        .iter()
+                        .position(|l| {
+                            let line_lower = l.to_lowercase();
+                            tokens.iter().any(|t| line_lower.contains(t.as_str()))
+                        })
+                        .unwrap_or(0);
+                    let anchor_line = lines.get(anchor).copied().unwrap_or("");
+                    let score = calculate_relevance(anchor_line, &query_lower);
+                    results.push((
+                        repo_name.clone(),
+                        make_excerpt(&lines, anchor, &rel_path, score),
+                    ));
                 }
             }
         }
 
         // Sort by relevance and take top results
         results.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
+            b.1.relevance_score
+                .partial_cmp(&a.1.relevance_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(max_results);
 
         // Collect dependent files for smart invalidation
-        let dependent_files: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
+        let dependent_files: Vec<String> =
+            results.iter().map(|(_, r)| r.file_path.clone()).collect();
 
         let mut output = String::new();
         output.push_str(&format!("# Search Results for: `{}`\n\n", query));
         output.push_str(&format!("Found {} results\n\n", results.len()));
+        if used_fallback && !results.is_empty() {
+            output.push_str(
+                "*No single line contained all terms; showing files that contain every term \
+                 across multiple lines.*\n\n",
+            );
+        }
 
-        for (i, result) in results.iter().enumerate() {
+        for (i, (repo_name, result)) in results.iter().enumerate() {
             output.push_str(&format!("## {}. `{}`\n", i + 1, result.file_path));
+            if multi_repo {
+                output.push_str(&format!("**Repo**: `{}`\n", repo_name));
+            }
             output.push_str(&format!(
                 "Lines {}-{} | Score: {:.2}\n\n",
                 result.start_line, result.end_line, result.relevance_score
