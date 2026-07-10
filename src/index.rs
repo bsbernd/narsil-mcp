@@ -3291,15 +3291,38 @@ impl CodeIntelEngine {
         )
         .await;
 
-        // 3. Use LSP results if available and non-empty, otherwise text search
-        if let Ok(Some(lsp_refs)) = lsp_result {
-            let lsp_refs = filter_tests(lsp_refs);
-            if !lsp_refs.is_empty() {
-                return Ok(self.format_references(&lsp_refs, true, symbol));
-            }
-        }
+        // 3. Merge LSP and text results instead of letting either win outright:
+        //    LSP can miss cross-TU definitions/calls that a text scan catches,
+        //    while text over-reports. The union (deduped by location) keeps both
+        //    sources' hits — the same combined-view rule find_symbol_usages
+        //    already follows. Returning LSP-only here silently dropped the
+        //    definition and real call sites text search had found.
+        let lsp_refs = match lsp_result {
+            Ok(Some(refs)) => filter_tests(refs),
+            _ => Vec::new(),
+        };
+        let lsp_used = !lsp_refs.is_empty();
+        let merged = Self::merge_references(text_refs, lsp_refs);
 
-        Ok(self.format_references(&text_refs, false, symbol))
+        Ok(self.format_references(&merged, lsp_used, symbol))
+    }
+
+    /// Merge two reference lists, deduplicated by (path, line). `primary`'s
+    /// content wins on a location collision; locations unique to either list
+    /// survive. Ordered by (path, line) for deterministic output.
+    fn merge_references(
+        primary: Vec<(String, usize, String)>,
+        secondary: Vec<(String, usize, String)>,
+    ) -> Vec<(String, usize, String)> {
+        use std::collections::BTreeMap;
+        let mut merged: BTreeMap<(String, usize), String> = BTreeMap::new();
+        for (path, line, content) in primary.into_iter().chain(secondary) {
+            merged.entry((path, line)).or_insert(content);
+        }
+        merged
+            .into_iter()
+            .map(|((path, line), content)| (path, line, content))
+            .collect()
     }
 
     /// Text-based reference search (fast, synchronous)
@@ -11929,6 +11952,37 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn merge_references_unions_both_sources() {
+        // Regression for the find_references LSP-wins bug: text search found the
+        // definition and a call site; LSP found only the declaration. The union
+        // must keep all three locations, not just the LSP one.
+        let text = vec![
+            ("chunk_remove.c".to_string(), 397, "def".to_string()),
+            ("nisd_write.c".to_string(), 581, "call".to_string()),
+            ("chunk_remove.h".to_string(), 53, "decl".to_string()),
+        ];
+        let lsp = vec![("chunk_remove.h".to_string(), 53, "lsp-decl".to_string())];
+
+        let merged = CodeIntelEngine::merge_references(text, lsp);
+
+        assert_eq!(merged.len(), 3, "duplicate (path,line) must collapse: {merged:?}");
+        assert!(merged.contains(&("chunk_remove.c".to_string(), 397, "def".to_string())));
+        assert!(merged.contains(&("nisd_write.c".to_string(), 581, "call".to_string())));
+        // primary (text) content wins on the shared declaration location.
+        assert!(merged.contains(&("chunk_remove.h".to_string(), 53, "decl".to_string())));
+    }
+
+    #[test]
+    fn merge_references_keeps_lsp_only_locations() {
+        // A location only LSP knows about must survive the merge.
+        let text = vec![("a.c".to_string(), 1, "a".to_string())];
+        let lsp = vec![("b.c".to_string(), 2, "b".to_string())];
+        let merged = CodeIntelEngine::merge_references(text, lsp);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&("b.c".to_string(), 2, "b".to_string())));
     }
 
     #[test]
