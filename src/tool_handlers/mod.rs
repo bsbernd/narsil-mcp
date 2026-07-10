@@ -265,16 +265,26 @@ impl ArgExtractor for Value {
 }
 
 /// Map well-known argument-name aliases onto the canonical names used by the
-/// handlers, in place. Clients commonly send `file_path` for the path
-/// argument, but the schema (and every handler) reads `path`; without this an
-/// unrecognised `file_path` would leave `path` absent and silently degrade to
-/// an empty path downstream (git blame -- '' etc.). An explicit `path` always
-/// wins.
+/// handlers, in place. Clients reach for a plausible-but-wrong key
+/// (`file_path` for `path`, `repo_path` for `repo`, `symbol_name` for
+/// `symbol`); the schema and every handler read the canonical key, so an
+/// unrecognised alias would leave the canonical key absent and silently
+/// degrade downstream — an empty path (git blame -- ''), or an ignored `repo`
+/// that falls through to an all-repos search. An explicit canonical key always
+/// wins over its alias.
 fn normalize_arg_aliases(args: &mut Value) {
+    // (canonical, alias) pairs.
+    const ALIASES: &[(&str, &str)] = &[
+        ("path", "file_path"),
+        ("repo", "repo_path"),
+        ("symbol", "symbol_name"),
+    ];
     if let Some(obj) = args.as_object_mut() {
-        if !obj.contains_key("path") {
-            if let Some(file_path) = obj.get("file_path").cloned() {
-                obj.insert("path".to_string(), file_path);
+        for (canonical, alias) in ALIASES {
+            if !obj.contains_key(*canonical) {
+                if let Some(value) = obj.get(*alias).cloned() {
+                    obj.insert((*canonical).to_string(), value);
+                }
             }
         }
     }
@@ -356,5 +366,39 @@ mod tests {
         let mut args = serde_json::json!({"repo": "r"});
         normalize_arg_aliases(&mut args);
         assert_eq!(args.get_str("path"), None);
+    }
+
+    #[test]
+    fn test_repo_path_aliases_to_repo() {
+        // Regression: `repo_path` is a common wrong guess; unaliased it leaves
+        // `repo` absent, which for search_code falls through to an all-repos
+        // search instead of scoping to the intended repo.
+        let mut args = serde_json::json!({"repo_path": "/src/x", "query": "q"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("repo"), Some("/src/x"));
+    }
+
+    #[test]
+    fn test_explicit_repo_wins_over_repo_path() {
+        let mut args = serde_json::json!({"repo": "real", "repo_path": "alias"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("repo"), Some("real"));
+    }
+
+    #[test]
+    fn test_symbol_name_aliases_to_symbol() {
+        // Regression: `symbol_name` (the engine's own param name) is a natural
+        // guess; unaliased it leaves `symbol` empty and require_arg rejects the
+        // call with a misleading "non-empty 'symbol'" error.
+        let mut args = serde_json::json!({"repo": "r", "symbol_name": "foo"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("symbol"), Some("foo"));
+    }
+
+    #[test]
+    fn test_explicit_symbol_wins_over_symbol_name() {
+        let mut args = serde_json::json!({"symbol": "real", "symbol_name": "alias"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("symbol"), Some("real"));
     }
 }
