@@ -742,12 +742,21 @@ async fn test_compile_commands_filter_applied_at_threshold() -> Result<()> {
     }
 
     let repo_path = repo.path().canonicalize()?;
-    // Database lists only src/f0.c, so f1..f4 must be filtered out.
-    let kept = repo_path.join("src/f0.c");
+    // List 2 of the 5 sources (40%): enough to clear the 25% coverage floor. A
+    // manifest covering fewer is treated as a stale sliver and ignored, so with
+    // only one listed the filter would (correctly) not engage at all. With the
+    // floor cleared the filter engages and the 3 unlisted sources are dropped.
+    let entry = |file: std::path::PathBuf| {
+        format!(
+            "{{\"directory\":\"{dir}\",\"file\":\"{file}\",\"command\":\"cc -c {file}\"}}",
+            dir = repo_path.display(),
+            file = file.display(),
+        )
+    };
     let cc = format!(
-        "[{{\"directory\":\"{dir}\",\"file\":\"{file}\",\"command\":\"cc -c {file}\"}}]",
-        dir = repo_path.display(),
-        file = kept.display(),
+        "[{},{}]",
+        entry(repo_path.join("src/f0.c")),
+        entry(repo_path.join("src/f1.c")),
     );
     repo.add_rust_file("compile_commands.json", &cc)?;
 
@@ -767,11 +776,13 @@ async fn test_compile_commands_filter_applied_at_threshold() -> Result<()> {
     let symbols = engine
         .find_symbols(&repo_key, None, Some("*"), None, None, 100)
         .await?;
-    assert!(
-        symbols.contains("func_0"),
-        "source listed in compile_commands.json must be indexed:\n{symbols}"
-    );
-    for idx in 1..5 {
+    for idx in 0..2 {
+        assert!(
+            symbols.contains(&format!("func_{idx}")),
+            "source listed in compile_commands.json must be indexed; missing func_{idx}:\n{symbols}"
+        );
+    }
+    for idx in 2..5 {
         assert!(
             !symbols.contains(&format!("func_{idx}")),
             "source absent from compile_commands.json must be filtered out; found func_{idx}:\n{symbols}"
