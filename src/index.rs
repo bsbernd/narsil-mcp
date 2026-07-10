@@ -2791,6 +2791,22 @@ impl CodeIntelEngine {
             output.push('\n');
         }
 
+        // A git submodule is indexed as its own repo, not merged into this one
+        // (a nested checkout crosses the git boundary), so a submodule-defined
+        // symbol can surface only its header declaration here while the .c
+        // definition is absent. Point the caller at the submodule to index.
+        let submodules = submodule_paths(&repo_path);
+        if !submodules.is_empty() {
+            output.push_str(&format!(
+                "\n> Note: this repo has git submodule(s): {}. Their sources are indexed \
+                 separately — if a definition looks missing, index the submodule with \
+                 `reindex(repo=\"{}/{}\")`.\n",
+                submodules.join(", "),
+                repo,
+                submodules[0]
+            ));
+        }
+
         // Cache the result with file dependencies for smart invalidation.
         if self.options.cache_enabled {
             self.query_cache
@@ -11694,6 +11710,24 @@ fn is_filename_like(name: &str) -> bool {
         && !name.contains('(')
 }
 
+/// Submodule paths declared in `<repo_root>/.gitmodules`, parsed from the
+/// `path = <p>` entries. Returns empty when there is no .gitmodules file.
+fn submodule_paths(repo_root: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(repo_root.join(".gitmodules")) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("path")
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
 fn get_language_id(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("rs") => "rust",
@@ -12031,6 +12065,25 @@ mod tests {
         let merged = CodeIntelEngine::merge_references(text, lsp);
         assert_eq!(merged.len(), 2);
         assert!(merged.contains(&("b.c".to_string(), 2, "b".to_string())));
+    }
+
+    #[test]
+    fn submodule_paths_parses_gitmodules() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir.path().join(".gitmodules"),
+            "[submodule \"niova-core\"]\n\tpath = niova-core\n\turl = ../niova-core.git\n\
+             [submodule \"other\"]\n\tpath = vendor/other\n",
+        );
+        let mut paths = submodule_paths(dir.path());
+        paths.sort();
+        assert_eq!(paths, vec!["niova-core".to_string(), "vendor/other".to_string()]);
+    }
+
+    #[test]
+    fn submodule_paths_empty_without_gitmodules() {
+        let dir = TempDir::new().unwrap();
+        assert!(submodule_paths(dir.path()).is_empty());
     }
 
     #[test]
