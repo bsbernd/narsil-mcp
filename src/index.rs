@@ -4685,10 +4685,23 @@ impl CodeIntelEngine {
 
         let branch = git_repo.current_branch()?;
         let modified = git_repo.modified_files()?;
+        // Best-effort: no upstream (detached HEAD / no tracking branch) is a
+        // normal state, not an error, so a failure here must not sink the call.
+        let upstream = git_repo.upstream_info().ok().flatten();
 
         let mut output = String::new();
         output.push_str(&format!("# Git Status: {}\n\n", repo_key));
         output.push_str(&format!("**Current Branch**: `{}`\n", branch));
+        match &upstream {
+            Some(up) => {
+                output.push_str(&format!("**Upstream**: `{}`\n", up.upstream));
+                output.push_str(&format!(
+                    "**Ahead**: {} | **Behind**: {}\n",
+                    up.ahead, up.behind
+                ));
+            }
+            None => output.push_str("**Upstream**: *none (no tracking branch)*\n"),
+        }
         output.push_str(&format!("**Modified Files**: {}\n\n", modified.len()));
 
         if !modified.is_empty() {
@@ -4698,6 +4711,15 @@ impl CodeIntelEngine {
             }
         } else {
             output.push_str("*No changes in working tree*\n");
+        }
+
+        if let Some(up) = &upstream {
+            if !up.unpushed.is_empty() {
+                output.push_str("\n## Unpushed Commits\n\n");
+                for commit in &up.unpushed {
+                    output.push_str(&format!("- {}\n", commit));
+                }
+            }
         }
 
         Ok(output)

@@ -45,6 +45,16 @@ pub struct ChangeFrequency {
     pub churn_score: f32, // Higher = more volatile
 }
 
+/// Tracking state of the current branch relative to its upstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamInfo {
+    pub upstream: String,
+    pub ahead: usize,
+    pub behind: usize,
+    /// Subjects of the ahead (unpushed) commits, newest first.
+    pub unpushed: Vec<String>,
+}
+
 /// Git repository interface
 pub struct GitRepo {
     root: std::path::PathBuf,
@@ -491,6 +501,63 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// Tracking state of the current branch versus its upstream. Returns
+    /// `Ok(None)` when there is no upstream (detached HEAD or no tracking
+    /// branch) — that is a normal state, not an error. All args are fixed
+    /// literals, so no validate_input is needed.
+    pub fn upstream_info(&self) -> Result<Option<UpstreamInfo>> {
+        // Upstream ref name, e.g. "origin/main"; non-zero exit => no upstream.
+        let name_out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git rev-parse")?;
+        if !name_out.status.success() {
+            return Ok(None);
+        }
+        let upstream = String::from_utf8_lossy(&name_out.stdout).trim().to_string();
+        if upstream.is_empty() {
+            return Ok(None);
+        }
+
+        // "<behind>\t<ahead>": commits on upstream not HEAD, then HEAD not upstream.
+        let counts_out = Command::new("git")
+            .args(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git rev-list")?;
+        let (mut behind, mut ahead) = (0usize, 0usize);
+        if counts_out.status.success() {
+            let text = String::from_utf8_lossy(&counts_out.stdout);
+            let mut parts = text.split_whitespace();
+            behind = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            ahead = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+
+        // Subjects of the unpushed (ahead) commits, newest first.
+        let mut unpushed = Vec::new();
+        if ahead > 0 {
+            let log_out = Command::new("git")
+                .args(["log", "--format=%h %s", "@{upstream}..HEAD"])
+                .current_dir(&self.root)
+                .output()
+                .context("Failed to run git log")?;
+            if log_out.status.success() {
+                unpushed = String::from_utf8_lossy(&log_out.stdout)
+                    .lines()
+                    .map(|line| line.to_string())
+                    .collect();
+            }
+        }
+
+        Ok(Some(UpstreamInfo {
+            upstream,
+            ahead,
+            behind,
+            unpushed,
+        }))
+    }
+
     /// Check if git is available on the system
     pub fn check_git_available() -> Result<()> {
         let output = Command::new("git")
@@ -584,6 +651,73 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Run a git command in `dir`, asserting success. gpg signing is disabled
+    /// and identity is set via env so the test does not depend on global config.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn test_upstream_info_none_without_tracking_branch() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.txt"), "x").unwrap();
+        run_git(p, &["add", "a.txt"]);
+        run_git(p, &["commit", "-q", "-m", "a"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        assert!(
+            repo.upstream_info().unwrap().is_none(),
+            "a branch with no upstream must report None, not an error"
+        );
+    }
+
+    #[test]
+    fn test_upstream_info_reports_ahead() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.txt"), "1").unwrap();
+        run_git(p, &["add", "a.txt"]);
+        run_git(p, &["commit", "-q", "-m", "base"]);
+        // Use a local branch as the current branch's upstream.
+        run_git(p, &["branch", "up"]);
+        run_git(p, &["branch", "--set-upstream-to=up"]);
+        // One commit past the upstream: ahead by 1, behind by 0.
+        std::fs::write(p.join("a.txt"), "2").unwrap();
+        run_git(p, &["commit", "-qa", "-m", "ahead commit"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let info = repo.upstream_info().unwrap().expect("has upstream");
+        assert_eq!(info.upstream, "up");
+        assert_eq!(info.ahead, 1);
+        assert_eq!(info.behind, 0);
+        assert_eq!(info.unpushed.len(), 1);
+        assert!(
+            info.unpushed[0].contains("ahead commit"),
+            "unpushed subject missing: {:?}",
+            info.unpushed
+        );
+    }
 
     #[test]
     fn test_chrono_lite() {
