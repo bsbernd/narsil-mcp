@@ -577,8 +577,7 @@ async fn main() -> Result<()> {
         Transport::Stdio => "stdio",
         Transport::Sse => "sse",
     };
-    let base_pid_status =
-        pid_status::PidStatus::new(pid_status_transport, pid_status_role, &repos);
+    let base_pid_status = pid_status::PidStatus::new(pid_status_transport, pid_status_role, &repos);
     let _pid_status_entry = pid_status::write_status(&base_pid_status)
         .map_err(|e| warn!("pid status: could not write: {}", e))
         .ok();
@@ -793,7 +792,11 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     })?;
 
     if server_args.repos.is_empty() {
-        server_args.repos = profile.repos.iter().map(|e| e.path().to_path_buf()).collect();
+        server_args.repos = profile
+            .repos
+            .iter()
+            .map(|e| e.path().to_path_buf())
+            .collect();
         // Carry per-repo overrides alongside the flat path list so the path code
         // below stays untouched; the engine keys these by canonical repo path.
         // Fold the profile-group backend defaults into each entry's unset fields.

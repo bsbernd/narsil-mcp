@@ -112,7 +112,11 @@ impl Drop for PidStatusEntry {
         match fs::remove_file(&self.path) {
             Ok(()) => info!("pid status: removed {}", self.path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("pid status: failed to remove {}: {}", self.path.display(), e),
+            Err(e) => warn!(
+                "pid status: failed to remove {}: {}",
+                self.path.display(),
+                e
+            ),
         }
     }
 }
@@ -337,7 +341,10 @@ mod tests {
         let entry = PidStatusEntry { path: path.clone() };
         assert!(entry.file_path().exists());
         drop(entry);
-        assert!(!path.exists(), "guard should remove the status file on drop");
+        assert!(
+            !path.exists(),
+            "guard should remove the status file on drop"
+        );
     }
 
     #[test]

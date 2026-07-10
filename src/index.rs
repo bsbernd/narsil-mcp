@@ -566,10 +566,7 @@ impl CodeIntelEngine {
             let key = match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
                 Ok(key) => key,
                 Err(e) => {
-                    warn!(
-                        "per-repo config ignored for {:?}: {}",
-                        entry.path, e
-                    );
+                    warn!("per-repo config ignored for {:?}: {}", entry.path, e);
                     continue;
                 }
             };
@@ -850,7 +847,10 @@ impl CodeIntelEngine {
                 warn!("Repository path does not exist: {:?}", repo_path);
             }
             done_repos += 1;
-            info!("Indexed {}/{} repositories: {}", done_repos, total_repos, repo_name);
+            info!(
+                "Indexed {}/{} repositories: {}",
+                done_repos, total_repos, repo_name
+            );
         }
 
         // Persist the freshly-built index so subsequent startups skip embedding
@@ -1419,17 +1419,24 @@ impl CodeIntelEngine {
         let index_filter_rules = self.repo_index_filter_rules(&repo_name);
         let repo_index_filtered = !index_filter_rules.is_empty()
             && files.iter().any(|f| {
-                let rel = f.strip_prefix(path).unwrap_or(f).to_string_lossy().into_owned();
+                let rel = f
+                    .strip_prefix(path)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .into_owned();
                 scope_matches(index_filter_rules, &rel, &f.to_string_lossy())
             });
         if repo_index_filtered {
             let before = files.len();
             let include = compile_scope(&self.options.include);
             files.retain(|f| {
-                let rel = f.strip_prefix(path).unwrap_or(f).to_string_lossy().into_owned();
+                let rel = f
+                    .strip_prefix(path)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .into_owned();
                 let abs = f.to_string_lossy();
-                scope_matches(index_filter_rules, &rel, &abs)
-                    || scope_matches(&include, &rel, &abs)
+                scope_matches(index_filter_rules, &rel, &abs) || scope_matches(&include, &rel, &abs)
             });
             info!(
                 "--index-filter: {} → {} files ({} filtered out) in {}",
@@ -2880,8 +2887,12 @@ impl CodeIntelEngine {
         // (it can span more lines than the struct it implements). reduce() keeps
         // the first match on ties and yields None when nothing matches,
         // preserving the gtags fallback below.
-        let definition_rank =
-            |s: &Symbol| (!matches!(s.kind, SymbolKind::Implementation), s.line_count());
+        let definition_rank = |s: &Symbol| {
+            (
+                !matches!(s.kind, SymbolKind::Implementation),
+                s.line_count(),
+            )
+        };
         // qualified_name is rarely populated by the extractors, so a caller-supplied
         // "Type::method" (the natural way to name an inherent-impl method) would
         // otherwise never match anything but the bare method name itself.
@@ -3042,8 +3053,8 @@ impl CodeIntelEngine {
         let tokens: Vec<String> = query_lower.split_whitespace().map(String::from).collect();
         let multi_token = tokens.len() > 1;
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
-        // Each hit is paired with its owning repo root so cross-repo searches
-        // can name where the hit lives.
+                                                            // Each hit is paired with its owning repo root so cross-repo searches
+                                                            // can name where the hit lives.
         let mut results: Vec<(String, CodeExcerpt)> = Vec::new();
 
         let repos_to_search: Vec<String> = match repo {
@@ -3079,24 +3090,25 @@ impl CodeIntelEngine {
         };
 
         // Build a context excerpt centred on the 0-based line index `center`.
-        let make_excerpt = |lines: &[&str], center: usize, rel_path: &str, score: f32| -> CodeExcerpt {
-            let start = center.saturating_sub(3);
-            let end = (center + 4).min(lines.len());
-            let excerpt_content: String = lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(i, l)| format!("{:4} | {}", start + i + 1, l))
-                .collect::<Vec<_>>()
-                .join("\n");
-            CodeExcerpt {
-                file_path: rel_path.to_string(),
-                start_line: start + 1,
-                end_line: end,
-                content: excerpt_content,
-                language: get_language_id(rel_path).to_string(),
-                relevance_score: score,
-            }
-        };
+        let make_excerpt =
+            |lines: &[&str], center: usize, rel_path: &str, score: f32| -> CodeExcerpt {
+                let start = center.saturating_sub(3);
+                let end = (center + 4).min(lines.len());
+                let excerpt_content: String = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{:4} | {}", start + i + 1, l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                CodeExcerpt {
+                    file_path: rel_path.to_string(),
+                    start_line: start + 1,
+                    end_line: end,
+                    content: excerpt_content,
+                    language: get_language_id(rel_path).to_string(),
+                    relevance_score: score,
+                }
+            };
 
         // Pass 1: lines containing the whole phrase, or (for a multi-word
         // query) every token in any order.
@@ -3969,8 +3981,12 @@ impl CodeIntelEngine {
         repo_scoped: bool,
         mut symbols: Vec<Symbol>,
     ) -> Vec<Symbol> {
-        if self.lsp_augment_allows(repo_name, repo_scoped, relative_path, &abs_path.to_string_lossy())
-            && self.lsp_repo_enabled(repo_path)
+        if self.lsp_augment_allows(
+            repo_name,
+            repo_scoped,
+            relative_path,
+            &abs_path.to_string_lossy(),
+        ) && self.lsp_repo_enabled(repo_path)
         {
             if let Some(lsp) = &self.lsp_manager {
                 let lang = get_language_from_path(&abs_path.to_string_lossy());
@@ -4366,11 +4382,7 @@ impl CodeIntelEngine {
                                             lsp.active_cxx_backends_for(repo_path);
                                         for &backend in &active_backends {
                                             match lsp
-                                                .get_document_symbols(
-                                                    backend,
-                                                    &change.path,
-                                                    &lang,
-                                                )
+                                                .get_document_symbols(backend, &change.path, &lang)
                                                 .await
                                             {
                                                 Ok(mut lsp_syms) => {
@@ -12050,7 +12062,11 @@ mod tests {
 
         let merged = CodeIntelEngine::merge_references(text, lsp);
 
-        assert_eq!(merged.len(), 3, "duplicate (path,line) must collapse: {merged:?}");
+        assert_eq!(
+            merged.len(),
+            3,
+            "duplicate (path,line) must collapse: {merged:?}"
+        );
         assert!(merged.contains(&("chunk_remove.c".to_string(), 397, "def".to_string())));
         assert!(merged.contains(&("nisd_write.c".to_string(), 581, "call".to_string())));
         // primary (text) content wins on the shared declaration location.
@@ -12077,7 +12093,10 @@ mod tests {
         );
         let mut paths = submodule_paths(dir.path());
         paths.sort();
-        assert_eq!(paths, vec!["niova-core".to_string(), "vendor/other".to_string()]);
+        assert_eq!(
+            paths,
+            vec!["niova-core".to_string(), "vendor/other".to_string()]
+        );
     }
 
     #[test]

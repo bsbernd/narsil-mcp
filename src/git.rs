@@ -508,7 +508,12 @@ impl GitRepo {
     pub fn upstream_info(&self) -> Result<Option<UpstreamInfo>> {
         // Upstream ref name, e.g. "origin/main"; non-zero exit => no upstream.
         let name_out = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git rev-parse")?;

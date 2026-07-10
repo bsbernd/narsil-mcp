@@ -35,9 +35,12 @@ impl TestRepo {
 /// alive (the engine reads/writes under it for the test's duration).
 async fn engine_for(repo_paths: Vec<PathBuf>) -> Result<(CodeIntelEngine, TempDir)> {
     let index_dir = TempDir::new()?;
-    let engine =
-        CodeIntelEngine::with_options(index_dir.path().to_path_buf(), repo_paths, EngineOptions::default())
-            .await?;
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        repo_paths,
+        EngineOptions::default(),
+    )
+    .await?;
     engine.complete_initialization().await?;
     Ok((engine, index_dir))
 }
@@ -81,7 +84,10 @@ async fn test_search_code_multi_token_non_adjacent() -> Result<()> {
 #[tokio::test]
 async fn test_search_code_phrase_on_one_line_no_fallback() -> Result<()> {
     let repo = TestRepo::new()?;
-    repo.add_file("src/a.c", "int struct_tool_config_marker;\nstruct tool_config x;\n")?;
+    repo.add_file(
+        "src/a.c",
+        "int struct_tool_config_marker;\nstruct tool_config x;\n",
+    )?;
     let repo_path = repo.path().canonicalize()?;
     let (engine, _index) = engine_for(vec![repo_path.clone()]).await?;
 

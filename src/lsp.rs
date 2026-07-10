@@ -895,7 +895,11 @@ impl LspManager {
     fn ccls_cache_dir(repo: &Path) -> PathBuf {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(repo.to_string_lossy().as_bytes());
-        let hash: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        let hash: String = digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect();
         let base = directories::BaseDirs::new()
             .map(|dirs| dirs.cache_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/tmp"));
