@@ -2121,6 +2121,7 @@ impl CodeIntelEngine {
         // declarations, not only resolved calls), so these edges are weaker —
         // recorded via the GTAGS bit so the consumer can tell them apart.
         let gtags_phase_start = std::time::Instant::now();
+        #[allow(clippy::type_complexity)]
         let mut gtags_refs: Vec<(String, Vec<(String, usize, String)>)> = Vec::new();
         if let Some(gtags) = gtags {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
@@ -3405,6 +3406,9 @@ impl CodeIntelEngine {
         let first = start_line.saturating_sub(1);
         let window_end = (first + 8).min(end_line).min(lines.len());
 
+        // line_idx is returned as the matched line number, so indexing is the
+        // loop's purpose, not an incidental cursor.
+        #[allow(clippy::needless_range_loop)]
         for line_idx in first..window_end {
             let line = lines[line_idx];
             let mut search_from = 0;

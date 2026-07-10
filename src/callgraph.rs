@@ -196,6 +196,7 @@ impl CallGraph {
     ///   - if `source` outranks the current canonical confirmer it wins the
     ///     call-site line/column, demoting the old line into `line_conflicts`;
     ///   - otherwise a differing line is recorded in `line_conflicts`.
+    ///
     /// A pair not already present is inserted with `confirmed_by = {source}`.
     /// Only existing caller/callee nodes are touched — tree-sitter provides the
     /// node baseline.
@@ -363,7 +364,7 @@ impl CallGraph {
             let key = Self::qualified_key(path, &func.name);
             self.name_index
                 .entry(func.name.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(key.clone());
             self.nodes.insert(key, func.clone());
         }
@@ -2932,7 +2933,7 @@ if __name__ == \"__main__\":
         graph
             .name_index
             .entry(node.name.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(key.clone());
         graph.nodes.insert(key, node);
     }

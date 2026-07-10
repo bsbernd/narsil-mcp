@@ -1445,6 +1445,9 @@ fn name_anchor(content: &str, name: &str, start_line: usize) -> Option<(u32, u32
     }
     let lines: Vec<&str> = content.lines().collect();
     let end = (start_line + 8).min(lines.len());
+    // line_idx is returned as the matched line number, so indexing is the
+    // loop's purpose, not an incidental cursor.
+    #[allow(clippy::needless_range_loop)]
     for line_idx in start_line..end {
         let line = lines[line_idx];
         let mut search_from = 0;

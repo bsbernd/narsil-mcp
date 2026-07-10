@@ -50,6 +50,8 @@ impl SizeExpr {
     ///
     /// Folds constants, flattens nested sums, and returns the result
     /// in canonical form (see [`SizeExpr::Sum`] for invariants).
+    // Inherent symbolic fold over SizeExpr, not std::ops::Add on values.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Self) -> Self {
         if matches!(self, SizeExpr::Unknown) || matches!(other, SizeExpr::Unknown) {
             return SizeExpr::Unknown;
@@ -60,7 +62,7 @@ impl SizeExpr {
         flatten_into(self, &mut constant_sum, &mut symbolic_terms);
         flatten_into(other, &mut constant_sum, &mut symbolic_terms);
 
-        symbolic_terms.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+        symbolic_terms.sort_by_key(|left| left.to_string());
         if constant_sum > 0 {
             symbolic_terms.push(SizeExpr::Constant(constant_sum));
         }
@@ -2292,7 +2294,7 @@ pub fn parse_size_expression(node: Node<'_>, source: &str) -> SizeExpr {
 }
 
 fn parse_c_integer(text: &str) -> SizeExpr {
-    let cleaned = text.trim_end_matches(|byte: char| matches!(byte, 'u' | 'U' | 'l' | 'L'));
+    let cleaned = text.trim_end_matches(['u', 'U', 'l', 'L']);
     if let Some(hex_digits) = cleaned
         .strip_prefix("0x")
         .or_else(|| cleaned.strip_prefix("0X"))
@@ -3247,7 +3249,7 @@ mod tests {
                     }";
         let findings = run_scan(code);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].snippet.contains("longer"), true);
+        assert!(findings[0].snippet.contains("longer"));
     }
 
     #[test]

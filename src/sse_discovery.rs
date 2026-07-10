@@ -446,7 +446,7 @@ mod tests {
 
         // Seed the file with a foreign entry first.
         let foreign = record("http://127.0.0.1:7600", &["/elsewhere"]);
-        write_records(&path, &[foreign.clone()]);
+        write_records(&path, std::slice::from_ref(&foreign));
 
         // Register our own; let the guard drop at the end of the block.
         let our_url = "http://127.0.0.1:7557";
