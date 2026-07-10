@@ -9335,6 +9335,17 @@ impl CodeIntelEngine {
         let mut output = String::new();
         output.push_str(&format!("# Symbol Usages: '{}'\n\n", symbol_name));
 
+        // A file name is not a symbol; the substring match below still finds
+        // #include / mention sites, so return them but say what happened rather
+        // than let the caller read a filename query as a real symbol lookup.
+        if is_filename_like(symbol_name) {
+            output.push_str(
+                "> Note: this looks like a file name, not a symbol. The results below are \
+                 lines that mention it (e.g. `#include` sites). For a broader text search, \
+                 use search_code.\n\n",
+            );
+        }
+
         if !definitions.is_empty() {
             output.push_str("## Definitions\n\n");
             for (file, line, kind) in &definitions {
@@ -11668,6 +11679,21 @@ fn get_file_icon(name: &str) -> &'static str {
     }
 }
 
+/// True when a string looks like a source/header file name rather than a
+/// symbol: it ends in a known source extension and contains none of the
+/// characters that only appear in symbol expressions (`::`, spaces, `(`).
+fn is_filename_like(name: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".h", ".hpp", ".hh", ".hxx", ".c", ".cc", ".cpp", ".cxx", ".rs", ".py", ".js", ".ts",
+        ".go", ".java",
+    ];
+    let lower = name.to_lowercase();
+    EXTS.iter().any(|ext| lower.ends_with(ext))
+        && !name.contains("::")
+        && !name.contains(' ')
+        && !name.contains('(')
+}
+
 fn get_language_id(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("rs") => "rust",
@@ -12005,6 +12031,18 @@ mod tests {
         let merged = CodeIntelEngine::merge_references(text, lsp);
         assert_eq!(merged.len(), 2);
         assert!(merged.contains(&("b.c".to_string(), 2, "b".to_string())));
+    }
+
+    #[test]
+    fn is_filename_like_distinguishes_files_from_symbols() {
+        assert!(is_filename_like("mount_i_linux.h"));
+        assert!(is_filename_like("chunk_remove.c"));
+        assert!(is_filename_like("index.rs"));
+        // Symbols, not files.
+        assert!(!is_filename_like("CodeIntelEngine"));
+        assert!(!is_filename_like("Type::method"));
+        assert!(!is_filename_like("fn foo("));
+        assert!(!is_filename_like("validate_path"));
     }
 
     #[test]
