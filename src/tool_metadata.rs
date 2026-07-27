@@ -2056,7 +2056,7 @@ lazy_static! {
                 "properties": {
                     "host": {"type": "string", "description": "Git host (default: github.com)"},
                     "owner": {"type": "string", "description": "Repository owner"},
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string", "description": "Repository name (as in host/owner/repo), not a local path"},
                     "commit": {"type": "string", "description": "Commit SHA or 'latest' (default: latest)"}
                 },
                 "required": ["owner", "repo"]
