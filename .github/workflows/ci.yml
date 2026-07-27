@@ -50,6 +50,12 @@ jobs:
       - name: Clippy (CI features)
         run: cargo clippy --all-targets --features "$CI_FEATURES" -- -D warnings
 
+      # A tool added to tool_metadata.rs without an ExposeGroup is unreachable
+      # under --expose and absent from docs/tools.md; fail here rather than
+      # ship it invisible.
+      - name: Tool reference is current
+        run: scripts/check-docs-tools.sh
+
   # Main test suite
   test:
     name: Test (${{ matrix.os }})

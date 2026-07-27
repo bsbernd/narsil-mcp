@@ -423,6 +423,7 @@ narsil-mcp config profiles
 ```
 
 **Learn More:**
+- [Tool Reference](docs/tools.md) - All 71 tools, the `--expose` groups, and known caveats
 - [Configuration Guide](docs/configuration.md) - Full configuration reference
 - [Installation Guide](docs/INSTALL.md) - Platform-specific installation
 
