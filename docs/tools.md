@@ -5,7 +5,7 @@ group it belongs to, and which ones not to trust.
 
 Tool schemas cost context on **every** request, not once per session: the MCP
 protocol is stateless, so the client re-sends the whole tool block with each
-turn. The full set is 34,451 bytes (~8.6k tokens). `--expose` selects which
+turn. The full set is 33,276 bytes (~8.3k tokens). `--expose` selects which
 groups ship, so a session that only navigates source does not carry the
 security scanner's schemas in its context window all day.
 
@@ -15,6 +15,7 @@ security scanner's schemas in its context window all day.
 $ narsil-mcp --expose code,git            # recommended default
 $ narsil-mcp --expose code                # navigation only
 $ narsil-mcp --expose code,git,security   # when auditing
+$ narsil-mcp --expose code,git,analysis   # when you want metrics and graphs
 ```
 
 Comma-separated and composable. `base` is always included. An empty `--expose`
@@ -71,22 +72,31 @@ with a guard rail, not an access-control boundary.
 
 | group | tools | schema bytes | in the recommended default? |
 |---|---|---|---|
-| `base` | 7 | 2,684 | always |
-| `code` | 27 | 15,061 | yes |
+| `base` | 7 | 2,426 | always |
+| `code` | 20 | 11,570 | yes |
 | `git` | 9 | 3,205 | yes |
-| `lint` | 5 | 2,055 | no — the compiler already reports these |
-| `security` | 11 | 5,621 | no — enable for an audit |
+| `analysis` | 7 | 2,949 | no — derived from source you can already read |
+| `lint` | 5 | 1,987 | no — the compiler already reports these |
+| `security` | 11 | 5,519 | no — enable for an audit |
 | `supply-chain` | 4 | 1,933 | no — enable for a dependency review |
-| `retrieval` | 8 | 3,898 | no — see caveats |
+| `retrieval` | 8 | 3,694 | no — see caveats |
 
-`--expose code,git` is 43 tools and 20,948 bytes (~5.2k tokens), 61% of the
+`--expose code,git` is 36 tools and 17,199 bytes (~4.3k tokens), 52% of the
 full block.
 
-A group earns a name when it answers a **different question**, not when it
-answers the same question at a different scale. That is why repo-wide call
-graphs live in `code` next to the per-symbol `get_callers` rather than in a
-group of their own, and why `lint` is separate: "does it compile clean" is a
-different question, and one your build already answers.
+The line between `code` and the two opt-in analysis groups is **retrieval
+versus restatement**. A tool belongs in `code` when it answers something the
+caller cannot work out from source it is already holding — where a symbol
+lives, who calls it, what the LSP knows. A tool belongs in `analysis` when its
+answer is derivable from code already in view: a complexity number, a listing
+of the branches in a function you are reading. Paying schema bytes on every
+request to offer the second kind is a bad trade. `lint` is separate again:
+"does it compile clean" is a real question, but one your build already answers.
+
+Two tools sit in `code` despite looking like analysis. `get_call_graph` returns
+callers, callees and metrics in one round trip instead of two calls, and
+`get_reaching_definitions` answers "where did this value come from" across a
+function too long to hold in view — both are retrieval in substance.
 
 ### `base` — which repos, and is the index fresh
 
@@ -97,9 +107,8 @@ the documented first move.
 ### `code` — what is this code
 
 The bulk of everyday use: symbols, references, search, file text, LSP lookups,
-call and import edges both per-symbol and as whole graphs, complexity and
-cycles, per-function control-flow and def-use views. Seven of these tools carry
-87% of all recorded traffic.
+call edges per-symbol and as a graph, def-use chains. Seven of these tools
+carry 87% of all recorded traffic.
 
 ### `git` — why is it like this
 
@@ -107,6 +116,20 @@ Blame, file and symbol history, commit diffs, branch state, contributors.
 Belongs in the default: with git tools absent an agent told to use narsil for
 blame finds nothing and falls back to raw `git`, which is what routing it here
 was meant to prevent.
+
+### `analysis` — derived from code you can already read
+
+Complexity metrics, connectivity hotspots, import graphs, cycles, and
+per-function control and data flow. A model holding the source can work all of
+this out unaided, so it is off by default.
+
+Enable it deliberately, and read the caveats first — four of the seven return
+wrong answers today: `get_function_hotspots` ranks std method names
+(`len`, `is_empty`) as the codebase's most-connected functions,
+`find_unused_exports` reports 100% of exports as unused, `get_import_graph`
+repeats a row per dependent, and `get_data_flow` takes ~13 s for one function
+and emits the false positives described below. `get_complexity` and
+`find_circular_imports` are correct.
 
 ### `lint` — does it compile clean
 
@@ -163,24 +186,17 @@ Mostly diagnostics for the machinery under `semantic_search` and
 | tool | required args | what it answers |
 |---|---|---|
 | `find_call_path` | from, to | Find the call path between two functions |
-| `find_circular_imports` | — | Detect circular import dependencies in the codebase |
 | `find_references` | symbol | Every reference to a symbol, unioning LSP hits with text matches |
 | `find_symbol_usages` | symbol | Usages of a symbol including its imports and re-exports, cross-language aware for JS/TS |
 | `find_symbols` | — | Find structs, classes, enums, interfaces, functions and methods by name pattern or kind |
-| `find_unused_exports` | — | Detect exported symbols never imported by other files in repo |
 | `get_call_graph` | — | Callers, callees and complexity for one function in a single call, or the whole repository's graph |
 | `get_callees` | function | Find functions called by a given function |
 | `get_callers` | function | Find functions that call a given function |
-| `get_complexity` | function | Get complexity metrics (cyclomatic, cognitive) for a function |
-| `get_control_flow` | path, function | Get the control flow graph (CFG) for a function, showing basic blocks, branches, and loops |
-| `get_data_flow` | path, function | Get data flow analysis for a function, showing variable definitions and uses |
 | `get_dependencies` | path | Imports and module dependencies of one source file |
 | `get_excerpt` | path, lines | Context around a list of specific line numbers, expanded to function or class boundaries |
 | `get_export_map` | path | Get the export map for a file or module showing all exported symbols and their types |
 | `get_file` | path | File contents, optionally one contiguous start_line..end_line range |
-| `get_function_hotspots` | — | Find highly connected functions (potential refactoring targets) based on call graph analysis |
 | `get_hover_info` | path, line, character | Get hover information (type info, documentation) for a symbol at a specific position |
-| `get_import_graph` | — | Build and analyze the import/dependency graph for a codebase |
 | `get_project_structure` | — | Get the directory structure and key files of a repository |
 | `get_reaching_definitions` | path, function | Get reaching definitions analysis - which variable assignments reach each point in the code |
 | `get_symbol_definition` | symbol | Get the full definition of a symbol with surrounding context |
@@ -203,6 +219,18 @@ Mostly diagnostics for the machinery under `semantic_search` and
 | `get_modified_files` | — | Get list of modified files in the working tree |
 | `get_recent_changes` | — | Get recent commits across the repository |
 | `get_symbol_history` | path, symbol | Get commits that modified a specific symbol/function |
+
+### `analysis`
+
+| tool | required args | what it answers |
+|---|---|---|
+| `find_circular_imports` | — | Detect circular import dependencies in the codebase |
+| `find_unused_exports` | — | Detect exported symbols never imported by other files in repo |
+| `get_complexity` | function | Get complexity metrics (cyclomatic, cognitive) for a function |
+| `get_control_flow` | path, function | Get the control flow graph (CFG) for a function, showing basic blocks, branches, and loops |
+| `get_data_flow` | path, function | Get data flow analysis for a function, showing variable definitions and uses |
+| `get_function_hotspots` | — | Find highly connected functions (potential refactoring targets) based on call graph analysis |
+| `get_import_graph` | — | Build and analyze the import/dependency graph for a codebase |
 
 ### `lint`
 
