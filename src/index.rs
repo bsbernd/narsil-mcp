@@ -3312,6 +3312,7 @@ impl CodeIntelEngine {
         symbol: &str,
         _include_definition: bool,
         exclude_tests: Option<bool>,
+        window: response_budget::ListWindow,
     ) -> Result<String> {
         use crate::security_rules::is_test_file;
 
@@ -3344,7 +3345,7 @@ impl CodeIntelEngine {
         if !lsp_enabled {
             // Fast path: no LSP, just do text search
             let text_refs = filter_tests(self.text_search_references(&repo_path, symbol));
-            return Ok(self.format_references(&text_refs, false, symbol));
+            return Ok(self.format_references(&text_refs, false, symbol, window));
         }
 
         // LSP is enabled - race text search against LSP with a grace period
@@ -3372,7 +3373,7 @@ impl CodeIntelEngine {
         let lsp_used = !lsp_refs.is_empty();
         let merged = Self::merge_references(text_refs, lsp_refs);
 
-        Ok(self.format_references(&merged, lsp_used, symbol))
+        Ok(self.format_references(&merged, lsp_used, symbol, window))
     }
 
     /// Merge two reference lists, deduplicated by (path, line). `primary`'s
@@ -3664,6 +3665,7 @@ impl CodeIntelEngine {
         references: &[(String, usize, String)],
         lsp_enhanced: bool,
         symbol: &str,
+        window: response_budget::ListWindow,
     ) -> String {
         let mut output = String::new();
         output.push_str(&format!(
@@ -3673,7 +3675,8 @@ impl CodeIntelEngine {
         ));
         output.push_str(&format!("Found {} references\n\n", references.len()));
 
-        for (path, line, content) in references {
+        let (page, capped) = response_budget::cap(references, window, "find_references");
+        for (path, line, content) in page {
             output.push_str(&format!(
                 "- `{}:{}` - `{}`\n",
                 path,
@@ -3684,6 +3687,18 @@ impl CodeIntelEngine {
                     content
                 }
             ));
+        }
+
+        if capped.truncated() {
+            let dropped = &references[(capped.offset + capped.shown).min(references.len())..];
+            output.push_str("\n## Remaining references by file\n\n");
+            output.push_str(&response_budget::by_file_summary(
+                dropped,
+                |(path, _, _)| path.as_str(),
+                20,
+            ));
+            output.push('\n');
+            output.push_str(&capped.footer());
         }
 
         output

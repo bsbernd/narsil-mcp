@@ -5,6 +5,12 @@ use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
 use crate::index::CodeIntelEngine;
+use crate::response_budget::DEFAULT_LIST_LIMIT;
+
+/// Symbol rows returned when the caller passes no `limit`. Higher than the
+/// generic list default because a symbol line is the whole answer, but far
+/// below the old 500 — that was ~80 KB of response on a large repo.
+const DEFAULT_SYMBOL_LIMIT: u64 = 100;
 
 /// Handler for find_symbols tool
 pub struct FindSymbolsHandler;
@@ -24,7 +30,7 @@ impl ToolHandler for FindSymbolsHandler {
         let pattern = args.get_str("pattern").or_else(|| args.get_str("query"));
         let file_pattern = args.get_str("file_pattern");
         let exclude_tests = args.get_bool("exclude_tests");
-        let limit = args.get_u64_or("limit", 500) as usize;
+        let limit = args.get_u64_or("limit", DEFAULT_SYMBOL_LIMIT) as usize;
         engine
             .find_symbols(
                 repo,
@@ -71,8 +77,9 @@ impl ToolHandler for FindReferencesHandler {
         let symbol = super::require_arg(&args, "symbol", "find_references")?;
         let include_def = args.get_bool_or("include_definition", true);
         let exclude_tests = args.get_bool("exclude_tests");
+        let window = super::list_window(&args, DEFAULT_LIST_LIMIT as u64);
         engine
-            .find_references(repo, symbol, include_def, exclude_tests)
+            .find_references(repo, symbol, include_def, exclude_tests, window)
             .await
     }
 }

@@ -1013,6 +1013,50 @@ fn test_find_references() -> Result<()> {
     Ok(())
 }
 
+/// find_references was uncapped — 60 KB for `kmalloc` on linux.git. The page
+/// must be bounded and must name the follow-up call.
+#[test]
+fn test_find_references_caps_and_pages() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let mut body = String::from("pub struct Widget;\n");
+    for idx in 0..80 {
+        body.push_str(&format!(
+            "pub fn use_{}(w: Widget) -> Widget {{ w }}\n",
+            idx
+        ));
+    }
+    repo.add_rust_file("src/lib.rs", &body)?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_references",
+        json!({ "repo": repo_name, "symbol": "Widget" }),
+    )?;
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    let listing = content
+        .split("## Remaining references by file")
+        .next()
+        .unwrap();
+    assert!(
+        listing.matches("\n- `").count() <= 50,
+        "default page must be capped at 50: {}",
+        content
+    );
+    assert!(
+        content.contains("find_references(offset=50)"),
+        "footer must name the next page: {}",
+        content
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_get_dependencies() -> Result<()> {
     let repo = TestRepo::new()?;

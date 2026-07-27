@@ -348,7 +348,7 @@ lazy_static! {
                     "query": {"type": "string", "description": "Alias for 'pattern'."},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.rs', 'src/**/*.py')"},
                     "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
-                    "limit": {"type": "integer", "description": "Maximum number of symbols to return (default: 500)"}
+                    "limit": {"type": "integer", "description": "Maximum number of symbols to return (default: 100)"}
                 },
                 "required": ["repo"]
             }),
@@ -391,7 +391,9 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "symbol": {"type": "string", "description": "Symbol name to find references for"},
                     "include_definition": {"type": "boolean", "description": "Include the definition location (default: true)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"}
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files from results (default: false)"},
+                    "limit": {"type": "integer", "description": "Max references to list (default: 50; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first reference to list (default: 0)"}
                 },
                 "required": ["repo", "symbol"]
             }),
