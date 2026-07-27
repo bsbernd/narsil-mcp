@@ -140,15 +140,15 @@ async fn test_resolve_repo_rejects_arbitrary_paths() {
     engine.complete_initialization().await.unwrap();
 
     // Arbitrary filesystem paths should NOT resolve as repos.
-    let result = engine.get_project_structure("/etc", 3).await;
+    let result = engine.get_project_structure("/etc", 3, 0, 0).await;
     assert!(result.is_err(), "Should not allow /etc as a repo path");
 
-    let result = engine.get_project_structure("/tmp", 3).await;
+    let result = engine.get_project_structure("/tmp", 3, 0, 0).await;
     assert!(result.is_err(), "Should not allow /tmp as a repo path");
 
     // The full indexed repo path must work.
     let result = engine
-        .get_project_structure(repo_path.to_str().unwrap(), 3)
+        .get_project_structure(repo_path.to_str().unwrap(), 3, 0, 0)
         .await;
     assert!(
         result.is_ok(),
@@ -173,7 +173,7 @@ async fn test_resolve_repo_accepts_indexed_repo_path() {
 
     // The actual indexed path should work when passed directly.
     let result = engine
-        .get_project_structure(repo_path.to_str().unwrap(), 3)
+        .get_project_structure(repo_path.to_str().unwrap(), 3, 0, 0)
         .await;
     assert!(
         result.is_ok(),
@@ -199,7 +199,7 @@ async fn test_resolve_repo_rejects_bare_short_name() {
         .unwrap();
     engine.complete_initialization().await.unwrap();
 
-    let result = engine.get_project_structure("test-repo", 3).await;
+    let result = engine.get_project_structure("test-repo", 3, 0, 0).await;
     let err = result.expect_err("bare short name must be rejected");
     let msg = format!("{:#}", err);
     assert!(
@@ -232,11 +232,11 @@ async fn test_resolve_repo_two_repos_same_basename() {
 
     // Each path resolves to its own repo without collision.
     let result_a = engine
-        .get_project_structure(clone_a.to_str().unwrap(), 3)
+        .get_project_structure(clone_a.to_str().unwrap(), 3, 0, 0)
         .await
         .expect("clone A must resolve");
     let result_b = engine
-        .get_project_structure(clone_b.to_str().unwrap(), 3)
+        .get_project_structure(clone_b.to_str().unwrap(), 3, 0, 0)
         .await
         .expect("clone B must resolve");
 
@@ -271,7 +271,7 @@ async fn test_resolve_repo_subdirectory_resolves_to_root() {
     // Passing the subdirectory must resolve to the repo root, so the project
     // structure includes files outside the subdirectory.
     let result = engine
-        .get_project_structure(sub_path.to_str().unwrap(), 3)
+        .get_project_structure(sub_path.to_str().unwrap(), 3, 0, 0)
         .await
         .expect("subdirectory must resolve to repo root");
     assert!(
@@ -301,7 +301,7 @@ async fn test_resolve_repo_succeeds_before_initialization() {
     // Deliberately do NOT call complete_initialization() — this is the exact
     // startup race window, before the background task has indexed anything.
     let result = engine
-        .get_project_structure(repo_path.to_str().unwrap(), 3)
+        .get_project_structure(repo_path.to_str().unwrap(), 3, 0, 0)
         .await;
     assert!(
         result.is_ok(),
@@ -340,7 +340,7 @@ async fn test_resolve_repo_nested_git_checkout_not_merged() {
     // The nested checkout was never indexed on its own, so it must not
     // silently resolve to the outer repo's index.
     let result = engine
-        .get_project_structure(nested_repo.to_str().unwrap(), 3)
+        .get_project_structure(nested_repo.to_str().unwrap(), 3, 0, 0)
         .await;
     assert!(
         result.is_err(),

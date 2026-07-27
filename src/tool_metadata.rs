@@ -157,7 +157,9 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string", "description": "Repository to query. Pass an absolute path, a relative path, or `.` for the current directory. Use `list_repos` to see all indexed repositories."},
-                    "max_depth": {"type": "integer", "description": "Maximum directory depth (default: 4)"}
+                    "max_depth": {"type": "integer", "description": "Maximum directory depth (default: 4)"},
+                    "max_entries_per_dir": {"type": "integer", "description": "Max entries listed per directory (default: 40; 0 = all)"},
+                    "max_total_entries": {"type": "integer", "description": "Max entries in the whole tree (default: 600; 0 = all)"}
                 },
                 "required": ["repo"]
             }),

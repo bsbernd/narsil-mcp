@@ -335,6 +335,45 @@ fn test_get_project_structure() -> Result<()> {
     Ok(())
 }
 
+/// linux.git rendered 61k tree lines at the default depth because only depth
+/// was bounded. A wide directory must be elided, and the elision must show.
+#[test]
+fn test_get_project_structure_caps_wide_directories() -> Result<()> {
+    let repo = TestRepo::new()?;
+    for idx in 0..120 {
+        repo.add_rust_file(&format!("src/f{}.rs", idx), "fn f() {}")?;
+    }
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_project_structure",
+        json!({
+            "repo": repo_name,
+            "max_depth": 3,
+            "max_entries_per_dir": 40
+        }),
+    )?;
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+
+    assert!(
+        content.contains("(+80 more entries)"),
+        "wide directory must be elided: {}",
+        content
+    );
+    assert!(
+        content.matches(".rs (").count() <= 40,
+        "at most max_entries_per_dir files listed: {}",
+        content
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_find_symbols_rust() -> Result<()> {
     let repo = TestRepo::new()?;

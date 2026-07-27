@@ -2565,15 +2565,34 @@ impl CodeIntelEngine {
             .collect()
     }
 
-    pub async fn get_project_structure(&self, repo: &str, max_depth: usize) -> Result<String> {
+    pub async fn get_project_structure(
+        &self,
+        repo: &str,
+        max_depth: usize,
+        max_entries_per_dir: usize,
+        max_total_entries: usize,
+    ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let path = PathBuf::from(&repo_key);
         let mut output = String::new();
         output.push_str(&format!("# Project Structure: {}\n\n```\n", repo_key));
 
-        self.build_tree(&path, 0, max_depth, &mut output)?;
+        let mut budget = TreeBudget {
+            max_depth,
+            max_entries_per_dir,
+            max_total: max_total_entries,
+            emitted: 0,
+        };
+        self.build_tree(&path, 0, &mut budget, &mut output)?;
 
         output.push_str("```\n");
+        if budget.exhausted() {
+            output.push_str(&format!(
+                "\n*Tree truncated at {} entries. Raise `max_total_entries` / \
+                 `max_entries_per_dir`, or lower `max_depth` for a wider overview.*\n",
+                max_total_entries
+            ));
+        }
         Ok(output)
     }
 
@@ -2581,10 +2600,10 @@ impl CodeIntelEngine {
         &self,
         current: &Path,
         depth: usize,
-        max_depth: usize,
+        budget: &mut TreeBudget,
         output: &mut String,
     ) -> Result<()> {
-        if depth > max_depth {
+        if depth > budget.max_depth || budget.exhausted() {
             return Ok(());
         }
 
@@ -2605,18 +2624,37 @@ impl CodeIntelEngine {
             }
 
             output.push_str(&format!("{}{} {}/\n", indent, "\u{1f4c1}", name));
+            budget.emitted += 1;
 
             let mut entries: Vec<_> = std::fs::read_dir(current)?.filter_map(|e| e.ok()).collect();
             entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name()));
 
-            for entry in entries {
-                self.build_tree(&entry.path(), depth + 1, max_depth, output)?;
+            let shown = if budget.max_entries_per_dir == 0 {
+                entries.len()
+            } else {
+                entries.len().min(budget.max_entries_per_dir)
+            };
+
+            for entry in entries.iter().take(shown) {
+                self.build_tree(&entry.path(), depth + 1, budget, output)?;
+                if budget.exhausted() {
+                    break;
+                }
+            }
+
+            if shown < entries.len() {
+                output.push_str(&format!(
+                    "{}  … (+{} more entries)\n",
+                    indent,
+                    entries.len() - shown
+                ));
             }
         } else {
             let size = std::fs::metadata(current).map(|m| m.len()).unwrap_or(0);
             let size_str = format_size(size);
             let icon = get_file_icon(name);
             output.push_str(&format!("{}{} {} ({})\n", indent, icon, name, size_str));
+            budget.emitted += 1;
         }
 
         Ok(())
@@ -11423,6 +11461,25 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
 }
 
 /// Format a vulnerability finding for output
+/// Caps for one `get_project_structure` walk. Depth alone does not bound the
+/// output: one wide directory is thousands of entries.
+struct TreeBudget {
+    /// Deepest directory level rendered.
+    max_depth: usize,
+    /// Entries listed per directory before the elision marker. 0 = unlimited.
+    max_entries_per_dir: usize,
+    /// Entries the whole walk may emit. 0 = unlimited.
+    max_total: usize,
+    /// Entries emitted so far.
+    emitted: usize,
+}
+
+impl TreeBudget {
+    fn exhausted(&self) -> bool {
+        self.max_total != 0 && self.emitted >= self.max_total
+    }
+}
+
 /// Render one page of a contributor ranking, with the paging footer when the
 /// list was cut.
 fn render_contributors(
