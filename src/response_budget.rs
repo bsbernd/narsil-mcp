@@ -125,6 +125,23 @@ pub fn by_file_summary<T>(dropped: &[T], file_of: impl Fn(&T) -> &str, max_rows:
     output
 }
 
+/// Longest prefix of `text` that fits in `max_bytes` without splitting a
+/// character.
+///
+/// Slicing at a fixed byte offset panics whenever the offset lands inside a
+/// multi-byte character, and the text being shortened here is arbitrary source
+/// content.
+pub fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Backstop for output that was rendered without a cap.
 ///
 /// Cuts on the last line boundary under [`MAX_RESPONSE_BYTES`] and appends a
@@ -136,15 +153,10 @@ pub fn clamp(text: String, tool: &str) -> String {
 
     // Cut at the last newline inside the budget so the response never ends
     // mid-line; fall back to a char boundary when a single line exceeds it.
-    let cut = match text[..MAX_RESPONSE_BYTES].rfind('\n') {
+    let head = truncate_on_char_boundary(&text, MAX_RESPONSE_BYTES);
+    let cut = match head.rfind('\n') {
         Some(nl) => nl + 1,
-        None => {
-            let mut boundary = MAX_RESPONSE_BYTES;
-            while boundary > 0 && !text.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            boundary
-        }
+        None => head.len(),
     };
 
     let dropped = text.len() - cut;
@@ -224,6 +236,27 @@ mod tests {
         assert!(summary.starts_with("- `a.c` — 3\n"));
         assert!(summary.contains("- `b.c` — 2\n"));
         assert!(summary.contains("(+ 2 further files)"));
+    }
+
+    /// `&text[..80]` panics when byte 80 lands inside a character; the helper
+    /// must back up to the boundary instead.
+    #[test]
+    fn truncate_on_char_boundary_never_splits_a_character() {
+        // 'é' is 2 bytes, so byte 80 falls mid-character.
+        let text = format!("{}é{}", "x".repeat(79), "y".repeat(50));
+        let cut = truncate_on_char_boundary(&text, 80);
+        assert_eq!(cut.len(), 79);
+        assert!(cut.chars().all(|c| c == 'x'));
+
+        // A 4-byte emoji straddling the limit backs up the whole character.
+        let emoji = format!("{}🦀tail", "x".repeat(78));
+        assert_eq!(truncate_on_char_boundary(&emoji, 80).len(), 78);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_passes_short_text_through() {
+        assert_eq!(truncate_on_char_boundary("héllo", 80), "héllo");
+        assert_eq!(truncate_on_char_boundary("", 80), "");
     }
 
     #[test]

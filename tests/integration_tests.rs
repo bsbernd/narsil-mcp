@@ -1013,6 +1013,43 @@ fn test_find_references() -> Result<()> {
     Ok(())
 }
 
+/// A match line whose 80th byte lands inside a multi-byte character used to
+/// panic the handler, surfacing as "tool panicked" for a valid query.
+#[test]
+fn test_find_references_handles_multibyte_match_lines() -> Result<()> {
+    let repo = TestRepo::new()?;
+    // The comment puts a 2-byte 'é' across byte offset 80 of the line.
+    repo.add_rust_file(
+        "src/lib.rs",
+        &format!(
+            "pub struct Widget;\n// {}é padding to keep the line well past eighty bytes: Widget\n\
+             pub fn take(w: Widget) -> Widget {{ w }}\n",
+            "x".repeat(76)
+        ),
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_references",
+        json!({ "repo": repo_name, "symbol": "Widget" }),
+    )?;
+
+    assert!(
+        response["error"].is_null(),
+        "multi-byte match line must not panic the handler: {}",
+        response["error"]
+    );
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(content.contains("References to `Widget`"), "{}", content);
+
+    Ok(())
+}
+
 /// find_references was uncapped — 60 KB for `kmalloc` on linux.git. The page
 /// must be bounded and must name the follow-up call.
 #[test]

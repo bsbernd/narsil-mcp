@@ -3681,11 +3681,7 @@ impl CodeIntelEngine {
                 "- `{}:{}` - `{}`\n",
                 path,
                 line,
-                if content.len() > 80 {
-                    &content[..80]
-                } else {
-                    content
-                }
+                response_budget::truncate_on_char_boundary(content, 80)
             ));
         }
 
