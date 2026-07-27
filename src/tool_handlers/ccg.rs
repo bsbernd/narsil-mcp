@@ -381,7 +381,10 @@ impl ToolHandler for ImportCcgHandler {
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
                 "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..500])
+                    format!(
+                        "{}...",
+                        crate::response_budget::truncate_on_char_boundary(&imported.content, 500)
+                    )
                 } else {
                     imported.content.clone()
                 }
@@ -417,7 +420,10 @@ impl ToolHandler for ImportCcgHandler {
                 "size_bytes": imported.size_bytes,
                 "was_compressed": imported.was_compressed,
                 "preview": if imported.content.len() > 500 {
-                    format!("{}...", &imported.content[..500])
+                    format!(
+                        "{}...",
+                        crate::response_budget::truncate_on_char_boundary(&imported.content, 500)
+                    )
                 } else {
                     imported.content.clone()
                 }

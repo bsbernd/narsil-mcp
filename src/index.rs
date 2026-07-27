@@ -9616,7 +9616,7 @@ impl CodeIntelEngine {
                     symbol.name,
                     symbol.kind,
                     symbol.start_line,
-                    if sig.len() > 50 { &sig[..50] } else { sig }
+                    response_budget::truncate_on_char_boundary(sig, 50)
                 ));
             }
 
@@ -9705,7 +9705,10 @@ impl CodeIntelEngine {
                 // Show snippet (truncated if long)
                 let content = &result.document.content;
                 let snippet = if content.len() > 500 {
-                    format!("{}...", &content[..500])
+                    format!(
+                        "{}...",
+                        response_budget::truncate_on_char_boundary(content, 500)
+                    )
                 } else {
                     content.clone()
                 };
@@ -9790,7 +9793,10 @@ impl CodeIntelEngine {
 
                 let content = &result.document.content;
                 let snippet = if content.len() > 300 {
-                    format!("{}...", &content[..300])
+                    format!(
+                        "{}...",
+                        response_budget::truncate_on_char_boundary(content, 300)
+                    )
                 } else {
                     content.clone()
                 };

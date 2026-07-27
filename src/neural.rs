@@ -491,7 +491,10 @@ impl EmbeddingBackend for ApiEmbedder {
         if !status.is_success() {
             // Redact potential sensitive info from error messages
             let safe_text = if text.len() > 500 {
-                format!("{}... (truncated)", &text[..500])
+                format!(
+                    "{}... (truncated)",
+                    crate::response_budget::truncate_on_char_boundary(&text, 500)
+                )
             } else {
                 text.clone()
             };

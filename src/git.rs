@@ -649,7 +649,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max - 3])
+        format!(
+            "{}...",
+            crate::response_budget::truncate_on_char_boundary(s, max.saturating_sub(3))
+        )
     }
 }
 
@@ -739,6 +742,15 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world this is long", 10), "hello w...");
+    }
+
+    /// Commit subjects and author names are routinely non-ASCII; cutting at a
+    /// fixed byte offset used to panic when the offset split a character.
+    #[test]
+    fn test_truncate_multibyte_summary() {
+        // 'ü' is 2 bytes and straddles the cut at byte 7.
+        assert_eq!(truncate("fix: übergrößes buffer", 10), "fix: ü...");
+        assert_eq!(truncate("🦀🦀🦀 rewrite in rust", 10), "🦀...");
     }
 
     #[test]

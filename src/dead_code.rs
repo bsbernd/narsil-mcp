@@ -389,7 +389,10 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len])
+        format!(
+            "{}...",
+            crate::response_budget::truncate_on_char_boundary(text, max_len)
+        )
     }
 }
 
@@ -1589,6 +1592,12 @@ mod tests {
     #[test]
     fn test_truncate_text_long() {
         assert_eq!(truncate_text("hello world", 5), "hello...");
+    }
+
+    /// Source text is arbitrary UTF-8; a cut inside a character used to panic.
+    #[test]
+    fn test_truncate_text_multibyte() {
+        assert_eq!(truncate_text("naïve value here", 4), "naï...");
     }
 
     // ==== Rust Unused Import Tests ====
