@@ -1,5 +1,5 @@
 use crate::config::schema::ToolConfig;
-use crate::config::{validate_config, ConfigLoader};
+use crate::config::{validate_config, ConfigLoader, ExposeGroup};
 use crate::tool_metadata::TOOL_METADATA;
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -86,7 +86,11 @@ pub enum ToolsCommand {
         #[arg(long)]
         category: Option<String>,
 
-        /// Output format (table, json, yaml)
+        /// Filter by --expose group (code, git, lint, security, …)
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Output format (table, json, yaml, markdown)
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
@@ -117,6 +121,8 @@ pub enum OutputFormat {
     Yaml,
     Json,
     Table,
+    /// One table per expose group, for the generated block in docs/tools.md.
+    Markdown,
 }
 
 /// Handle config subcommands
@@ -139,7 +145,11 @@ pub async fn handle_config_command(cmd: ConfigCommand) -> Result<()> {
 /// Handle tools subcommands
 pub fn handle_tools_command(cmd: ToolsCommand) -> Result<()> {
     match cmd {
-        ToolsCommand::List { category, format } => cmd_tools_list(category, format),
+        ToolsCommand::List {
+            category,
+            group,
+            format,
+        } => cmd_tools_list(category, group, format),
         ToolsCommand::Search { query, format } => cmd_tools_search(query, format),
         ToolsCommand::Show { tool, format } => cmd_tools_show(tool, format),
     }
@@ -158,7 +168,8 @@ fn cmd_show(format: OutputFormat, _repo: Option<PathBuf>) -> Result<()> {
             let json = serde_json::to_string_pretty(&config)?;
             println!("{}", json);
         }
-        OutputFormat::Table => {
+        // Markdown only differs for `tools list`; render the table.
+        OutputFormat::Table | OutputFormat::Markdown => {
             println!("Current Configuration:");
             println!("=====================");
             println!("Version: {}", config.version);
@@ -421,7 +432,8 @@ fn cmd_export(resolved: bool, format: OutputFormat) -> Result<()> {
             let json = serde_json::to_string_pretty(&config)?;
             println!("{}", json);
         }
-        OutputFormat::Table => {
+        // Markdown only differs for `tools list`; render the table.
+        OutputFormat::Table | OutputFormat::Markdown => {
             eprintln!("Error: table format not supported for export, use yaml or json");
             std::process::exit(1);
         }
@@ -437,7 +449,8 @@ fn cmd_profiles(format: OutputFormat) -> Result<()> {
     profiles.sort_by_key(|(name, _)| *name);
 
     match format {
-        OutputFormat::Table => {
+        // Markdown only differs for `tools list`; render the table.
+        OutputFormat::Table | OutputFormat::Markdown => {
             if profiles.is_empty() {
                 println!("No repository profiles configured.");
                 return Ok(());
@@ -491,17 +504,103 @@ fn cmd_profiles(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tools_list(category: Option<String>, format: OutputFormat) -> Result<()> {
-    let tools: Vec<_> = if let Some(cat) = category {
-        TOOL_METADATA
-            .iter()
-            .filter(|(_, meta)| meta.category.to_string() == cat)
-            .collect()
+/// Required arguments of a tool, minus `repo` — nearly every tool takes it, so
+/// listing it in every row is noise.
+fn required_args(meta: &crate::tool_metadata::ToolMetadata) -> String {
+    let args: Vec<&str> = meta
+        .input_schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|arg| *arg != "repo")
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if args.is_empty() {
+        "—".to_string()
     } else {
-        TOOL_METADATA.iter().collect()
+        args.join(", ")
+    }
+}
+
+/// First sentence of a description, escaped so it cannot break the table.
+fn summarize(description: &str) -> String {
+    description
+        .split(". ")
+        .next()
+        .unwrap_or(description)
+        .trim_end_matches('.')
+        .replace('|', "\\|")
+}
+
+fn cmd_tools_list(
+    category: Option<String>,
+    group: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    let group = match group {
+        Some(name) => Some(ExposeGroup::parse(&name).ok_or_else(|| {
+            let valid: Vec<&str> = ExposeGroup::ALL.iter().map(|g| g.name()).collect();
+            anyhow::anyhow!(
+                "Unknown --group '{}'. Valid groups: {}",
+                name,
+                valid.join(", ")
+            )
+        })?),
+        None => None,
     };
 
+    let tools: Vec<_> = TOOL_METADATA
+        .iter()
+        .filter(|(_, meta)| match &category {
+            Some(cat) => meta.category.to_string() == *cat,
+            None => true,
+        })
+        .filter(|(name, _)| match group {
+            Some(g) => g.tools().contains(*name),
+            None => true,
+        })
+        .collect();
+
     match format {
+        OutputFormat::Markdown => {
+            // One table per group, in --help order, so the output can be
+            // pasted between the generated markers in docs/tools.md.
+            let groups: Vec<ExposeGroup> = match group {
+                Some(g) => vec![g],
+                None => ExposeGroup::ALL.to_vec(),
+            };
+
+            for g in groups {
+                let mut names: Vec<&str> = tools
+                    .iter()
+                    .map(|(name, _)| **name)
+                    .filter(|name| g.tools().contains(name))
+                    .collect();
+                if names.is_empty() {
+                    continue;
+                }
+                names.sort_unstable();
+
+                println!("\n### `{}`\n", g.name());
+                println!("| tool | required args | what it answers |");
+                println!("|---|---|---|");
+                for name in names {
+                    if let Some(meta) = TOOL_METADATA.get(name) {
+                        println!(
+                            "| `{}` | {} | {} |",
+                            name,
+                            required_args(meta),
+                            summarize(meta.description)
+                        );
+                    }
+                }
+            }
+        }
         OutputFormat::Table => {
             println!("Available Tools ({} total):", tools.len());
             println!("{:-<80}", "");
@@ -567,7 +666,8 @@ fn cmd_tools_search(query: String, format: OutputFormat) -> Result<()> {
     }
 
     match format {
-        OutputFormat::Table => {
+        // Markdown only differs for `tools list`; render the table.
+        OutputFormat::Table | OutputFormat::Markdown => {
             println!(
                 "Tools matching '{}' ({} found):",
                 query,
@@ -637,7 +737,8 @@ fn cmd_tools_show(tool: String, format: OutputFormat) -> Result<()> {
             let json = serde_json::to_string_pretty(&data)?;
             println!("{}", json);
         }
-        OutputFormat::Table => {
+        // Markdown only differs for `tools list`; render the table.
+        OutputFormat::Table | OutputFormat::Markdown => {
             println!("Tool: {}", tool);
             println!("{:-<80}", "");
             println!("Description: {}", meta.description);
