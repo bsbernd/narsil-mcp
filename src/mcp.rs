@@ -101,6 +101,35 @@ impl JsonRpcResponse {
     }
 }
 
+/// Reject a call to a tool outside `--expose`, naming the group so the operator
+/// knows what to turn on and telling the caller not to retry — a client that
+/// connected before the set was narrowed still holds the old tools/list.
+///
+/// Only `--expose` is enforced, not the whole tools/list filter: exposed groups
+/// are a server-wide statement by the operator, whereas the preset can be picked
+/// per client from the `initialize` handshake and is presentation, not policy.
+/// Returns `None` for an unknown name — that is the registry's error to report.
+fn expose_rejection(expose: &[ExposeGroup], tool_name: &str) -> Option<String> {
+    if expose.is_empty() || ExposeGroup::union(expose).contains(tool_name) {
+        return None;
+    }
+
+    let group = ExposeGroup::of(tool_name)?;
+    let mut enabled: Vec<&str> = expose.iter().map(|g| g.name()).collect();
+    enabled.sort_unstable();
+
+    Some(format!(
+        "Tool '{tool}' is not available on this server: its group '{group}' is not \
+         exposed (this server serves: base, {enabled}). This is a fixed server \
+         configuration, not a transient failure — do not retry '{tool}', and expect \
+         every other '{group}' tool to be unavailable too. To enable it, add \
+         '{group}' to --expose or to `expose:` in config.yaml and restart the server.",
+        tool = tool_name,
+        group = group.name(),
+        enabled = enabled.join(", "),
+    ))
+}
+
 pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
@@ -397,6 +426,14 @@ impl McpServer {
         let start_time = std::time::Instant::now();
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+        // A client that connected before the tool set was narrowed still holds
+        // the old list — tools/list is never re-pushed — so it can ask for a
+        // tool this server no longer offers.
+        if let Some(message) = expose_rejection(&self.expose, tool_name) {
+            tracing::info!(tool = tool_name, "refused: outside the exposed groups");
+            return JsonRpcResponse::error(id, -32000, &message);
+        }
 
         // Dispatch to tool registry. The release profile unwinds (not aborts),
         // so catch a panicking handler here and turn it into an error instead
@@ -762,6 +799,42 @@ mod tests {
         // Also test with None
         let no_override: Option<String> = None;
         assert!(no_override.is_none());
+    }
+
+    #[test]
+    fn test_expose_rejection_names_the_group_and_says_not_to_retry() {
+        let msg = expose_rejection(&[ExposeGroup::Code, ExposeGroup::Git], "scan_security")
+            .expect("a security tool must be refused when only code+git are exposed");
+
+        assert!(msg.contains("scan_security"), "names the tool: {msg}");
+        assert!(msg.contains("'security'"), "names the group: {msg}");
+        assert!(
+            msg.contains("do not retry"),
+            "tells the caller to stop: {msg}"
+        );
+        assert!(msg.contains("--expose"), "says how to enable it: {msg}");
+    }
+
+    #[test]
+    fn test_expose_rejection_allows_exposed_and_base_tools() {
+        let groups = [ExposeGroup::Code, ExposeGroup::Git];
+        assert!(expose_rejection(&groups, "find_symbols").is_none());
+        assert!(expose_rejection(&groups, "get_blame").is_none());
+        // base is always folded in by ExposeGroup::union
+        assert!(expose_rejection(&groups, "list_repos").is_none());
+    }
+
+    /// Without --expose the server keeps its historical behaviour: everything
+    /// the registry knows stays callable.
+    #[test]
+    fn test_expose_rejection_is_inert_when_no_groups_selected() {
+        assert!(expose_rejection(&[], "scan_security").is_none());
+    }
+
+    /// An unknown name is the registry's error to report, with its own wording.
+    #[test]
+    fn test_expose_rejection_ignores_unknown_tools() {
+        assert!(expose_rejection(&[ExposeGroup::Code], "no_such_tool").is_none());
     }
 
     #[test]

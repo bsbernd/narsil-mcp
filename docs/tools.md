@@ -39,18 +39,30 @@ warning.
 
 ### What `--expose` does and does not do
 
-It filters `tools/list` — what a client is *told about*. It does not filter
-`tools/call`: a client that already knows a tool name can still invoke a tool
-outside the exposed groups, and the call succeeds. The same has always been
-true of `--preset`.
+It filters `tools/list` — what a client is told about — and `tools/call`
+refuses anything outside the groups, so the two agree. The refusal names the
+group and says not to retry:
 
-That matters after a change: the server does not advertise the
+```
+Tool 'find_dead_stores' is not available on this server: its group 'lint' is
+not exposed (this server serves: base, code, git). This is a fixed server
+configuration, not a transient failure — do not retry 'find_dead_stores', and
+expect every other 'lint' tool to be unavailable too. To enable it, add 'lint'
+to --expose or to `expose:` in config.yaml and restart the server.
+```
+
+That matters after a change, because the server does not advertise the
 `listChanged` tool capability and never emits
-`notifications/tools/list_changed`, so a client connected before a restart
-keeps its old list until it re-lists — and its calls to now-unlisted tools
-keep working rather than failing. Restart the client to pick up a new set.
+`notifications/tools/list_changed`: a client connected before a restart keeps
+its old list until it re-lists, so it will try tools that are gone. It now
+gets told, once, per tool. Restart the client to pick up the new set cleanly.
 
-Treat `--expose` as a context-window budget, not as access control.
+Two limits worth knowing. `--preset` is **not** enforced this way — only
+`--expose` is, because exposed groups are a server-wide statement while a
+preset can be selected per client during `initialize`. And the HTTP
+`/tools/call` route used by the visualization frontend is unaffected; it is a
+local UI surface, not an MCP client. So `--expose` is a context-window budget
+with a guard rail, not an access-control boundary.
 
 | group | tools | schema bytes | in the recommended default? |
 |---|---|---|---|
