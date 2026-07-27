@@ -2766,12 +2766,20 @@ fn calculate_entropy(s: &str) -> f64 {
         .sum()
 }
 
-/// Redact a secret for safe display
-fn redact_secret(secret: &str) -> String {
-    if secret.len() <= 8 {
-        "*".repeat(secret.len())
+/// Redact a secret for safe display.
+///
+/// Counts characters, not bytes: a byte offset can fall inside a character
+/// (panic), and a byte-length guard would let a short multi-byte secret
+/// through to the head/tail branch, where the two halves would print all of
+/// it.
+pub(crate) fn redact_secret(secret: &str) -> String {
+    let char_count = secret.chars().count();
+    if char_count <= 8 {
+        "*".repeat(char_count)
     } else {
-        format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
+        let head: String = secret.chars().take(4).collect();
+        let tail: String = secret.chars().skip(char_count - 4).collect();
+        format!("{}...{}", head, tail)
     }
 }
 
@@ -3540,6 +3548,24 @@ strcpy(dest, src);
     fn test_secret_redaction() {
         assert_eq!(redact_secret("short"), "*****");
         assert_eq!(redact_secret("longsecretvalue123"), "long...e123"); // First 4 + ... + last 4
+    }
+
+    /// A matched literal can hold any UTF-8: byte 4 of a 3-byte-per-character
+    /// secret falls inside a character, which used to panic the scan.
+    #[test]
+    fn test_secret_redaction_multibyte() {
+        assert_eq!(redact_secret("日本語テキストです"), "日本語テ...ストです");
+        assert_eq!(redact_secret("🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"), "🦀🦀🦀🦀...🦀🦀🦀🦀");
+    }
+
+    /// The guard counts characters: an 8-character secret is 24 bytes here, so
+    /// a byte-length guard would send it to the head/tail branch and print all
+    /// of it.
+    #[test]
+    fn test_short_multibyte_secret_is_fully_masked() {
+        let secret = "日本語テキストで";
+        assert_eq!(secret.chars().count(), 8);
+        assert_eq!(redact_secret(secret), "********");
     }
 
     #[test]

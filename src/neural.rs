@@ -451,11 +451,7 @@ impl EmbeddingBackend for ApiEmbedder {
 
         if let Some(key) = &self.api_key {
             // Redact API key in logs - only show first/last 4 chars
-            let redacted = if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len() - 4..])
-            } else {
-                "****".to_string()
-            };
+            let redacted = crate::security_rules::redact_secret(key);
             tracing::debug!("Using API key: {}", redacted);
             request = request.header("Authorization", format!("Bearer {}", key));
         }
