@@ -641,7 +641,8 @@ async fn main() -> Result<()> {
                 });
             }
 
-            let server = mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset);
+            let server =
+                mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset, Vec::new());
             run_stdio_with_shutdown(server).await
         }
         Transport::Sse => {
@@ -673,6 +674,7 @@ async fn main() -> Result<()> {
             let mcp_server = Arc::new(mcp::McpServer::from_arc(
                 Arc::clone(&engine),
                 server_args.preset,
+                Vec::new(),
             ));
             info!(
                 "Starting MCP SSE transport on http://{}:{}/mcp/sse",

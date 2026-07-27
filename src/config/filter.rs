@@ -3,7 +3,7 @@
 /// Converts EngineOptions and ToolConfig into a filtered list of enabled tools.
 /// Must complete in <1ms for responsive tool list queries.
 use crate::config::editor::get_editor_preset_or_full;
-use crate::config::preset::Preset;
+use crate::config::preset::{ExposeGroup, Preset};
 use crate::config::schema::ToolConfig;
 use crate::index::EngineOptions;
 use crate::tool_metadata::{FeatureFlag, PerformanceImpact, ToolMetadata, TOOL_METADATA};
@@ -21,6 +21,11 @@ pub struct ToolFilter {
     config: ToolConfig,
     enabled_flags: HashSet<FeatureFlag>,
     preset: Preset,
+    /// Tool whitelist from `--expose`, already unioned across groups. Empty
+    /// means no group filter was requested. Intersected with the preset rather
+    /// than replacing it, so `--expose code,git` under `--preset balanced`
+    /// means what it reads as.
+    expose: HashSet<&'static str>,
 }
 
 impl ToolFilter {
@@ -48,7 +53,16 @@ impl ToolFilter {
             config,
             enabled_flags,
             preset,
+            expose: HashSet::new(),
         }
+    }
+
+    /// Narrow the filter to the given `--expose` groups. An empty slice leaves
+    /// the preset in sole charge, which is what a caller that never saw the
+    /// flag wants.
+    pub fn with_expose(mut self, groups: &[ExposeGroup]) -> Self {
+        self.expose = ExposeGroup::union(groups);
+        self
     }
 
     /// Convert EngineOptions to a set of FeatureFlags
@@ -91,6 +105,9 @@ impl ToolFilter {
     /// gets the full registry (subject to the per-tool feature-flag check).
     /// Other presets (Minimal, Balanced, SecurityFocused) honour the cap so
     /// editor token-budgets stay predictable.
+    ///
+    /// An explicit `--expose` bypasses the cap for the same reason `Full`
+    /// does: the operator has already said how much they want.
     pub fn get_enabled_tools(&self) -> Vec<&'static str> {
         let mut enabled_tools = Vec::new();
 
@@ -101,7 +118,7 @@ impl ToolFilter {
             }
         }
 
-        if matches!(self.preset, Preset::Full) {
+        if matches!(self.preset, Preset::Full) || !self.expose.is_empty() {
             return enabled_tools;
         }
 
@@ -134,6 +151,12 @@ impl ToolFilter {
             }
         }
         // If preset is Full (empty whitelist), all tools are allowed
+
+        // 3b. Check the --expose group whitelist. Applied after the preset so
+        // the two intersect rather than one silently winning.
+        if !self.expose.is_empty() && !self.expose.contains(tool_name) {
+            return false;
+        }
 
         // 4. Check if tool's category is enabled.
         // Use Display, not Debug — Debug emits the raw variant identifier

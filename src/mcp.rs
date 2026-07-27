@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 use crate::config::schema::ToolConfig;
-use crate::config::{ClientInfo, ConfigLoader, ToolFilter};
+use crate::config::{ClientInfo, ConfigLoader, ExposeGroup, ToolFilter};
 use crate::index::CodeIntelEngine;
 use crate::tool_metadata::TOOL_METADATA;
 
@@ -105,6 +105,8 @@ pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
     config: ToolConfig,
+    /// Tool groups from `--expose`. Empty leaves the preset in charge.
+    expose: Vec<ExposeGroup>,
 }
 
 impl McpServer {
@@ -137,6 +139,7 @@ impl McpServer {
             engine,
             tool_registry,
             config,
+            expose: Vec::new(),
         }
     }
 
@@ -146,7 +149,12 @@ impl McpServer {
     /// # Arguments
     /// * `engine` - The code intelligence engine
     /// * `preset_override` - Optional preset to override config file (from CLI --preset)
-    pub fn from_arc(engine: Arc<CodeIntelEngine>, preset_override: Option<String>) -> Self {
+    /// * `expose` - Tool groups from CLI --expose; empty defers to the preset
+    pub fn from_arc(
+        engine: Arc<CodeIntelEngine>,
+        preset_override: Option<String>,
+        expose: Vec<ExposeGroup>,
+    ) -> Self {
         let mut config = ConfigLoader::new().load().unwrap_or_else(|e| {
             eprintln!("Warning: Failed to load config: {}. Using defaults.", e);
             ConfigLoader::new().default_config.clone()
@@ -169,6 +177,7 @@ impl McpServer {
             engine,
             tool_registry,
             config,
+            expose,
         }
     }
 
@@ -350,7 +359,8 @@ impl McpServer {
         let client_info: Option<ClientInfo> = session.client_info();
 
         // Create tool filter with current config and engine options
-        let filter = ToolFilter::new(self.config.clone(), self.engine.options(), client_info);
+        let filter = ToolFilter::new(self.config.clone(), self.engine.options(), client_info)
+            .with_expose(&self.expose);
 
         // Get filtered list of enabled tools
         let enabled_tools = filter.get_enabled_tools();

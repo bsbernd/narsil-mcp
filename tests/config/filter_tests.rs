@@ -6,7 +6,7 @@
 /// 3. Tool overrides
 /// 4. Editor presets (future)
 /// 5. Performance budgets
-use narsil_mcp::config::schema::{CategoryConfig, ToolConfig, ToolOverride};
+use narsil_mcp::config::schema::{CategoryConfig, PerformanceConfig, ToolConfig, ToolOverride};
 use narsil_mcp::config::ConfigLoader;
 use narsil_mcp::index::EngineOptions;
 use narsil_mcp::tool_metadata::{FeatureFlag, TOOL_METADATA};
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 // Import ToolFilter (will be implemented)
-use narsil_mcp::config::ToolFilter;
+use narsil_mcp::config::{ExposeGroup, ToolFilter};
 
 #[test]
 fn test_filter_by_feature_flags_git() {
@@ -456,4 +456,100 @@ fn test_security_focused_preset() {
 
     // Should NOT include neural tools
     assert!(!enabled.contains(&"neural_search"));
+}
+
+/// All feature flags on, so nothing below is filtered out by a missing flag.
+fn all_features_enabled() -> EngineOptions {
+    EngineOptions {
+        git_enabled: true,
+        call_graph_enabled: true,
+        persist_enabled: true,
+        watch_enabled: true,
+        remote_enabled: true,
+        lsp_config: narsil_mcp::lsp::LspConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        neural_config: narsil_mcp::neural::NeuralConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_expose_narrows_to_selected_groups() {
+    let filter = ToolFilter::new(ToolConfig::default(), &all_features_enabled(), None)
+        .with_expose(&[ExposeGroup::Code, ExposeGroup::Git]);
+    let enabled = filter.get_enabled_tools();
+
+    assert!(enabled.contains(&"find_symbols"), "code group");
+    assert!(enabled.contains(&"get_blame"), "git group");
+    assert!(enabled.contains(&"list_repos"), "base is always folded in");
+
+    assert!(!enabled.contains(&"scan_security"), "security not selected");
+    assert!(
+        !enabled.contains(&"generate_sbom"),
+        "supply-chain not selected"
+    );
+    assert!(!enabled.contains(&"find_dead_stores"), "lint not selected");
+    assert!(!enabled.contains(&"get_chunks"), "retrieval not selected");
+}
+
+/// Without the flag the filter must behave exactly as before.
+#[test]
+fn test_expose_empty_leaves_preset_in_charge() {
+    let options = all_features_enabled();
+    let before = ToolFilter::new(ToolConfig::default(), &options, None).get_enabled_tools();
+    let after = ToolFilter::new(ToolConfig::default(), &options, None)
+        .with_expose(&[])
+        .get_enabled_tools();
+
+    assert_eq!(before.len(), after.len());
+}
+
+/// The two compose by intersection: a group cannot re-enable what the preset
+/// excluded, and the preset cannot re-enable what the groups excluded.
+#[test]
+fn test_expose_intersects_preset() {
+    let config = ToolConfig {
+        preset: Some("minimal".to_string()),
+        ..Default::default()
+    };
+
+    let filter = ToolFilter::new(config, &all_features_enabled(), None)
+        .with_expose(&[ExposeGroup::Code, ExposeGroup::Git]);
+    let enabled = filter.get_enabled_tools();
+
+    // In both minimal and code -> present.
+    assert!(enabled.contains(&"find_symbols"));
+    // In the git group but not in the minimal preset -> still excluded.
+    assert!(!enabled.contains(&"get_blame"));
+    // In the minimal preset but not in code/git/base -> still excluded.
+    assert!(!enabled.contains(&"search_chunks"));
+}
+
+/// An explicit --expose is a deliberate narrowing, so it must not be trimmed
+/// further by the editor token budget.
+#[test]
+fn test_expose_bypasses_performance_budget() {
+    let config = ToolConfig {
+        preset: Some("balanced".to_string()),
+        performance: PerformanceConfig {
+            max_tool_count: 5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
+        .with_expose(&[ExposeGroup::Code])
+        .get_enabled_tools();
+
+    assert!(
+        enabled.len() > 5,
+        "max_tool_count must not trim an explicit --expose, got {}",
+        enabled.len()
+    );
 }
