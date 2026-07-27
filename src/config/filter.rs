@@ -49,19 +49,47 @@ impl ToolFilter {
             Preset::Full
         };
 
+        // A top-level `expose:` in config.yaml is the machine-wide default,
+        // for invocations whose command line comes from an editor plugin.
+        // with_expose overrides it when the CLI/env/profile supplied groups.
+        let expose = ExposeGroup::union(&Self::parse_config_expose(&config.expose));
+
         Self {
             config,
             enabled_flags,
             preset,
-            expose: HashSet::new(),
+            expose,
         }
     }
 
-    /// Narrow the filter to the given `--expose` groups. An empty slice leaves
-    /// the preset in sole charge, which is what a caller that never saw the
-    /// flag wants.
+    /// Resolve `expose:` entries from config, naming any that are not groups
+    /// rather than silently dropping them — a typo in a config file is
+    /// otherwise invisible.
+    fn parse_config_expose(names: &[String]) -> Vec<ExposeGroup> {
+        names
+            .iter()
+            .filter_map(|name| {
+                let group = ExposeGroup::parse(name);
+                if group.is_none() {
+                    let valid: Vec<&str> = ExposeGroup::ALL.iter().map(|g| g.name()).collect();
+                    tracing::warn!(
+                        "config: ignoring unknown expose group '{}'. Valid groups: {}",
+                        name,
+                        valid.join(", ")
+                    );
+                }
+                group
+            })
+            .collect()
+    }
+
+    /// Narrow the filter to the given `--expose` groups. An empty slice keeps
+    /// whatever the config file asked for, so a caller that never saw the flag
+    /// does not clear the machine-wide default.
     pub fn with_expose(mut self, groups: &[ExposeGroup]) -> Self {
-        self.expose = ExposeGroup::union(groups);
+        if !groups.is_empty() {
+            self.expose = ExposeGroup::union(groups);
+        }
         self
     }
 

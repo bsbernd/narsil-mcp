@@ -118,6 +118,7 @@ async fn test_config_priority_cli_flags_override() -> Result<()> {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -344,6 +345,7 @@ async fn test_category_level_filtering() -> Result<()> {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -396,6 +398,7 @@ async fn test_tool_level_override() -> Result<()> {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -434,6 +437,7 @@ async fn test_performance_budget_max_tool_count() -> Result<()> {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: Some("balanced".to_string()),
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -504,6 +508,7 @@ async fn test_feature_flag_validation() -> Result<()> {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {

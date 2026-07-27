@@ -157,6 +157,7 @@ mod tests {
         let config = ToolConfig {
             version: "1.0".to_string(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -175,6 +176,7 @@ mod tests {
         let config = ToolConfig {
             version: "999.0".to_string(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -193,6 +195,7 @@ mod tests {
         let config = ToolConfig {
             version: "1.0".to_string(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -226,6 +229,7 @@ mod tests {
         let config = ToolConfig {
             version: "1.0".to_string(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -258,6 +262,7 @@ mod tests {
         let config = ToolConfig {
             version: "1.0".to_string(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {

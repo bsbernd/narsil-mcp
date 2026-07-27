@@ -212,6 +212,14 @@ impl ConfigLoader {
             base.preset = overlay.preset;
         }
 
+        // Overlay expose groups if specified. Replaced wholesale rather than
+        // appended: "expose these groups" is an absolute statement, and a
+        // project config that unions with the user config could only ever
+        // widen the tool set.
+        if !overlay.expose.is_empty() {
+            base.expose = overlay.expose;
+        }
+
         // Merge editors
         for (name, config) in overlay.editors {
             base.editors.insert(name, config);

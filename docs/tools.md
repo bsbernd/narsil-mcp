@@ -19,7 +19,23 @@ $ narsil-mcp --expose code,git,security   # when auditing
 
 Comma-separated and composable. `base` is always included. An empty `--expose`
 falls back to `--preset` (`minimal` / `balanced` / `full` / `security-focused`),
-which is the older, coarser knob; the two compose by intersection.
+which is the older, coarser knob; the two compose by intersection — a group can
+never re-enable what the preset excluded, and vice versa.
+
+Groups can also be set without touching the command line, which matters when
+the invocation comes from an editor plugin. First match wins:
+
+| where | example |
+|---|---|
+| `--expose` flag | `narsil-mcp --expose code,git` |
+| `NARSIL_EXPOSE` env | `NARSIL_EXPOSE=code,git` |
+| the selected profile | `profiles: { dev: { expose: [code, git] } }` |
+| top-level config | `expose: [code, git]` in `config.yaml` |
+
+The last one is the machine-wide default. Note that a stdio instance which
+delegates to a running SSE daemon (see `--transport sse`) serves the
+**daemon's** tool list — its own `--expose` cannot apply, and it says so in a
+warning.
 
 ### What `--expose` does and does not do
 

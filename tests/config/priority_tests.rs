@@ -97,6 +97,33 @@ tools:
     assert_eq!(override_config.reason.as_deref(), Some("User disabled"));
 }
 
+/// merge_configs copies field by field, so a new top-level field is silently
+/// dropped until it is added there — `expose` was, once.
+#[test]
+fn test_user_config_expose_survives_the_merge() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    std::env::remove_var("NARSIL_PRESET");
+    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
+    std::env::remove_var("NARSIL_DISABLED_TOOLS");
+
+    let user_config_content = r#"
+version: "1.0"
+expose: [code, git]
+"#;
+
+    let temp_dir = create_user_config(user_config_content);
+    let mut loader = ConfigLoader::new();
+    loader = loader.with_user_config_path(Some(temp_dir.path().join("config.yaml")));
+
+    let config = loader.load().unwrap();
+
+    assert_eq!(
+        config.expose,
+        vec!["code".to_string(), "git".to_string()],
+        "top-level expose must survive merge_configs"
+    );
+}
+
 #[test]
 fn test_project_config_overrides_user_config() {
     let _guard = ENV_MUTEX.lock().unwrap();

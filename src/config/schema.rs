@@ -22,6 +22,14 @@ pub struct ToolConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
 
+    /// Tool groups to expose, e.g. `[code, git]`. The machine-wide default,
+    /// applied to any invocation that does not pass `--expose` (or set
+    /// `NARSIL_EXPOSE`, or select a profile that lists its own groups) —
+    /// useful when the command line comes from an editor plugin you would
+    /// rather not edit. Intersected with `preset`, never unioned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+
     /// Editor-specific configurations (optional)
     #[serde(default)]
     pub editors: HashMap<String, serde_json::Value>,
@@ -49,6 +57,7 @@ impl Default for ToolConfig {
         Self {
             version: default_version(),
             preset: None,
+            expose: Vec::new(),
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig::default(),

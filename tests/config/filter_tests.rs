@@ -530,6 +530,72 @@ fn test_expose_intersects_preset() {
     assert!(!enabled.contains(&"search_chunks"));
 }
 
+/// A top-level `expose:` in config.yaml is the machine-wide default, for
+/// invocations whose command line comes from an editor plugin.
+#[test]
+fn test_config_expose_applies_without_the_flag() {
+    let config = ToolConfig {
+        expose: vec!["code".to_string(), "git".to_string()],
+        ..Default::default()
+    };
+
+    let enabled = ToolFilter::new(config, &all_features_enabled(), None).get_enabled_tools();
+
+    assert!(enabled.contains(&"find_symbols"));
+    assert!(enabled.contains(&"get_blame"));
+    assert!(!enabled.contains(&"scan_security"));
+}
+
+#[test]
+fn test_cli_expose_overrides_config_expose() {
+    let config = ToolConfig {
+        expose: vec!["code".to_string(), "git".to_string()],
+        ..Default::default()
+    };
+
+    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
+        .with_expose(&[ExposeGroup::Security])
+        .get_enabled_tools();
+
+    assert!(enabled.contains(&"scan_security"), "CLI groups win");
+    assert!(
+        !enabled.contains(&"get_blame"),
+        "config groups are replaced"
+    );
+    assert!(enabled.contains(&"list_repos"), "base is still folded in");
+}
+
+/// An empty slice means "the caller never saw the flag", which must not wipe
+/// the config default.
+#[test]
+fn test_empty_cli_expose_keeps_config_expose() {
+    let config = ToolConfig {
+        expose: vec!["code".to_string()],
+        ..Default::default()
+    };
+
+    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
+        .with_expose(&[])
+        .get_enabled_tools();
+
+    assert!(enabled.contains(&"find_symbols"));
+    assert!(!enabled.contains(&"get_blame"));
+}
+
+/// A typo must not silently narrow the tool set to the groups that parsed.
+#[test]
+fn test_unknown_config_expose_group_is_ignored() {
+    let config = ToolConfig {
+        expose: vec!["code".to_string(), "analysis".to_string()],
+        ..Default::default()
+    };
+
+    let enabled = ToolFilter::new(config, &all_features_enabled(), None).get_enabled_tools();
+
+    assert!(enabled.contains(&"find_symbols"), "the valid group applies");
+    assert!(!enabled.contains(&"get_blame"), "the typo adds nothing");
+}
+
 /// An explicit --expose is a deliberate narrowing, so it must not be trimmed
 /// further by the editor token budget.
 #[test]

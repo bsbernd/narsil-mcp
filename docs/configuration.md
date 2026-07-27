@@ -230,6 +230,14 @@ version: "1.0"
 # Optional: Apply a preset (minimal, balanced, full, security-focused)
 preset: "balanced"
 
+# Optional: expose only these tool groups (code, git, lint, security,
+# supply-chain, retrieval). The machine-wide default for invocations that do
+# not pass --expose, set NARSIL_EXPOSE, or select a profile listing its own
+# groups — useful when the command line comes from an editor plugin. Combined
+# with `preset` by intersection, so it can only narrow, never widen.
+# See docs/tools.md for what each group contains.
+expose: [code, git]
+
 # Editor-specific settings (optional)
 editors:
   vscode:

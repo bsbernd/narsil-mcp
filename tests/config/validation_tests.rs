@@ -24,6 +24,7 @@ fn test_validate_valid_config() {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -54,6 +55,7 @@ fn test_validate_invalid_version() {
     let config = ToolConfig {
         version: "999.0".to_string(), // Invalid version
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -94,6 +96,7 @@ fn test_validate_unknown_category() {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -127,6 +130,7 @@ fn test_validate_performance_budgets() {
     let mut config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -152,6 +156,7 @@ fn test_validate_empty_categories() {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -196,6 +201,7 @@ fn test_validate_conflicting_overrides() {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -233,6 +239,7 @@ fn test_validate_unknown_tool_in_override() {
     let config = ToolConfig {
         version: "1.0".to_string(),
         preset: None,
+        expose: Vec::new(),
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
