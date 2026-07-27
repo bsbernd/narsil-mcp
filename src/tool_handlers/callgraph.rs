@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
 use crate::index::CodeIntelEngine;
+use crate::response_budget::DEFAULT_LIST_LIMIT;
 
 /// Handler for get_call_graph tool
 pub struct GetCallGraphHandler;
@@ -51,8 +52,9 @@ impl ToolHandler for GetCallersHandler {
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
+        let window = super::list_window(&args, DEFAULT_LIST_LIMIT as u64);
         engine
-            .get_callers(repo, function, transitive, max_depth, exclude_tests)
+            .get_callers(repo, function, transitive, max_depth, exclude_tests, window)
             .await
     }
 }
@@ -72,8 +74,9 @@ impl ToolHandler for GetCalleesHandler {
         let transitive = args.get_bool_or("transitive", false);
         let max_depth = args.get_u64_or("max_depth", 5) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
+        let window = super::list_window(&args, DEFAULT_LIST_LIMIT as u64);
         engine
-            .get_callees(repo, function, transitive, max_depth, exclude_tests)
+            .get_callees(repo, function, transitive, max_depth, exclude_tests, window)
             .await
     }
 }

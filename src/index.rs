@@ -27,6 +27,7 @@ use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
+use crate::response_budget;
 use crate::search::{build_file_doc, generate_snippet, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{SourceLine, SourceSet, Symbol, SymbolKind};
@@ -5555,6 +5556,7 @@ impl CodeIntelEngine {
         transitive: bool,
         max_depth: usize,
         _exclude_tests: Option<bool>,
+        window: response_budget::ListWindow,
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
 
@@ -5571,7 +5573,13 @@ impl CodeIntelEngine {
             ));
         }
 
-        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callers_hybrid", function);
+        // The window is part of the key: the rendered page is what gets cached,
+        // so a limit=0 caller must not be served a 50-item answer.
+        let cache_key = AnalysisCacheKey::with_discriminator(
+            &repo,
+            "callers_hybrid",
+            format!("{}|{}|{}", function, window.offset, window.limit),
+        );
         let repo_hash = self.compute_repo_hash(&repo);
         if self.options.cache_enabled {
             if let Some(cached) = self
@@ -5599,8 +5607,13 @@ impl CodeIntelEngine {
                 callers.len(),
                 max_depth
             ));
-            for (name, depth) in &callers {
+            let (page, capped) = response_budget::cap(&callers, window, "get_callers");
+            for (name, depth) in page {
                 output.push_str(&format!("- `{}` (depth: {})\n", name, depth));
+            }
+            if capped.truncated() {
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         } else {
             // Collect AST-derived callers.
@@ -5678,7 +5691,8 @@ impl CodeIntelEngine {
             }
 
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
-            for caller in &callers {
+            let (page, capped) = response_budget::cap(&callers, window, "get_callers");
+            for caller in page {
                 let is_cxx = matches!(
                     get_language_from_path(&caller.file_path).as_str(),
                     "c" | "cpp"
@@ -5696,6 +5710,18 @@ impl CodeIntelEngine {
                     "- `{}` at `{}:{}`{} ({:?})\n",
                     caller.target, caller.file_path, caller.line, provenance, caller.call_type
                 ));
+            }
+
+            if capped.truncated() {
+                let dropped = &callers[(capped.offset + capped.shown).min(callers.len())..];
+                output.push_str("\n## Remaining callers by file\n\n");
+                output.push_str(&response_budget::by_file_summary(
+                    dropped,
+                    |edge| edge.file_path.as_str(),
+                    20,
+                ));
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         }
 
@@ -5719,6 +5745,7 @@ impl CodeIntelEngine {
         transitive: bool,
         max_depth: usize,
         _exclude_tests: Option<bool>,
+        window: response_budget::ListWindow,
     ) -> Result<String> {
         let repo = self.resolve_repo(repo)?;
 
@@ -5735,7 +5762,11 @@ impl CodeIntelEngine {
             ));
         }
 
-        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "callees_hybrid", function);
+        let cache_key = AnalysisCacheKey::with_discriminator(
+            &repo,
+            "callees_hybrid",
+            format!("{}|{}|{}", function, window.offset, window.limit),
+        );
         let repo_hash = self.compute_repo_hash(&repo);
         if self.options.cache_enabled {
             if let Some(cached) = self
@@ -5763,17 +5794,34 @@ impl CodeIntelEngine {
                 callees.len(),
                 max_depth
             ));
-            for (name, depth) in &callees {
+            let (page, capped) = response_budget::cap(&callees, window, "get_callees");
+            for (name, depth) in page {
                 output.push_str(&format!("- `{}` (depth: {})\n", name, depth));
+            }
+            if capped.truncated() {
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         } else {
             let callees = call_graph.get_callees(function);
             output.push_str(&format!("Found {} direct callees\n\n", callees.len()));
-            for callee in &callees {
+            let (page, capped) = response_budget::cap(&callees, window, "get_callees");
+            for callee in page {
                 output.push_str(&format!(
                     "- `{}` at `{}:{}` ({:?})\n",
                     callee.target, callee.file_path, callee.line, callee.call_type
                 ));
+            }
+            if capped.truncated() {
+                let dropped = &callees[(capped.offset + capped.shown).min(callees.len())..];
+                output.push_str("\n## Remaining callees by file\n\n");
+                output.push_str(&response_budget::by_file_summary(
+                    dropped,
+                    |edge| edge.file_path.as_str(),
+                    20,
+                ));
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         }
 

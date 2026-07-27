@@ -305,6 +305,16 @@ fn require_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
     }
 }
 
+/// The caller's window into a list-shaped result, from the `offset` and
+/// `limit` arguments. `default_limit` differs per tool because the rows differ
+/// in size; `limit=0` always means "no cap".
+fn list_window(args: &Value, default_limit: u64) -> crate::response_budget::ListWindow {
+    crate::response_budget::ListWindow::new(
+        args.get_u64_or("offset", 0) as usize,
+        args.get_u64_or("limit", default_limit) as usize,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

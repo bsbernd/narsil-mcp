@@ -766,7 +766,9 @@ lazy_static! {
                     "function": {"type": "string", "description": "Function name to find callers of (alias: symbol)"},
                     "transitive": {"type": "boolean", "description": "Include transitive callers (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"},
+                    "limit": {"type": "integer", "description": "Max callers to list (default: 50; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first caller to list (default: 0)"}
                 },
                 "required": ["repo", "function"]
             }),
@@ -789,7 +791,9 @@ lazy_static! {
                     "function": {"type": "string", "description": "Function name to find callees of (alias: symbol)"},
                     "transitive": {"type": "boolean", "description": "Include transitive callees (default: false)"},
                     "max_depth": {"type": "integer", "description": "Maximum depth for transitive analysis (default: 5)"},
-                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"}
+                    "exclude_tests": {"type": "boolean", "description": "Exclude test files (accepted, but filtering requires rebuild)"},
+                    "limit": {"type": "integer", "description": "Max callees to list (default: 50; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first callee to list (default: 0)"}
                 },
                 "required": ["repo", "function"]
             }),

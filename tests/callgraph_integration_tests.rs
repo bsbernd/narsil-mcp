@@ -1,5 +1,6 @@
 use narsil_mcp::callgraph::CallGraph;
 use narsil_mcp::parser::LanguageParser;
+use narsil_mcp::response_budget::ListWindow;
 use std::path::Path;
 
 #[test]
@@ -631,4 +632,95 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
         "io_submit_sqes should be called by io_uring_enter — got {:?}",
         callers.iter().map(|e| &e.target).collect::<Vec<_>>()
     );
+}
+
+/// Build a repo where `hot` has `count` callers spread over two files.
+fn write_hot_function_repo(root: &std::path::Path, count: usize) -> std::io::Result<()> {
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(root.join("src/hot.rs"), "pub fn hot() {}\n")?;
+    for (file, range) in [("src/a.rs", 0..count / 2), ("src/b.rs", count / 2..count)] {
+        let mut body = String::new();
+        for idx in range {
+            body.push_str(&format!("pub fn caller_{}() {{ hot(); }}\n", idx));
+        }
+        std::fs::write(root.join(file), body)?;
+    }
+    Ok(())
+}
+
+async fn hot_function_engine(
+    repo: &std::path::Path,
+    index_dir: &std::path::Path,
+) -> narsil_mcp::index::CodeIntelEngine {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let options = EngineOptions {
+        call_graph_enabled: true,
+        ..Default::default()
+    };
+    let engine =
+        CodeIntelEngine::with_options(index_dir.to_path_buf(), vec![repo.to_path_buf()], options)
+            .await
+            .expect("engine");
+
+    // with_options returns before the index exists; the server does this on a
+    // background task and the call-graph tools refuse to answer until it runs.
+    engine
+        .complete_initialization()
+        .await
+        .expect("initialization");
+    engine
+}
+
+/// A capped caller list must still say how many there are and how to get the
+/// rest — a truncated list that reads as complete is worse than a long one.
+#[tokio::test]
+async fn get_callers_caps_and_reports_the_total() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_hot_function_repo(repo.path(), 60).unwrap();
+    let engine = hot_function_engine(repo.path(), index_dir.path()).await;
+
+    let output = engine
+        .get_callers(
+            repo.path().to_str().unwrap(),
+            "hot",
+            false,
+            5,
+            None,
+            ListWindow::new(0, narsil_mcp::response_budget::DEFAULT_LIST_LIMIT),
+        )
+        .await
+        .unwrap();
+
+    assert!(output.contains("Found 60 direct callers"), "{}", output);
+    let listing = output.split("## Remaining callers by file").next().unwrap();
+    assert_eq!(listing.matches("\n- `").count(), 50, "{}", output);
+    assert!(output.contains("Showing 50 of 60"), "{}", output);
+    assert!(output.contains("get_callers(limit=0)"), "{}", output);
+    assert!(output.contains("src/b.rs"), "{}", output);
+}
+
+/// The rendered page is cached, so a limit=0 caller must not be served the
+/// capped answer produced for an earlier default-limit call.
+#[tokio::test]
+async fn get_callers_limit_zero_is_not_served_the_cached_page() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_hot_function_repo(repo.path(), 60).unwrap();
+    let engine = hot_function_engine(repo.path(), index_dir.path()).await;
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let capped = engine
+        .get_callers(repo_arg, "hot", false, 5, None, ListWindow::new(0, 50))
+        .await
+        .unwrap();
+    assert!(capped.contains("Showing 50 of 60"));
+
+    let full = engine
+        .get_callers(repo_arg, "hot", false, 5, None, ListWindow::new(0, 0))
+        .await
+        .unwrap();
+    assert_eq!(full.matches("\n- `").count(), 60, "{}", full);
+    assert!(!full.contains("Showing"), "{}", full);
 }
