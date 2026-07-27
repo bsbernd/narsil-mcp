@@ -156,7 +156,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "max_depth": {"type": "integer", "description": "Maximum directory depth (default: 4)"},
                     "max_entries_per_dir": {"type": "integer", "description": "Max entries listed per directory (default: 40; 0 = all)"},
                     "max_total_entries": {"type": "integer", "description": "Max entries in the whole tree (default: 600; 0 = all)"}
@@ -302,7 +302,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."}
+                    "repo": {"type": "string"}
                 },
                 "required": ["repo"]
             }),
@@ -1735,7 +1735,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "exclude_entry_points": {"type": "boolean", "description": "Exclude entry point files like lib.rs, main.rs, index.js (default: true)"},
                     "exclude_patterns": {
                         "type": "array",
@@ -1846,7 +1846,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "include_security": {"type": "boolean", "description": "Include security summary in manifest (default: true)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs (optional)"}
                 },
@@ -1867,7 +1867,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "include_security": {"type": "boolean", "description": "Include security summary (default: true)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs"},
                     "output": {"type": "string", "description": "Output file path (optional)"}
@@ -1889,7 +1889,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1909,7 +1909,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1929,7 +1929,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "output": {"type": "string", "description": "Output file path (optional)"}
                 },
                 "required": ["repo"]
@@ -1949,7 +1949,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "output_dir": {"type": "string", "description": "Output directory path (optional)"},
                     "base_url": {"type": "string", "description": "Base URL for layer URIs"},
                     "include_security": {"type": "boolean", "description": "Include security summary (default: true)"}
@@ -1971,7 +1971,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "query": {"type": "string", "description": "SPARQL query to execute"},
                     "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
                     "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"}
@@ -1993,7 +1993,7 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string", "description": "Repository to query. Absolute path, relative path, or `.`."},
+                    "repo": {"type": "string"},
                     "tier": {"type": "string", "description": "Access tier: 'public' or 'triple-heart' (default)"},
                     "agent": {"type": "string", "description": "Specific agent URI to grant private access to (optional)"}
                 },
