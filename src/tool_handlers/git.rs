@@ -6,6 +6,10 @@ use serde_json::Value;
 use super::{ArgExtractor, ToolHandler};
 use crate::index::CodeIntelEngine;
 
+/// Contributor rows returned when the caller passes no `limit`. Lower than the
+/// generic list default: the list is ranked, so the tail is never the answer.
+const DEFAULT_CONTRIBUTOR_LIMIT: u64 = 30;
+
 /// Handler for get_blame tool
 pub struct GetBlameHandler;
 
@@ -86,7 +90,8 @@ impl ToolHandler for GetContributorsHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let path = args.get_str("path");
-        engine.get_contributors(repo, path).await
+        let window = super::list_window(&args, DEFAULT_CONTRIBUTOR_LIMIT);
+        engine.get_contributors(repo, path, window).await
     }
 }
 

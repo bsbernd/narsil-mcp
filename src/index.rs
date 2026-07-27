@@ -4850,7 +4850,12 @@ impl CodeIntelEngine {
     }
 
     /// Get contributors to a file or repository
-    pub async fn get_contributors(&self, repo: &str, path: Option<&str>) -> Result<String> {
+    pub async fn get_contributors(
+        &self,
+        repo: &str,
+        path: Option<&str>,
+        window: response_budget::ListWindow,
+    ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let repo_path = PathBuf::from(&repo_key);
         // Validate path to prevent traversal attacks
@@ -4875,9 +4880,7 @@ impl CodeIntelEngine {
                 if contributors.is_empty() {
                     output.push_str("*No contributors found for this file.*\n");
                 } else {
-                    for (name, count) in contributors {
-                        output.push_str(&format!("- {} ({} commits)\n", name, count));
-                    }
+                    render_contributors(&contributors, window, &mut output);
                 }
             }
             None => {
@@ -4891,9 +4894,7 @@ impl CodeIntelEngine {
                         "**Total contributors**: {}\n\n",
                         contributors.len()
                     ));
-                    for (name, count) in contributors {
-                        output.push_str(&format!("- {} ({} commits)\n", name, count));
-                    }
+                    render_contributors(&contributors, window, &mut output);
                 }
             }
         }
@@ -11422,6 +11423,23 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
 }
 
 /// Format a vulnerability finding for output
+/// Render one page of a contributor ranking, with the paging footer when the
+/// list was cut.
+fn render_contributors(
+    contributors: &[(String, usize)],
+    window: response_budget::ListWindow,
+    output: &mut String,
+) {
+    let (page, capped) = response_budget::cap(contributors, window, "get_contributors");
+    for (name, count) in page {
+        output.push_str(&format!("- {} ({} commits)\n", name, count));
+    }
+    if capped.truncated() {
+        output.push('\n');
+        output.push_str(&capped.footer());
+    }
+}
+
 fn format_vuln_finding(v: &crate::supply_chain::DependencyVuln) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -12098,6 +12116,44 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// linux.git has 41k contributor identities; the default page must show the
+    /// top of the ranking and say what it left out.
+    #[test]
+    fn render_contributors_caps_and_keeps_the_ranking() {
+        let contributors: Vec<(String, usize)> = (0..100)
+            .map(|rank| (format!("dev{} <d{}@e>", rank, rank), 100 - rank))
+            .collect();
+
+        let mut output = String::new();
+        render_contributors(
+            &contributors,
+            response_budget::ListWindow::new(0, 30),
+            &mut output,
+        );
+
+        assert_eq!(output.matches("commits)").count(), 30);
+        assert!(output.starts_with("- dev0 <d0@e> (100 commits)\n"));
+        assert!(output.contains("Showing 30 of 100"));
+        assert!(output.contains("get_contributors(offset=30)"));
+    }
+
+    #[test]
+    fn render_contributors_limit_zero_lists_everyone() {
+        let contributors: Vec<(String, usize)> = (0..100)
+            .map(|rank| (format!("dev{} <d{}@e>", rank, rank), 100 - rank))
+            .collect();
+
+        let mut output = String::new();
+        render_contributors(
+            &contributors,
+            response_budget::ListWindow::new(0, 0),
+            &mut output,
+        );
+
+        assert_eq!(output.matches("commits)").count(), 100);
+        assert!(!output.contains("Showing"));
     }
 
     #[test]

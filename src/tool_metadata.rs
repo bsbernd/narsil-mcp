@@ -961,7 +961,9 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "File path (optional, shows repo contributors if omitted)"}
+                    "path": {"type": "string", "description": "File path (optional, shows repo contributors if omitted)"},
+                    "limit": {"type": "integer", "description": "Max contributors to list, ranked by commit count (default: 30; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first contributor to list (default: 0)"}
                 },
                 "required": ["repo"]
             }),
