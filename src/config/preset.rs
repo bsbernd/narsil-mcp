@@ -264,6 +264,11 @@ pub enum ExposeGroup {
     /// Why the code is the way it is: blame, history, commit diffs, branch
     /// state, contributors.
     Git,
+    /// Derived analysis of code the caller is already reading: complexity
+    /// metrics, hotspots, import graphs, cycles, per-function control and data
+    /// flow. Off by default — a model holding the source can work these out,
+    /// so the schemas cost context to restate what is already in front of it.
+    Analysis,
     /// Defect finders that duplicate compiler diagnostics. Off by default —
     /// the build already reports these, with type information narsil lacks.
     Lint,
@@ -304,10 +309,11 @@ const UNGROUPED_TOOLS: [&str; 20] = [
 
 impl ExposeGroup {
     /// Every group, in the order they are printed in `--help` and the docs.
-    pub const ALL: [ExposeGroup; 7] = [
+    pub const ALL: [ExposeGroup; 8] = [
         ExposeGroup::Base,
         ExposeGroup::Code,
         ExposeGroup::Git,
+        ExposeGroup::Analysis,
         ExposeGroup::Lint,
         ExposeGroup::Security,
         ExposeGroup::SupplyChain,
@@ -320,6 +326,7 @@ impl ExposeGroup {
             ExposeGroup::Base => "base",
             ExposeGroup::Code => "code",
             ExposeGroup::Git => "git",
+            ExposeGroup::Analysis => "analysis",
             ExposeGroup::Lint => "lint",
             ExposeGroup::Security => "security",
             ExposeGroup::SupplyChain => "supply-chain",
@@ -342,6 +349,7 @@ impl ExposeGroup {
             ExposeGroup::Base => Self::base_tools(),
             ExposeGroup::Code => Self::code_tools(),
             ExposeGroup::Git => Self::git_tools(),
+            ExposeGroup::Analysis => Self::analysis_tools(),
             ExposeGroup::Lint => Self::lint_tools(),
             ExposeGroup::Security => Self::security_tools(),
             ExposeGroup::SupplyChain => Self::supply_chain_tools(),
@@ -411,22 +419,31 @@ impl ExposeGroup {
             "go_to_definition",
             "get_hover_info",
             "get_type_info",
-            // The same questions at repo scale. Separating these from the
-            // per-symbol tools above would split pairs that cannot be
-            // explained apart: get_callers/get_call_graph,
-            // get_dependencies/get_import_graph,
-            // get_export_map/find_unused_exports.
+            // Callers, callees and metrics in one round trip rather than two.
             "get_call_graph",
-            "get_import_graph",
+            // "where did this value come from" across a function too long to
+            // hold in view — retrieval, not restatement.
+            "get_reaching_definitions",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    /// Derived analysis, as opposed to retrieval. The distinction that puts a
+    /// tool here: its answer is something a caller holding the source can work
+    /// out unaided, so paying schema bytes on every request to offer it is a
+    /// bad trade. Useful to a human reading `narsil-mcp tools list` or driving
+    /// the HTTP frontend, which is why these stay registered.
+    fn analysis_tools() -> HashSet<&'static str> {
+        [
             "get_complexity",
             "get_function_hotspots",
+            "get_import_graph",
             "find_circular_imports",
             "find_unused_exports",
-            // Per-function CFG and def-use views; 984 bytes of schema, not
-            // worth a group of their own.
             "get_control_flow",
             "get_data_flow",
-            "get_reaching_definitions",
         ]
         .iter()
         .copied()
@@ -659,7 +676,8 @@ mod tests {
             ExposeGroup::parse("supply_chain"),
             Some(ExposeGroup::SupplyChain)
         );
-        assert_eq!(ExposeGroup::parse("analysis"), None);
+        assert_eq!(ExposeGroup::parse("analysis"), Some(ExposeGroup::Analysis));
+        assert_eq!(ExposeGroup::parse("structure"), None);
     }
 
     #[test]
@@ -682,6 +700,36 @@ mod tests {
         assert_eq!(ExposeGroup::of("get_callers"), Some(ExposeGroup::Code));
         assert_eq!(ExposeGroup::of("get_blame"), Some(ExposeGroup::Git));
         assert_eq!(ExposeGroup::of("find_dead_stores"), Some(ExposeGroup::Lint));
+        assert_eq!(
+            ExposeGroup::of("get_complexity"),
+            Some(ExposeGroup::Analysis)
+        );
         assert_eq!(ExposeGroup::of("neural_search"), None);
+    }
+
+    /// The two kept in `code` earn it by answering something the caller cannot
+    /// derive from source it is already holding; the rest moved to `analysis`.
+    #[test]
+    fn test_code_keeps_the_retrieval_shaped_graph_tools() {
+        let code = ExposeGroup::Code.tools();
+        assert!(code.contains("get_call_graph"), "saves a round trip");
+        assert!(code.contains("get_reaching_definitions"), "retrieval");
+
+        let analysis = ExposeGroup::Analysis.tools();
+        for restated in [
+            "get_complexity",
+            "get_control_flow",
+            "get_data_flow",
+            "get_import_graph",
+            "get_function_hotspots",
+            "find_circular_imports",
+            "find_unused_exports",
+        ] {
+            assert!(
+                analysis.contains(restated),
+                "{restated} belongs to analysis"
+            );
+            assert!(!code.contains(restated), "{restated} must leave code");
+        }
     }
 }

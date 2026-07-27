@@ -209,6 +209,9 @@ struct ServerArgs {
     ///   code          symbols, references, search, file text; call and
     ///                 import graphs; complexity, hotspots, cycles; CFG views
     ///   git           blame, history, commit diffs, branch state
+    ///   analysis      complexity, hotspots, import graphs, cycles, per-
+    ///                 function control and data flow -- derived from source
+    ///                 you can already read, so off by default
     ///   lint          uninitialized reads, dead stores, dead code, type
     ///                 errors -- your compiler already reports these, with
     ///                 type information narsil does not have. Enable only
