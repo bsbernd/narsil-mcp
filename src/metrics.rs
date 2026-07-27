@@ -543,6 +543,9 @@ pub struct Metrics {
     start_time: Instant,
     /// Session-only counters (reset on process start).
     tool_metrics: RwLock<HashMap<String, MetricStats>>,
+    /// Per-tool response size in bytes. Session-only and not persisted: it
+    /// exists to make an oversized response visible before it costs a session.
+    tool_response_bytes: RwLock<HashMap<String, MetricStats>>,
     repo_index_metrics: RwLock<Vec<RepoIndexMetrics>>,
     file_parse_metrics: RwLock<MetricStats>,
     /// Lifetime counters split into baseline + deltas. See module docs.
@@ -571,6 +574,7 @@ impl Metrics {
         Self {
             start_time: Instant::now(),
             tool_metrics: RwLock::new(HashMap::new()),
+            tool_response_bytes: RwLock::new(HashMap::new()),
             repo_index_metrics: RwLock::new(Vec::new()),
             file_parse_metrics: RwLock::new(MetricStats::new()),
             lifetime: RwLock::new(LifetimeState::fresh(String::new())),
@@ -616,6 +620,7 @@ impl Metrics {
         Self {
             start_time: Instant::now(),
             tool_metrics: RwLock::new(HashMap::new()),
+            tool_response_bytes: RwLock::new(HashMap::new()),
             repo_index_metrics: RwLock::new(Vec::new()),
             file_parse_metrics: RwLock::new(MetricStats::new()),
             lifetime: RwLock::new(lifetime),
@@ -645,6 +650,20 @@ impl Metrics {
             .deltas
             .record_tool(tool_name, duration_ms);
         self.mark_dirty();
+    }
+
+    /// Record the size of a tool's rendered response, before any clamping.
+    pub fn record_tool_response(&self, tool_name: &str, response_bytes: usize) {
+        self.tool_response_bytes
+            .write()
+            .entry(tool_name.to_string())
+            .or_default()
+            .record(response_bytes as u64);
+    }
+
+    /// Per-tool response sizes recorded this session, in bytes.
+    pub fn get_tool_response_bytes(&self) -> HashMap<String, MetricStats> {
+        self.tool_response_bytes.read().clone()
     }
 
     /// Record one query to a reference backend (an LSP backend or language id
@@ -962,6 +981,15 @@ impl Metrics {
         } else {
             output.push_str("*No tool calls recorded this session.*\n");
         }
+        output.push('\n');
+
+        let response_sizes = self.get_tool_response_bytes();
+        output.push_str("## Tool Response Sizes (This Session)\n\n");
+        if !response_sizes.is_empty() {
+            push_response_size_table(&mut output, &response_sizes);
+        } else {
+            output.push_str("*No tool responses recorded this session.*\n");
+        }
 
         output
     }
@@ -994,6 +1022,7 @@ impl Metrics {
                 "total_requests": self.total_requests(),
                 "file_parsing": parse_stats_to_json(&self.get_file_parse_stats()),
                 "tools": session_tools_json,
+                "tool_response_bytes": tool_stats_to_json(&self.get_tool_response_bytes()),
                 "cxx_backends": backend_calls_to_json(&self.get_session_backend_calls()),
             },
             "lifetime": {
@@ -1225,6 +1254,35 @@ fn push_tool_table(output: &mut String, tools: &HashMap<String, MetricStats>) {
                 stats.count.to_string(),
                 format!("{:.2}", stats.avg_ms()),
                 min.to_string(),
+                stats.max_ms.to_string(),
+            ]
+        })
+        .collect();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &data {
+        for (col, cell) in row.iter().enumerate() {
+            widths[col] = widths[col].max(cell.len());
+        }
+    }
+    push_md_row(output, headers.iter().copied(), &widths);
+    push_md_sep(output, &widths);
+    for row in &data {
+        push_md_row(output, row.iter().map(|s| s.as_str()), &widths);
+    }
+}
+
+/// Response sizes reuse MetricStats, whose fields are ms-named but unit-agnostic.
+fn push_response_size_table(output: &mut String, tools: &HashMap<String, MetricStats>) {
+    let headers = ["Tool", "Responses", "Avg (bytes)", "Max (bytes)"];
+    let mut sorted: Vec<_> = tools.iter().collect();
+    sorted.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.max_ms));
+    let data: Vec<[String; 4]> = sorted
+        .iter()
+        .map(|(name, stats)| {
+            [
+                name.to_string(),
+                stats.count.to_string(),
+                format!("{:.0}", stats.avg_ms()),
                 stats.max_ms.to_string(),
             ]
         })
@@ -1849,6 +1907,25 @@ mod tests {
         assert_eq!(stats.min_ms, 50);
         assert_eq!(stats.max_ms, 100);
         assert_eq!(metrics.total_requests(), 3);
+    }
+
+    /// The size regression this series fixes was invisible; the report must
+    /// name the offending tool and its worst response.
+    #[test]
+    fn test_metrics_response_size_recording() {
+        let metrics = Metrics::new();
+        metrics.record_tool_response("get_contributors", 2_231_347);
+        metrics.record_tool_response("get_contributors", 1_000);
+        metrics.record_tool_response("get_callers", 4_500);
+
+        let sizes = metrics.get_tool_response_bytes();
+        let contributors = sizes.get("get_contributors").unwrap();
+        assert_eq!(contributors.count, 2);
+        assert_eq!(contributors.max_ms, 2_231_347);
+
+        let report = metrics.report();
+        assert!(report.contains("Tool Response Sizes (This Session)"));
+        assert!(report.contains("2231347"));
     }
 
     #[test]

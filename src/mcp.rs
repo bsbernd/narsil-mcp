@@ -416,15 +416,22 @@ impl McpServer {
         );
 
         match result {
-            Ok(content) => JsonRpcResponse::success(
-                id,
-                json!({
-                    "content": [{
-                        "type": "text",
-                        "text": crate::response_budget::clamp(content, tool_name)
-                    }]
-                }),
-            ),
+            Ok(content) => {
+                // Record what the tool produced, not what survived the clamp:
+                // the oversized response is the thing worth seeing in stats.
+                self.engine
+                    .metrics
+                    .record_tool_response(tool_name, content.len());
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": crate::response_budget::clamp(content, tool_name)
+                        }]
+                    }),
+                )
+            }
             Err(e) => JsonRpcResponse::error(id, -32000, &e.to_string()),
         }
     }
