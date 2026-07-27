@@ -243,6 +243,274 @@ impl Preset {
     }
 }
 
+/// One switchable band of tools. Unlike a [`Preset`], which names a single
+/// bundle, several groups may be active at once — so the union a caller picked
+/// never needs a name of its own.
+///
+/// A group earns a name when it answers a *different question*, not when it
+/// answers the same question at a different scale: repo-wide call graphs sit in
+/// [`ExposeGroup::Code`] beside the per-symbol lookups, while "does it compile
+/// clean" is [`ExposeGroup::Lint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExposeGroup {
+    /// Addressing a repo and recovering from a stale index. Always folded into
+    /// the union: without these a client cannot name a repository or repair an
+    /// empty answer, whatever else it selected.
+    Base,
+    /// What the code is, at every scale: symbols, references, search, file
+    /// text, LSP lookups; call and import edges both per-symbol and as whole
+    /// graphs; complexity, hotspots, cycles; per-function CFG and def-use.
+    Code,
+    /// Why the code is the way it is: blame, history, commit diffs, branch
+    /// state, contributors.
+    Git,
+    /// Defect finders that duplicate compiler diagnostics. Off by default —
+    /// the build already reports these, with type information narsil lacks.
+    Lint,
+    /// Vulnerability scanning and taint tracking.
+    Security,
+    /// SBOM, licences, dependency and upgrade checks.
+    SupplyChain,
+    /// Chunk and embedding retrieval, similarity search.
+    Retrieval,
+}
+
+/// Tools registered in `TOOL_METADATA` but deliberately not reachable over MCP
+/// (HTTP-only, or gated behind a feature flag). Listed so the partition test
+/// can tell "intentionally ungrouped" from "someone forgot".
+#[cfg(test)]
+const UNGROUPED_TOOLS: [&str; 20] = [
+    "add_remote_repo",
+    "export_ccg",
+    "export_ccg_architecture",
+    "export_ccg_full",
+    "export_ccg_index",
+    "export_ccg_manifest",
+    "find_semantic_clones",
+    "get_ccg_access_info",
+    "get_ccg_acl",
+    "get_ccg_manifest",
+    "get_neural_stats",
+    "get_remote_file",
+    "import_ccg",
+    "import_ccg_from_registry",
+    "list_remote_files",
+    "list_sparql_templates",
+    "neural_search",
+    "query_ccg",
+    "run_sparql_template",
+    "sparql_query",
+];
+
+impl ExposeGroup {
+    /// Every group, in the order they are printed in `--help` and the docs.
+    pub const ALL: [ExposeGroup; 7] = [
+        ExposeGroup::Base,
+        ExposeGroup::Code,
+        ExposeGroup::Git,
+        ExposeGroup::Lint,
+        ExposeGroup::Security,
+        ExposeGroup::SupplyChain,
+        ExposeGroup::Retrieval,
+    ];
+
+    /// The CLI spelling of this group.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ExposeGroup::Base => "base",
+            ExposeGroup::Code => "code",
+            ExposeGroup::Git => "git",
+            ExposeGroup::Lint => "lint",
+            ExposeGroup::Security => "security",
+            ExposeGroup::SupplyChain => "supply-chain",
+            ExposeGroup::Retrieval => "retrieval",
+        }
+    }
+
+    /// Parse a group from a string; hyphen and underscore both work.
+    pub fn parse(s: &str) -> Option<Self> {
+        let normalized = s.to_lowercase().replace('_', "-");
+        ExposeGroup::ALL
+            .iter()
+            .copied()
+            .find(|g| g.name() == normalized)
+    }
+
+    /// Tool names belonging to this group.
+    pub fn tools(&self) -> HashSet<&'static str> {
+        match self {
+            ExposeGroup::Base => Self::base_tools(),
+            ExposeGroup::Code => Self::code_tools(),
+            ExposeGroup::Git => Self::git_tools(),
+            ExposeGroup::Lint => Self::lint_tools(),
+            ExposeGroup::Security => Self::security_tools(),
+            ExposeGroup::SupplyChain => Self::supply_chain_tools(),
+            ExposeGroup::Retrieval => Self::retrieval_tools(),
+        }
+    }
+
+    /// Which group owns a tool. `None` for the deliberately ungrouped ones.
+    /// Not a hot path — the renderer walks groups, not tools.
+    pub fn of(tool: &str) -> Option<Self> {
+        ExposeGroup::ALL
+            .iter()
+            .copied()
+            .find(|g| g.tools().contains(tool))
+    }
+
+    /// Union of the selected groups, with `Base` always folded in. An empty
+    /// selection yields an empty set, which the filter reads as "no group
+    /// filter — defer to the preset".
+    pub fn union(groups: &[ExposeGroup]) -> HashSet<&'static str> {
+        if groups.is_empty() {
+            return HashSet::new();
+        }
+
+        let mut tools = Self::base_tools();
+        for group in groups {
+            tools.extend(group.tools());
+        }
+        tools
+    }
+
+    fn base_tools() -> HashSet<&'static str> {
+        [
+            "list_repos",
+            "get_index_status",
+            // The documented recovery when a query comes back empty.
+            "reindex",
+            "discover_repos",
+            "validate_repo",
+            "get_metrics",
+            "get_incremental_status",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn code_tools() -> HashSet<&'static str> {
+        [
+            "get_project_structure",
+            "get_file",
+            "get_excerpt",
+            "find_symbols",
+            "get_symbol_definition",
+            "find_symbol_usages",
+            "find_references",
+            "get_dependencies",
+            "get_export_map",
+            "search_code",
+            "semantic_search",
+            "hybrid_search",
+            "get_callers",
+            "get_callees",
+            "find_call_path",
+            // Gated behind FeatureFlag::Lsp already, so these disappear on
+            // their own when no language server is configured.
+            "go_to_definition",
+            "get_hover_info",
+            "get_type_info",
+            // The same questions at repo scale. Separating these from the
+            // per-symbol tools above would split pairs that cannot be
+            // explained apart: get_callers/get_call_graph,
+            // get_dependencies/get_import_graph,
+            // get_export_map/find_unused_exports.
+            "get_call_graph",
+            "get_import_graph",
+            "get_complexity",
+            "get_function_hotspots",
+            "find_circular_imports",
+            "find_unused_exports",
+            // Per-function CFG and def-use views; 984 bytes of schema, not
+            // worth a group of their own.
+            "get_control_flow",
+            "get_data_flow",
+            "get_reaching_definitions",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn git_tools() -> HashSet<&'static str> {
+        [
+            "get_blame",
+            "get_file_history",
+            "get_symbol_history",
+            "get_recent_changes",
+            "get_commit_diff",
+            "get_branch_info",
+            "get_modified_files",
+            "get_contributors",
+            "get_hotspots",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn lint_tools() -> HashSet<&'static str> {
+        [
+            "find_dead_code",
+            "find_dead_stores",
+            "find_uninitialized",
+            "check_type_errors",
+            "infer_types",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn security_tools() -> HashSet<&'static str> {
+        [
+            "scan_security",
+            "security_audit",
+            "get_security_summary",
+            "check_owasp_top10",
+            "check_cwe_top25",
+            "find_injection_vulnerabilities",
+            "trace_taint",
+            "get_taint_sources",
+            "get_typed_taint_flow",
+            "explain_vulnerability",
+            "suggest_fix",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn supply_chain_tools() -> HashSet<&'static str> {
+        [
+            "generate_sbom",
+            "check_dependencies",
+            "check_licenses",
+            "find_upgrade_path",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+
+    fn retrieval_tools() -> HashSet<&'static str> {
+        [
+            "get_chunks",
+            "search_chunks",
+            "get_chunk_stats",
+            "get_embedding_stats",
+            "find_similar_code",
+            "find_similar_to_symbol",
+            "workspace_symbol_search",
+            "get_code_graph",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +606,82 @@ mod tests {
             Some(Preset::SecurityFocused)
         );
         assert_eq!(Preset::parse("unknown"), None);
+    }
+
+    /// A tool added to the registry must be assigned a group or explicitly
+    /// opted out; otherwise it is unreachable under any `--expose` and nothing
+    /// says so.
+    #[test]
+    fn test_expose_groups_partition_registry() {
+        use crate::tool_metadata::TOOL_METADATA;
+
+        let ungrouped: HashSet<&str> = UNGROUPED_TOOLS.iter().copied().collect();
+
+        for tool_name in TOOL_METADATA.keys() {
+            let owners: Vec<&'static str> = ExposeGroup::ALL
+                .iter()
+                .filter(|g| g.tools().contains(tool_name))
+                .map(|g| g.name())
+                .collect();
+
+            assert!(
+                owners.len() <= 1,
+                "{} belongs to several groups: {:?}",
+                tool_name,
+                owners
+            );
+            assert_eq!(
+                owners.len() == 1,
+                !ungrouped.contains(tool_name),
+                "{}: assign it to an ExposeGroup or add it to UNGROUPED_TOOLS",
+                tool_name
+            );
+        }
+
+        for tool in UNGROUPED_TOOLS {
+            assert!(
+                TOOL_METADATA.contains_key(tool),
+                "UNGROUPED_TOOLS names {}, which is not in the registry",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_expose_parse() {
+        assert_eq!(ExposeGroup::parse("code"), Some(ExposeGroup::Code));
+        assert_eq!(ExposeGroup::parse("CODE"), Some(ExposeGroup::Code));
+        assert_eq!(
+            ExposeGroup::parse("supply-chain"),
+            Some(ExposeGroup::SupplyChain)
+        );
+        assert_eq!(
+            ExposeGroup::parse("supply_chain"),
+            Some(ExposeGroup::SupplyChain)
+        );
+        assert_eq!(ExposeGroup::parse("analysis"), None);
+    }
+
+    #[test]
+    fn test_expose_union_always_folds_in_base() {
+        let tools = ExposeGroup::union(&[ExposeGroup::Git]);
+        assert!(tools.contains("get_blame"));
+        assert!(tools.contains("list_repos"), "base must always be present");
+        assert!(!tools.contains("find_symbols"));
+    }
+
+    /// Empty means "no group filter", not "expose nothing" — the filter falls
+    /// back to the preset.
+    #[test]
+    fn test_expose_union_empty_is_empty() {
+        assert!(ExposeGroup::union(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_expose_of_names_the_owning_group() {
+        assert_eq!(ExposeGroup::of("get_callers"), Some(ExposeGroup::Code));
+        assert_eq!(ExposeGroup::of("get_blame"), Some(ExposeGroup::Git));
+        assert_eq!(ExposeGroup::of("find_dead_stores"), Some(ExposeGroup::Lint));
+        assert_eq!(ExposeGroup::of("neural_search"), None);
     }
 }

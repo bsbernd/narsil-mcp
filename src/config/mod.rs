@@ -24,7 +24,10 @@ pub mod wizard;
 // Re-export main types used by other modules and tests
 pub use cli::{handle_config_command, handle_tools_command, ConfigCommand, ToolsCommand};
 pub use filter::{ClientInfo, ToolFilter};
+// Unlike Preset, ExposeGroup is part of the CLI surface: main.rs parses
+// --expose into it and hands the result to the filter.
 pub use loader::ConfigLoader;
+pub use preset::ExposeGroup;
 pub use validation::validate_config;
 
 // Schema types are available at narsil_mcp::config::schema::{CategoryConfig, ...}
