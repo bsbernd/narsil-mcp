@@ -372,7 +372,13 @@ impl McpServer {
                     "version": SERVER_VERSION
                 },
                 "capabilities": {
-                    "tools": {},
+                    // The tool set is fixed for a process lifetime, so this
+                    // server never changes it mid-session. The notification
+                    // exists for the one case where a client's view can go
+                    // stale without the client noticing: the stdio proxy
+                    // reconnecting to a restarted daemon that may have been
+                    // started with a different --expose or --preset.
+                    "tools": { "listChanged": true },
                     "resources": {
                         "subscribe": false,
                         "listChanged": false

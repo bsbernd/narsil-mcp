@@ -65,7 +65,19 @@ struct ProxySession {
     init_request: Option<String>,
     /// The `notifications/initialized` line, replayed after `initialize`.
     initialized_notification: Option<String>,
+    /// Set when a reconnect re-established the session behind the client's
+    /// back. The client never saw a disconnect, so it will not re-read
+    /// `tools/list` on its own — and the restarted server may have been
+    /// started with a different `--expose`. Drained by the proxy loop, which
+    /// owns stdout.
+    tools_may_have_changed: bool,
 }
+
+/// Emitted to the client after a transparent reconnect. The proxy cannot tell
+/// whether the restarted server's tool set actually differs — comparing would
+/// cost a full `tools/list` round trip on every reconnect — so this is the
+/// "may have changed" signal the MCP capability is defined as.
+const TOOLS_LIST_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 /// Result of forwarding one stdin line upstream.
 enum Forward {
@@ -91,6 +103,7 @@ impl ProxySession {
             session_id: None,
             init_request: None,
             initialized_notification: None,
+            tools_may_have_changed: false,
         })
     }
 
@@ -308,6 +321,10 @@ impl ProxySession {
                 match self.replay_handshake().await {
                     Ok(()) => {
                         info!("Proxy reconnected to {}", url);
+                        // The client saw no disconnect, so it will not re-read
+                        // tools/list by itself; the new server may serve a
+                        // different set.
+                        self.tools_may_have_changed = true;
                         return Ok(());
                     }
                     Err(e) => warn!("Proxy reconnect: handshake replay failed: {}", e),
@@ -377,6 +394,72 @@ pub async fn run_stdio_proxy_with_shutdown(base_url: &str, repos: &[PathBuf]) ->
     }
 }
 
+/// Write the one-line `tools/list_changed` notification if a reconnect
+/// happened, then clear the flag. One ~60-byte line per reconnect: no polling,
+/// no diffing, and nothing at all on the steady-state path.
+///
+/// Suppressed when the request that hit the restart was itself `tools/list` —
+/// its reply already carries the new server's list, so telling the client to
+/// fetch it again would buy nothing and cost a round trip.
+async fn notify_tools_changed(
+    session: &mut ProxySession,
+    stdout: &mut tokio::io::Stdout,
+    answered: &str,
+) -> Result<()> {
+    if !std::mem::take(&mut session.tools_may_have_changed) {
+        return Ok(());
+    }
+    if method_of(answered).as_deref() == Some("tools/list") {
+        debug!("proxy: reconnect answered by a tools/list; no notification needed");
+        return Ok(());
+    }
+
+    info!("Proxy → client: tools/list_changed (server restarted)");
+    stdout.write_all(TOOLS_LIST_CHANGED.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// The `method` of a JSON-RPC line, if it parses.
+fn method_of(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("method")?
+        .as_str()
+        .map(String::from)
+}
+
+#[cfg(test)]
+mod list_changed_tests {
+    use super::*;
+
+    #[test]
+    fn test_notification_is_valid_jsonrpc_without_an_id() {
+        let value: Value = serde_json::from_str(TOOLS_LIST_CHANGED).expect("valid JSON");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "notifications/tools/list_changed");
+        assert!(
+            value.get("id").is_none(),
+            "a notification must carry no id, or clients answer it"
+        );
+    }
+
+    #[test]
+    fn test_method_of_reads_requests_and_notifications() {
+        assert_eq!(
+            method_of(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).as_deref(),
+            Some("tools/list")
+        );
+        assert_eq!(
+            method_of(TOOLS_LIST_CHANGED).as_deref(),
+            Some("notifications/tools/list_changed")
+        );
+        assert_eq!(method_of(r#"{"jsonrpc":"2.0","id":1}"#), None);
+        assert_eq!(method_of("not json"), None);
+    }
+}
+
 async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -407,6 +490,7 @@ async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
         match session.forward(trimmed).await? {
             Forward::Accepted => {
                 debug!("proxy ← 202 Accepted (notification)");
+                notify_tools_changed(session, &mut stdout, trimmed).await?;
                 continue;
             }
             Forward::Body(body) => {
@@ -419,6 +503,9 @@ async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
                     stdout.write_all(b"\n").await?;
                 }
                 stdout.flush().await?;
+                // After the reply to the request that hit the restart, so the
+                // client is not handed a notification mid-request.
+                notify_tools_changed(session, &mut stdout, trimmed).await?;
             }
         }
     }

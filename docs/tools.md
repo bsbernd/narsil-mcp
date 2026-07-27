@@ -51,11 +51,16 @@ expect every other 'lint' tool to be unavailable too. To enable it, add 'lint'
 to --expose or to `expose:` in config.yaml and restart the server.
 ```
 
-That matters after a change, because the server does not advertise the
-`listChanged` tool capability and never emits
-`notifications/tools/list_changed`: a client connected before a restart keeps
-its old list until it re-lists, so it will try tools that are gone. It now
-gets told, once, per tool. Restart the client to pick up the new set cleanly.
+Clients are also told when the set changes. The server advertises
+`"tools": {"listChanged": true}`, and after the stdio proxy transparently
+reconnects to a restarted daemon it emits
+`notifications/tools/list_changed` to the client, which re-reads `tools/list`.
+
+That one path is the only place a client's view can go stale without it
+noticing — the tool set is fixed for a process lifetime, so nothing polls or
+diffs anything. The notification is a single ~60-byte line per reconnect, and
+it is skipped entirely when the request that hit the restart was itself a
+`tools/list`, since that reply already carries the new list.
 
 Two limits worth knowing. `--preset` is **not** enforced this way — only
 `--expose` is, because exposed groups are a server-wide statement while a
