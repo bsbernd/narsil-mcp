@@ -272,6 +272,11 @@ pub struct RepoProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
 
+    /// Tool groups to expose with this profile, e.g. `[code, git]`.
+    /// Same values as `--expose`, which takes precedence when both are set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+
     /// Enable git integration for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<bool>,

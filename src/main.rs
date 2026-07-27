@@ -200,6 +200,30 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_PRESET")]
     preset: Option<String>,
 
+    /// Expose only these tool groups in tools/list. Example: --expose code,git
+    ///
+    /// Comma-separated and composable; repo-addressing tools are always
+    /// present. Empty falls back to --preset. Tool schemas are re-sent on
+    /// every request, so an unused group costs context all session.
+    ///
+    ///   code          symbols, references, search, file text; call and
+    ///                 import graphs; complexity, hotspots, cycles; CFG views
+    ///   git           blame, history, commit diffs, branch state
+    ///   lint          uninitialized reads, dead stores, dead code, type
+    ///                 errors -- your compiler already reports these, with
+    ///                 type information narsil does not have. Enable only
+    ///                 where no compiler covers the source.
+    ///   security      vulnerability scanning and taint tracking
+    ///   supply-chain  SBOM, licences, dependency and upgrade checks
+    ///   retrieval     chunk/embedding retrieval and similarity search
+    #[arg(
+        long,
+        env = "NARSIL_EXPOSE",
+        value_delimiter = ',',
+        verbatim_doc_comment
+    )]
+    expose: Vec<String>,
+
     /// TF-IDF embedding dimension (default: 512).
     /// Lower values reduce memory usage; higher values improve find_similar_code accuracy.
     #[arg(long, env = "NARSIL_EMBEDDING_DIM")]
@@ -328,6 +352,10 @@ async fn main() -> Result<()> {
 
     info!("Repos to index: {:?}", repos);
 
+    // Resolve before the discovery probe below: a typo must fail the process
+    // whether or not this invocation ends up delegating.
+    let expose = parse_expose_groups(&server_args.expose)?;
+
     // Stdio auto-discovery: if a long-running SSE narsil-mcp is already
     // indexing a superset of these repos, delegate to it and skip local
     // engine construction entirely. The probe is a single MCP `ping`;
@@ -345,6 +373,15 @@ async fn main() -> Result<()> {
                 .flatten();
         if let Some(proxy_url) = discovered {
             info!("SSE discovery: delegating stdio to {}", proxy_url);
+            // The upstream daemon decides its own tool list; nothing on this
+            // side can narrow it, so say so rather than appear to have applied it.
+            if !expose.is_empty() {
+                warn!(
+                    "--expose is ignored when delegating to {}: the upstream server's \
+                     own --expose/--preset decides the tool list",
+                    proxy_url
+                );
+            }
             // Record this delegating process so `narsil-mcp stats` can show the
             // stdio→SSE link; the guard removes the file on a clean return.
             let _pid_status_entry = pid_status::write_status(&pid_status::PidStatus::new(
@@ -641,8 +678,7 @@ async fn main() -> Result<()> {
                 });
             }
 
-            let server =
-                mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset, Vec::new());
+            let server = mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset, expose);
             run_stdio_with_shutdown(server).await
         }
         Transport::Sse => {
@@ -674,7 +710,7 @@ async fn main() -> Result<()> {
             let mcp_server = Arc::new(mcp::McpServer::from_arc(
                 Arc::clone(&engine),
                 server_args.preset,
-                Vec::new(),
+                expose,
             ));
             info!(
                 "Starting MCP SSE transport on http://{}:{}/mcp/sse",
@@ -767,6 +803,25 @@ async fn run_http_with_shutdown(server: http_server::HttpServer) -> Result<()> {
     }
 }
 
+/// Resolve `--expose` group names. Rejected here rather than by clap's value
+/// parser so the error can name the valid groups; a typo must fail the process
+/// instead of quietly exposing a different tool set.
+fn parse_expose_groups(names: &[String]) -> Result<Vec<config::ExposeGroup>> {
+    names
+        .iter()
+        .map(|name| {
+            config::ExposeGroup::parse(name).ok_or_else(|| {
+                let valid: Vec<&str> = config::ExposeGroup::ALL.iter().map(|g| g.name()).collect();
+                anyhow::anyhow!(
+                    "Unknown --expose group '{}'. Valid groups: {}",
+                    name,
+                    valid.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
 /// Apply a named repository profile from the loaded configuration.
 ///
 /// Explicit CLI/env values remain authoritative. Profiles provide defaults for
@@ -819,6 +874,9 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     }
     if server_args.preset.is_none() {
         server_args.preset = profile.preset.clone();
+    }
+    if server_args.expose.is_empty() {
+        server_args.expose = profile.expose.clone();
     }
 
     apply_bool_default(&mut server_args.git, profile.git);
