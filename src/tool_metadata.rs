@@ -169,7 +169,7 @@ lazy_static! {
 
         map.insert("get_file", ToolMetadata {
             name: "get_file",
-            description: "Get the contents of a specific file with optional line range",
+            description: "File contents, optionally one contiguous start_line..end_line range. For context around scattered line numbers use get_excerpt.",
             category: ToolCategory::Repository,
             tags: ["file", "read", "content"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -191,7 +191,7 @@ lazy_static! {
 
         map.insert("get_excerpt", ToolMetadata {
             name: "get_excerpt",
-            description: "Extract code excerpts around specific lines with intelligent context expansion. Automatically expands to function/class boundaries when enabled.",
+            description: "Context around a list of specific line numbers, expanded to function or class boundaries. Takes `lines`, not a range — for a range use get_file.",
             category: ToolCategory::Repository,
             tags: ["excerpt", "context", "lines", "code"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -236,7 +236,7 @@ lazy_static! {
 
         map.insert("validate_repo", ToolMetadata {
             name: "validate_repo",
-            description: "Validate that a path is a valid repository and can be indexed",
+            description: "Check whether a path is a repository narsil can index, before adding it.",
             category: ToolCategory::Repository,
             tags: ["validate", "repository", "check"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -255,7 +255,7 @@ lazy_static! {
 
         map.insert("reindex", ToolMetadata {
             name: "reindex",
-            description: "Trigger re-indexing of a repository or all repositories",
+            description: "Re-index one repository or all of them. The first move when a query returns nothing for code you know exists.",
             category: ToolCategory::Repository,
             tags: ["reindex", "index", "refresh"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -333,7 +333,7 @@ lazy_static! {
 
         map.insert("find_symbols", ToolMetadata {
             name: "find_symbols",
-            description: "Find data structures (structs, classes, enums, interfaces) and functions/methods in a repository. Supports filtering by type and name pattern.",
+            description: "Find structs, classes, enums, interfaces, functions and methods by name pattern or kind. Exact and glob matching; for typo tolerance use workspace_symbol_search.",
             category: ToolCategory::Symbols,
             tags: ["symbols", "find", "search", "structs", "functions"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -379,7 +379,7 @@ lazy_static! {
 
         map.insert("find_references", ToolMetadata {
             name: "find_references",
-            description: "Find all references to a symbol across the codebase",
+            description: "Every reference to a symbol, unioning LSP hits with text matches. To resolve imports and re-exports as well, use find_symbol_usages.",
             category: ToolCategory::Symbols,
             tags: ["references", "usages", "symbol", "find"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -403,7 +403,7 @@ lazy_static! {
 
         map.insert("get_dependencies", ToolMetadata {
             name: "get_dependencies",
-            description: "Analyze dependencies and imports for a file or module",
+            description: "Imports and module dependencies of one source file. For package manifests and their CVEs use check_dependencies instead.",
             category: ToolCategory::Symbols,
             tags: ["dependencies", "imports", "module", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -424,7 +424,7 @@ lazy_static! {
 
         map.insert("find_symbol_usages", ToolMetadata {
             name: "find_symbol_usages",
-            description: "Find all usages of a symbol across files, including imports and re-exports. Cross-language aware for JS/TS projects.",
+            description: "Usages of a symbol including its imports and re-exports, cross-language aware for JS/TS. For plain reference sites, find_references.",
             category: ToolCategory::Symbols,
             tags: ["symbol", "usages", "imports", "exports"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -466,7 +466,7 @@ lazy_static! {
 
         map.insert("workspace_symbol_search", ToolMetadata {
             name: "workspace_symbol_search",
-            description: "Fuzzy search for symbols across the entire workspace. Uses trigram matching for typo-tolerant search.",
+            description: "Typo-tolerant trigram symbol search across every indexed repo — takes no repo argument and is far slower than find_symbols. Use when the exact name is unknown.",
             category: ToolCategory::Symbols,
             tags: ["search", "symbols", "fuzzy", "workspace"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -489,7 +489,7 @@ lazy_static! {
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
-            description: "Semantic and keyword search across code. Returns ranked excerpts with surrounding context.",
+            description: "Keyword and phrase search across code — the default when you know the terms to look for. Returns ranked excerpts with context.",
             category: ToolCategory::Search,
             tags: ["search", "code", "keyword", "semantic"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -512,7 +512,7 @@ lazy_static! {
 
         map.insert("semantic_search", ToolMetadata {
             name: "semantic_search",
-            description: "BM25-ranked semantic search with code-aware tokenization. Better than simple text search for natural language queries.",
+            description: "Ranked search for a natural-language description of code, using BM25 with code-aware tokenization. Lexical despite the name — no embeddings.",
             category: ToolCategory::Search,
             tags: ["search", "semantic", "bm25", "ranking"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -535,7 +535,7 @@ lazy_static! {
 
         map.insert("hybrid_search", ToolMetadata {
             name: "hybrid_search",
-            description: "Perform hybrid search combining BM25 keyword search with TF-IDF semantic similarity using Reciprocal Rank Fusion (RRF).",
+            description: "Fuses keyword ranking with TF-IDF similarity (Reciprocal Rank Fusion). Slowest of the three searches; reach for it when keywords alone miss.",
             category: ToolCategory::Search,
             tags: ["search", "hybrid", "bm25", "tfidf", "rrf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -579,7 +579,7 @@ lazy_static! {
 
         map.insert("search_chunks", ToolMetadata {
             name: "search_chunks",
-            description: "Search over AST-aware code chunks with symbol context.",
+            description: "Search at chunk granularity, each hit carrying its symbol context. Usually search_code or semantic_search is what you want.",
             category: ToolCategory::Search,
             tags: ["search", "chunks", "ast", "semantic"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -602,7 +602,7 @@ lazy_static! {
 
         map.insert("find_similar_code", ToolMetadata {
             name: "find_similar_code",
-            description: "Find code similar to a given snippet using TF-IDF embeddings. Good for finding duplicate or related code patterns.",
+            description: "Code resembling a snippet you supply, by TF-IDF vector similarity. Finds near-duplicates; for meaning-based lookup use semantic_search.",
             category: ToolCategory::Search,
             tags: ["similar", "duplicate", "clone", "tfidf"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -624,7 +624,7 @@ lazy_static! {
 
         map.insert("find_similar_to_symbol", ToolMetadata {
             name: "find_similar_to_symbol",
-            description: "Find code similar to a specific symbol (function, class, etc.). Useful for finding related implementations or potential duplicates.",
+            description: "Near-duplicates of a named symbol, by TF-IDF vector similarity. Only symbols whose signature was captured at index time are present.",
             category: ToolCategory::Search,
             tags: ["similar", "symbol", "clone", "duplicate"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -667,7 +667,7 @@ lazy_static! {
 
         map.insert("get_embedding_stats", ToolMetadata {
             name: "get_embedding_stats",
-            description: "Get statistics about the embedding index.",
+            description: "Document count, vocabulary size and dimension of the TF-IDF index behind find_similar_code. Diagnostics, not a code query.",
             category: ToolCategory::Search,
             tags: ["stats", "embedding", "tfidf", "index"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -693,7 +693,7 @@ lazy_static! {
 
         map.insert("get_chunk_stats", ToolMetadata {
             name: "get_chunk_stats",
-            description: "Get statistics about code chunks in a repository.",
+            description: "Chunk counts and sizes for a repository — diagnostics for the chunker, not a code query.",
             category: ToolCategory::Search,
             tags: ["stats", "chunks", "ast", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -712,7 +712,7 @@ lazy_static! {
 
         map.insert("get_chunks", ToolMetadata {
             name: "get_chunks",
-            description: "Get AST-aware code chunks for a file with symbol context.",
+            description: "Inspect how the chunker split one file. A debug view of the index behind semantic_search — re-emits the whole file.",
             category: ToolCategory::Search,
             tags: ["chunks", "ast", "code", "symbols"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -735,7 +735,7 @@ lazy_static! {
 
         map.insert("get_call_graph", ToolMetadata {
             name: "get_call_graph",
-            description: "Get the call graph for a repository or specific function. Requires --call-graph flag.",
+            description: "Callers, callees and complexity for one function in a single call, or the whole repository's graph. Requires --call-graph flag.",
             category: ToolCategory::CallGraph,
             tags: ["callgraph", "dependencies", "analysis", "graph"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -1384,7 +1384,7 @@ lazy_static! {
 
         map.insert("suggest_fix", ToolMetadata {
             name: "suggest_fix",
-            description: "Get suggested fixes for a specific security finding.",
+            description: "Suggested remediation for one security finding, by file and line. Pair with scan_security output.",
             category: ToolCategory::Security,
             tags: ["security", "fix", "remediation", "suggestion"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -1753,7 +1753,7 @@ lazy_static! {
 
         map.insert("get_code_graph", ToolMetadata {
             name: "get_code_graph",
-            description: "Get graph visualization data (call graph, import graph, symbols). HTTP-only tool, not available via MCP.",
+            description: "Whole-repo graph data as raw JSON for the visualization frontend. Very large; over MCP prefer get_call_graph or get_import_graph.",
             category: ToolCategory::Graph,
             tags: ["graph", "visualization", "http", "callgraph", "imports"].iter().copied().collect(),
             stability: StabilityLevel::Experimental,

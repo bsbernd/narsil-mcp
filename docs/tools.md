@@ -5,7 +5,7 @@ group it belongs to, and which ones not to trust.
 
 Tool schemas cost context on **every** request, not once per session: the MCP
 protocol is stateless, so the client re-sends the whole tool block with each
-turn. The full set is 33,588 bytes (~8.4k tokens). `--expose` selects which
+turn. The full set is 34,451 bytes (~8.6k tokens). `--expose` selects which
 groups ship, so a session that only navigates source does not carry the
 security scanner's schemas in its context window all day.
 
@@ -38,15 +38,15 @@ Treat `--expose` as a context-window budget, not as access control.
 
 | group | tools | schema bytes | in the recommended default? |
 |---|---|---|---|
-| `base` | 7 | 2,619 | always |
-| `code` | 27 | 14,677 | yes |
+| `base` | 7 | 2,684 | always |
+| `code` | 27 | 15,061 | yes |
 | `git` | 9 | 3,205 | yes |
 | `lint` | 5 | 2,055 | no — the compiler already reports these |
-| `security` | 11 | 5,576 | no — enable for an audit |
+| `security` | 11 | 5,621 | no — enable for an audit |
 | `supply-chain` | 4 | 1,933 | no — enable for a dependency review |
-| `retrieval` | 8 | 3,531 | no — see caveats |
+| `retrieval` | 8 | 3,898 | no — see caveats |
 
-`--expose code,git` is 43 tools and 20,497 bytes (~5.1k tokens), 61% of the
+`--expose code,git` is 43 tools and 20,948 bytes (~5.2k tokens), 61% of the
 full block.
 
 A group earns a name when it answers a **different question**, not when it
@@ -122,8 +122,8 @@ Mostly diagnostics for the machinery under `semantic_search` and
 | `get_index_status` | — | Get status of the search index and enabled features |
 | `get_metrics` | — | Get performance metrics including tool execution times, indexing statistics, and server uptime |
 | `list_repos` | — | List indexed repositories (path, file/line counts) |
-| `reindex` | — | Trigger re-indexing of a repository or all repositories |
-| `validate_repo` | path | Validate that a path is a valid repository and can be indexed |
+| `reindex` | — | Re-index one repository or all of them |
+| `validate_repo` | path | Check whether a path is a repository narsil can index, before adding it |
 
 ### `code`
 
@@ -131,20 +131,20 @@ Mostly diagnostics for the machinery under `semantic_search` and
 |---|---|---|
 | `find_call_path` | from, to | Find the call path between two functions |
 | `find_circular_imports` | — | Detect circular import dependencies in the codebase |
-| `find_references` | symbol | Find all references to a symbol across the codebase |
-| `find_symbol_usages` | symbol | Find all usages of a symbol across files, including imports and re-exports |
-| `find_symbols` | — | Find data structures (structs, classes, enums, interfaces) and functions/methods in a repository |
+| `find_references` | symbol | Every reference to a symbol, unioning LSP hits with text matches |
+| `find_symbol_usages` | symbol | Usages of a symbol including its imports and re-exports, cross-language aware for JS/TS |
+| `find_symbols` | — | Find structs, classes, enums, interfaces, functions and methods by name pattern or kind |
 | `find_unused_exports` | — | Detect exported symbols never imported by other files in repo |
-| `get_call_graph` | — | Get the call graph for a repository or specific function |
+| `get_call_graph` | — | Callers, callees and complexity for one function in a single call, or the whole repository's graph |
 | `get_callees` | function | Find functions called by a given function |
 | `get_callers` | function | Find functions that call a given function |
 | `get_complexity` | function | Get complexity metrics (cyclomatic, cognitive) for a function |
 | `get_control_flow` | path, function | Get the control flow graph (CFG) for a function, showing basic blocks, branches, and loops |
 | `get_data_flow` | path, function | Get data flow analysis for a function, showing variable definitions and uses |
-| `get_dependencies` | path | Analyze dependencies and imports for a file or module |
-| `get_excerpt` | path, lines | Extract code excerpts around specific lines with intelligent context expansion |
+| `get_dependencies` | path | Imports and module dependencies of one source file |
+| `get_excerpt` | path, lines | Context around a list of specific line numbers, expanded to function or class boundaries |
 | `get_export_map` | path | Get the export map for a file or module showing all exported symbols and their types |
-| `get_file` | path | Get the contents of a specific file with optional line range |
+| `get_file` | path | File contents, optionally one contiguous start_line..end_line range |
 | `get_function_hotspots` | — | Find highly connected functions (potential refactoring targets) based on call graph analysis |
 | `get_hover_info` | path, line, character | Get hover information (type info, documentation) for a symbol at a specific position |
 | `get_import_graph` | — | Build and analyze the import/dependency graph for a codebase |
@@ -153,9 +153,9 @@ Mostly diagnostics for the machinery under `semantic_search` and
 | `get_symbol_definition` | symbol | Get the full definition of a symbol with surrounding context |
 | `get_type_info` | path, line, character | Get precise type information for a symbol |
 | `go_to_definition` | path, line, character | Find the definition location of a symbol at a specific position |
-| `hybrid_search` | query | Perform hybrid search combining BM25 keyword search with TF-IDF semantic similarity using Reciprocal Rank Fusion (RRF) |
-| `search_code` | query | Semantic and keyword search across code |
-| `semantic_search` | query | BM25-ranked semantic search with code-aware tokenization |
+| `hybrid_search` | query | Fuses keyword ranking with TF-IDF similarity (Reciprocal Rank Fusion) |
+| `search_code` | query | Keyword and phrase search across code — the default when you know the terms to look for |
+| `semantic_search` | query | Ranked search for a natural-language description of code, using BM25 with code-aware tokenization |
 
 ### `git`
 
@@ -194,7 +194,7 @@ Mostly diagnostics for the machinery under `semantic_search` and
 | `get_typed_taint_flow` | path, source_line | Enhanced taint analysis with type information |
 | `scan_security` | — | Scan repository for security issues using the security rules engine |
 | `security_audit` | — | Run every security pass the engine supports (pattern rules, symbolic CWE-122 heap-overflow detection, taint-flow analysis) and return a single ranked report with a summary panel up top |
-| `suggest_fix` | path, line | Get suggested fixes for a specific security finding |
+| `suggest_fix` | path, line | Suggested remediation for one security finding, by file and line |
 | `trace_taint` | path, line | Trace how tainted data flows from a source location through the code |
 
 ### `supply-chain`
@@ -210,14 +210,14 @@ Mostly diagnostics for the machinery under `semantic_search` and
 
 | tool | required args | what it answers |
 |---|---|---|
-| `find_similar_code` | query | Find code similar to a given snippet using TF-IDF embeddings |
-| `find_similar_to_symbol` | symbol | Find code similar to a specific symbol (function, class, etc.) |
-| `get_chunk_stats` | — | Get statistics about code chunks in a repository |
-| `get_chunks` | path | Get AST-aware code chunks for a file with symbol context |
-| `get_code_graph` | — | Get graph visualization data (call graph, import graph, symbols) |
-| `get_embedding_stats` | — | Get statistics about the embedding index |
-| `search_chunks` | query | Search over AST-aware code chunks with symbol context |
-| `workspace_symbol_search` | query | Fuzzy search for symbols across the entire workspace |
+| `find_similar_code` | query | Code resembling a snippet you supply, by TF-IDF vector similarity |
+| `find_similar_to_symbol` | symbol | Near-duplicates of a named symbol, by TF-IDF vector similarity |
+| `get_chunk_stats` | — | Chunk counts and sizes for a repository — diagnostics for the chunker, not a code query |
+| `get_chunks` | path | Inspect how the chunker split one file |
+| `get_code_graph` | — | Whole-repo graph data as raw JSON for the visualization frontend |
+| `get_embedding_stats` | — | Document count, vocabulary size and dimension of the TF-IDF index behind find_similar_code |
+| `search_chunks` | query | Search at chunk granularity, each hit carrying its symbol context |
+| `workspace_symbol_search` | query | Typo-tolerant trigram symbol search across every indexed repo — takes no repo argument and is far slower than find_symbols |
 <!-- END GENERATED -->
 
 ## Paging
