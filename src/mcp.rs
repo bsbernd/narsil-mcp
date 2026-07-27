@@ -421,7 +421,7 @@ impl McpServer {
                 json!({
                     "content": [{
                         "type": "text",
-                        "text": content
+                        "text": crate::response_budget::clamp(content, tool_name)
                     }]
                 }),
             ),

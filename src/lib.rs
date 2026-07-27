@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod parser;
 pub mod pid_status;
 pub mod repo;
+pub mod response_budget;
 pub mod search;
 pub mod security_config;
 pub mod security_rules;
