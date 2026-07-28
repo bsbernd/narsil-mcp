@@ -808,6 +808,21 @@ fn is_compile_commands_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A branch switch rewrites the worktree, and the `.git/HEAD` write precedes
+/// it — the earliest signal that a burst of file changes is coming. It has to
+/// survive the source-extension filter, like compile_commands.json.
+///
+/// A linked worktree keeps its HEAD in `<main>/.git/worktrees/<name>/HEAD`,
+/// outside the watched root, so a switch there is not seen here.
+fn is_git_head_file(path: &Path) -> bool {
+    path.file_name().map(|n| n == "HEAD").unwrap_or(false)
+        && path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|n| n == ".git")
+            .unwrap_or(false)
+}
+
 /// Convert a notify path into source-file changes.
 ///
 /// Some platforms, especially macOS FSEvents and network/container mounts,
@@ -815,7 +830,7 @@ fn is_compile_commands_file(path: &Path) -> bool {
 /// happens, scan the reported directory for source files so watch mode does
 /// not silently miss the change.
 fn source_changes_for_path(path: &Path, change_type: ChangeType) -> Vec<FileChange> {
-    if is_source_file(path) || is_compile_commands_file(path) {
+    if is_source_file(path) || is_compile_commands_file(path) || is_git_head_file(path) {
         return vec![FileChange {
             path: path.to_path_buf(),
             change_type,
@@ -963,6 +978,25 @@ impl IncrementalIndexer {
 /// startup — silently disabling `--watch`. Use `spawn_watch_mode` (below)
 /// from new call sites; it returns the sender so the caller cannot forget to
 /// keep it alive.
+/// How long the worktree must be quiet before a branch-switch update window is
+/// closed. `git checkout` writes files in bursts with gaps far below this.
+const BRANCH_SWITCH_SETTLE: Duration = Duration::from_secs(2);
+
+/// Apply one watch batch to the index. The caller holds the update leases for
+/// the repos involved.
+async fn apply_changes(engine: &crate::index::CodeIntelEngine, changes: &[FileChange]) {
+    match engine.process_file_changes(changes).await {
+        Ok(count) => {
+            if count > 0 {
+                debug!("Re-indexed {} file(s)", count);
+            }
+        }
+        Err(e) => {
+            warn!("Error processing file changes: {}", e);
+        }
+    }
+}
+
 pub async fn run_watch_mode(
     engine: Arc<crate::index::CodeIntelEngine>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
@@ -986,18 +1020,31 @@ pub async fn run_watch_mode(
                     // Hold the update leases for every repo this batch touches,
                     // so a query sees the index either before the batch or
                     // after it, never mid-apply.
-                    let _window = engine
+                    let window = engine
                         .index_update_leases(&engine.repos_for_changes(&changes))
                         .await;
-                    match engine.process_file_changes(&changes).await {
-                        Ok(count) => {
-                            if count > 0 {
-                                debug!("Re-indexed {} file(s)", count);
+                    let switched = changes.iter().any(|change| is_git_head_file(&change.path));
+                    apply_changes(&engine, &changes).await;
+                    // HEAD moved: the checkout that follows rewrites many files
+                    // across several debounced batches. Keep this one window
+                    // open until the worktree goes quiet, so a query sees the
+                    // old branch or the new one, never a mixture.
+                    if switched {
+                        info!("Branch switch detected; holding the index update window");
+                        while let Ok(Some(more)) =
+                            tokio::time::timeout(BRANCH_SWITCH_SETTLE, rx.recv()).await
+                        {
+                            for repo in engine.repos_for_changes(&more) {
+                                if !window.covers(&repo) {
+                                    debug!(
+                                        "Changes in {} applied outside the branch-switch window",
+                                        repo
+                                    );
+                                }
                             }
+                            apply_changes(&engine, &more).await;
                         }
-                        Err(e) => {
-                            warn!("Error processing file changes: {}", e);
-                        }
+                        info!("Worktree settled; index update window closed");
                     }
                 }
             }
@@ -1049,6 +1096,24 @@ mod tests {
         std::fs::write(&file, "hello world!").unwrap();
         let hash3 = hash_file(&file).unwrap();
         assert_ne!(hash1, hash3);
+    }
+
+    /// `.git/HEAD` is the only non-source path the watcher keeps besides
+    /// compile_commands.json: it is what opens the branch-switch window. The
+    /// rest of `.git` must stay out — an index write on every command would
+    /// reopen the window continuously.
+    #[test]
+    fn git_head_reaches_the_watcher_and_the_rest_of_git_does_not() {
+        let head = Path::new("/repo/.git/HEAD");
+        assert_eq!(source_changes_for_path(head, ChangeType::Modified).len(), 1);
+
+        for ignored in ["/repo/.git/index", "/repo/.git/ORIG_HEAD", "/repo/HEAD"] {
+            assert!(
+                source_changes_for_path(Path::new(ignored), ChangeType::Modified).is_empty(),
+                "{} must not reach the watcher",
+                ignored
+            );
+        }
     }
 
     #[test]
