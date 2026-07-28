@@ -8,7 +8,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::index::CodeIntelEngine;
+use crate::config::ExposeGroup;
+use crate::index::{CodeIntelEngine, IndexBusy};
 
 mod analysis;
 mod callgraph;
@@ -199,6 +200,9 @@ impl ToolRegistry {
         mut args: Value,
     ) -> Result<String> {
         normalize_arg_aliases(&mut args);
+        // Index-backed tools must not answer from an index that is being
+        // rebuilt: hold a read lease for the call, or refuse with EAGAIN.
+        let _leases = query_leases(engine, name, &args).await?;
         self.handlers
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?
@@ -221,6 +225,51 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether a tool answers from the in-memory index. Base tools address repos
+/// and repair the index, git tools answer from git itself, remote tools from
+/// GitHub; everything else — including the ungrouped ccg/sparql/neural tools —
+/// reads the index and must not answer from one being rebuilt.
+fn reads_index(tool: &str) -> bool {
+    const REMOTE_TOOLS: [&str; 3] = ["add_remote_repo", "list_remote_files", "get_remote_file"];
+    !matches!(
+        ExposeGroup::of(tool),
+        Some(ExposeGroup::Base) | Some(ExposeGroup::Git)
+    ) && !REMOTE_TOOLS.contains(&tool)
+}
+
+/// Read leases to hold for the duration of an index-backed tool call. Empty for
+/// tools that do not read the index, so a client can still ask what is going on
+/// while a repo is being re-indexed.
+async fn query_leases(
+    engine: &CodeIntelEngine,
+    tool: &str,
+    args: &Value,
+) -> Result<Vec<tokio::sync::OwnedRwLockReadGuard<()>>> {
+    if !reads_index(tool) {
+        return Ok(Vec::new());
+    }
+    let repos = match args.get_str("repo") {
+        // An unresolvable repo is the handler's error to report, not ours.
+        Some(repo) => match engine.resolve_repo(repo) {
+            Ok(key) => vec![key],
+            Err(_) => return Ok(Vec::new()),
+        },
+        // No repo named: the tool searches every indexed repo, so one repo
+        // mid-update would make the answer silently partial.
+        None => engine.all_repo_keys(),
+    };
+    let mut leases = Vec::with_capacity(repos.len());
+    for repo in repos {
+        match engine.try_query_lease(&repo).await {
+            Some(lease) => leases.push(lease),
+            // Returning drops the leases taken so far, so a refused query never
+            // holds up the update it collided with.
+            None => return Err(IndexBusy { repo }.into()),
+        }
+    }
+    Ok(leases)
 }
 
 /// Helper trait for extracting arguments from JSON
@@ -318,6 +367,54 @@ fn list_window(args: &Value, default_limit: u64) -> crate::response_budget::List
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A branch switch (or a reindex) makes the index unreadable for a while.
+    /// An index-backed tool must say so rather than answer from it, while the
+    /// tools that report what is going on keep working.
+    #[tokio::test]
+    async fn index_backed_tools_get_eagain_during_an_update() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({ "repo": repo.to_str().unwrap() });
+
+        let _update = engine.index_update_leases(&engine.all_repo_keys()).await;
+
+        let refused = registry
+            .dispatch("find_symbols", &engine, args.clone())
+            .await
+            .expect_err("find_symbols reads the index");
+        assert!(refused.downcast_ref::<IndexBusy>().is_some());
+
+        // A query naming no repo searches all of them, so it is refused too.
+        let refused_all = registry
+            .dispatch("search_code", &engine, serde_json::json!({ "query": "x" }))
+            .await
+            .expect_err("search_code reads every repo");
+        assert!(refused_all.downcast_ref::<IndexBusy>().is_some());
+
+        // get_index_status is how a caller finds out why: it must not be
+        // refused by the very update it is asking about.
+        let status = registry.dispatch("get_index_status", &engine, args).await;
+        assert!(status.is_ok(), "{:?}", status.err());
+    }
+
+    #[test]
+    fn non_index_tools_take_no_lease() {
+        assert!(reads_index("find_symbols"));
+        assert!(reads_index("get_callers"));
+        assert!(reads_index("scan_security"));
+        // Ungrouped tools default to index-backed.
+        assert!(reads_index("query_ccg"));
+        assert!(!reads_index("get_index_status"));
+        assert!(!reads_index("reindex"));
+        assert!(!reads_index("get_blame"));
+        assert!(!reads_index("get_remote_file"));
+    }
 
     #[test]
     fn test_registry_creation() {

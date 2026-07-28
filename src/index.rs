@@ -2441,7 +2441,7 @@ impl CodeIntelEngine {
     ///
     /// The returned string is the canonical absolute path as stored in the
     /// engine's repository maps — use it directly as the lookup key.
-    fn resolve_repo(&self, input: &str) -> Result<String> {
+    pub(crate) fn resolve_repo(&self, input: &str) -> Result<String> {
         if input.is_empty() {
             return Err(self.repo_not_found_error(input));
         }

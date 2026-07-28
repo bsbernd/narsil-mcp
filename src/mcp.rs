@@ -428,6 +428,17 @@ impl McpServer {
         )
     }
 
+    /// Render a tool error as a JSON-RPC error response. A repo whose index is
+    /// mid-update gets its own code, so a client can retry the request instead
+    /// of reporting a failure.
+    fn tool_error_response(id: Option<Value>, error: &anyhow::Error) -> JsonRpcResponse {
+        let code = match error.downcast_ref::<crate::index::IndexBusy>() {
+            Some(_) => crate::index::JSONRPC_INDEX_BUSY,
+            None => -32000,
+        };
+        JsonRpcResponse::error(id, code, &error.to_string())
+    }
+
     async fn handle_tool_call(&self, id: Option<Value>, params: Value) -> JsonRpcResponse {
         let start_time = std::time::Instant::now();
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -485,7 +496,7 @@ impl McpServer {
                     }),
                 )
             }
-            Err(e) => JsonRpcResponse::error(id, -32000, &e.to_string()),
+            Err(e) => Self::tool_error_response(id, &e),
         }
     }
 
@@ -650,6 +661,24 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retry case needs its own code: a client that cannot tell it from a
+    /// generic failure reports the branch switch as a broken tool call.
+    #[test]
+    fn index_busy_gets_its_own_error_code() {
+        let busy = McpServer::tool_error_response(
+            Some(json!(1)),
+            &anyhow::Error::from(crate::index::IndexBusy {
+                repo: "/repo".to_string(),
+            }),
+        );
+        let error = busy.error.expect("IndexBusy is an error response");
+        assert_eq!(error.code, crate::index::JSONRPC_INDEX_BUSY);
+        assert!(error.message.contains("EAGAIN"));
+
+        let other = McpServer::tool_error_response(Some(json!(1)), &anyhow::anyhow!("boom"));
+        assert_eq!(other.error.expect("still an error").code, -32000);
+    }
 
     /// Test prompts/list returns both prompts
     #[test]
