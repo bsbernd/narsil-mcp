@@ -501,6 +501,67 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// Repo-relative paths that differ between `base` and the current working
+    /// tree, including uncommitted edits and untracked files. Empty when `base`
+    /// is not a commit this repo has (e.g. a rebased or deleted branch).
+    pub fn changed_files_since(&self, base: &str) -> Result<Vec<String>> {
+        Self::validate_input(base, "commit")?;
+
+        // No second revision: git compares `base` against the working tree, so
+        // committed and uncommitted changes come out of one command.
+        let diff_out = Command::new("git")
+            .args(["diff", "--name-only", base, "--"])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git diff")?;
+
+        let mut files: Vec<String> = if diff_out.status.success() {
+            String::from_utf8_lossy(&diff_out.stdout)
+                .lines()
+                .map(|line| line.to_string())
+                .collect()
+        } else {
+            // An unknown base is not an error here — the caller loses the
+            // widening, which is the state it was in before the base existed.
+            Vec::new()
+        };
+
+        // Untracked files are invisible to git diff.
+        let untracked_out = Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git ls-files")?;
+
+        if untracked_out.status.success() {
+            files.extend(
+                String::from_utf8_lossy(&untracked_out.stdout)
+                    .lines()
+                    .map(|line| line.to_string()),
+            );
+        }
+
+        Ok(files)
+    }
+
+    /// Number of commits between `base` and HEAD, for reporting how far behind
+    /// a build artefact is. `None` when `base` is unknown to this repo.
+    pub fn commits_since(&self, base: &str) -> Option<usize> {
+        Self::validate_input(base, "commit").ok()?;
+
+        let output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..HEAD", base)])
+            .current_dir(&self.root)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
     /// Tracking state of the current branch versus its upstream. Returns
     /// `Ok(None)` when there is no upstream (detached HEAD or no tracking
     /// branch) — that is a normal state, not an error. All args are fixed
@@ -725,6 +786,62 @@ mod tests {
             "unpushed subject missing: {:?}",
             info.unpushed
         );
+    }
+
+    #[test]
+    fn changed_files_since_reports_committed_and_untracked() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("base.c"), "int base;").unwrap();
+        run_git(p, &["add", "base.c"]);
+        run_git(p, &["commit", "-q", "-m", "base"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let base = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(p)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(repo.changed_files_since(&base).unwrap().is_empty());
+
+        // Committed after the base, edited but not committed, never added.
+        std::fs::write(p.join("added.c"), "int added;").unwrap();
+        run_git(p, &["add", "added.c"]);
+        run_git(p, &["commit", "-q", "-m", "add"]);
+        std::fs::write(p.join("base.c"), "int base_edited;").unwrap();
+        std::fs::write(p.join("untracked.c"), "int untracked;").unwrap();
+
+        let changed = repo.changed_files_since(&base).unwrap();
+        for expected in ["added.c", "base.c", "untracked.c"] {
+            assert!(
+                changed.iter().any(|f| f == expected),
+                "{} missing from {:?}",
+                expected,
+                changed
+            );
+        }
+        assert_eq!(repo.commits_since(&base), Some(1));
+    }
+
+    /// A base commit that no longer exists (rebase, deleted branch) must not
+    /// propagate an error to the caller.
+    #[test]
+    fn changed_files_since_unknown_base_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.c"), "int a;").unwrap();
+        run_git(p, &["add", "a.c"]);
+        run_git(p, &["commit", "-q", "-m", "a"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert!(repo.changed_files_since(missing).unwrap().is_empty());
+        assert_eq!(repo.commits_since(missing), None);
     }
 
     #[test]
