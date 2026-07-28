@@ -77,12 +77,19 @@ pub struct PersistedIndex {
     /// sha256 of the resolved compile_commands.json at index time, when
     /// compile_commands filtering is on. Detects a CDB regen with no commit.
     pub cdb_hash: Option<String>,
+    /// git HEAD when compile_commands.json was last applied as the index
+    /// filter. The diff base for sources the manifest cannot describe: a
+    /// checkout does not regenerate it, so everything changed since is unlisted.
+    pub cdb_head_hash: Option<String>,
     /// [`INDEX_LOGIC_VERSION`] the records were produced under. A mismatch with
     /// the running binary's value forces a rebuild, independent of the fingerprint.
     pub logic_version: u32,
 }
 
 impl PersistedIndex {
+    // v8: PersistedIndex/RepoMeta gained cdb_head_hash (postcard layout change);
+    // older records fail to decode and rebuild, which is what gives the new
+    // field its first value.
     // v7: PersistedIndex/RepoMeta gained logic_version (postcard layout change);
     // older records fail to decode and rebuild.
     // v6: FileMetadata gained call_edges (persisted call-graph augmentation), a
@@ -92,7 +99,7 @@ impl PersistedIndex {
     // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 7;
+    const CURRENT_VERSION: u32 = 8;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -108,6 +115,7 @@ impl PersistedIndex {
             files: HashMap::new(),
             head_hash: None,
             cdb_hash: None,
+            cdb_head_hash: None,
             logic_version: INDEX_LOGIC_VERSION,
         }
     }
@@ -243,6 +251,9 @@ struct RepoMeta {
     head_hash: Option<String>,
     /// Mirrors PersistedIndex::cdb_hash for the same reason.
     cdb_hash: Option<String>,
+    /// Mirrors PersistedIndex::cdb_head_hash so the manifest's diff base
+    /// survives a restart; without it every restart re-widens from nothing.
+    cdb_head_hash: Option<String>,
     /// [`INDEX_LOGIC_VERSION`] these records were produced under; a mismatch with
     /// the running binary forces a rebuild even when head/cdb are unchanged.
     logic_version: u32,
@@ -424,6 +435,39 @@ impl IndexStore {
         }
     }
 
+    /// The stored repo header — fingerprint and timestamps, no per-file records.
+    /// A caller that only needs the fingerprint must not pay `load_repo`'s scan
+    /// of every record. Returns a fresh empty header when nothing is stored yet;
+    /// unlike `load_repo` it does not migrate a legacy blob.
+    pub fn load_repo_header(&self, repo_root: &Path) -> Result<PersistedIndex> {
+        let canonical_root = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+
+        let mut index = PersistedIndex::new(canonical_root.clone());
+        if !self.db_path(&canonical_root).exists() {
+            return Ok(index);
+        }
+
+        let db = self.db(&canonical_root)?;
+        let read_txn = db.begin_read()?;
+        if let Ok(meta_table) = read_txn.open_table(META_TABLE) {
+            if let Some(guard) = meta_table.get("repo")? {
+                if let Ok(meta) = postcard::from_bytes::<RepoMeta>(guard.value()) {
+                    index.version = meta.version;
+                    index.created_at = meta.created_at;
+                    index.updated_at = meta.updated_at;
+                    index.repo_root = meta.repo_root;
+                    index.head_hash = meta.head_hash;
+                    index.cdb_hash = meta.cdb_hash;
+                    index.cdb_head_hash = meta.cdb_head_hash;
+                    index.logic_version = meta.logic_version;
+                }
+            }
+        }
+        Ok(index)
+    }
+
     /// Load a repo's index from its redb store, reconstructing a `PersistedIndex`.
     ///
     /// On first use, migrates an old single-blob `.idx` into redb and removes it.
@@ -446,23 +490,10 @@ impl IndexStore {
             return Ok(PersistedIndex::new(canonical_root));
         }
 
+        let mut index = self.load_repo_header(&canonical_root)?;
+
         let db = self.db(&canonical_root)?;
         let read_txn = db.begin_read()?;
-
-        let mut index = PersistedIndex::new(canonical_root);
-        if let Ok(meta_table) = read_txn.open_table(META_TABLE) {
-            if let Some(guard) = meta_table.get("repo")? {
-                if let Ok(meta) = postcard::from_bytes::<RepoMeta>(guard.value()) {
-                    index.version = meta.version;
-                    index.created_at = meta.created_at;
-                    index.updated_at = meta.updated_at;
-                    index.repo_root = meta.repo_root;
-                    index.head_hash = meta.head_hash;
-                    index.cdb_hash = meta.cdb_hash;
-                    index.logic_version = meta.logic_version;
-                }
-            }
-        }
         if let Ok(files_table) = read_txn.open_table(FILES_TABLE) {
             for entry in files_table.iter()? {
                 let (_key, value) = entry?;
@@ -502,6 +533,7 @@ impl IndexStore {
                 updated_at: now_secs(),
                 head_hash: index.head_hash.clone(),
                 cdb_hash: index.cdb_hash.clone(),
+                cdb_head_hash: index.cdb_head_hash.clone(),
                 logic_version: index.logic_version,
             };
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
@@ -555,6 +587,7 @@ impl IndexStore {
                 updated_at: 0,
                 head_hash: None,
                 cdb_hash: None,
+                cdb_head_hash: None,
                 logic_version: INDEX_LOGIC_VERSION,
             });
             meta.updated_at = now_secs();

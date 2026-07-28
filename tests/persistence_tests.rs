@@ -792,6 +792,171 @@ async fn test_compile_commands_filter_applied_at_threshold() -> Result<()> {
     Ok(())
 }
 
+/// Run a git command in `dir`, asserting success. Identity and signing are set
+/// via flags/env so the test does not depend on the developer's global config.
+fn run_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A git checkout with 5 C sources, of which `src/f0.c` and `src/f1.c` are
+/// listed in a committed compile_commands.json — 40%, clearing the coverage
+/// floor so the filter engages. Returns the canonical repo path.
+fn cdb_repo_at_threshold(repo: &TestRepo) -> Result<std::path::PathBuf> {
+    for idx in 0..5 {
+        repo.add_rust_file(
+            &format!("src/f{idx}.c"),
+            &format!("void func_{idx}(void) {{}}\n"),
+        )?;
+    }
+    let repo_path = repo.path().canonicalize()?;
+    let entry = |file: std::path::PathBuf| {
+        format!(
+            "{{\"directory\":\"{dir}\",\"file\":\"{file}\",\"command\":\"cc -c {file}\"}}",
+            dir = repo_path.display(),
+            file = file.display(),
+        )
+    };
+    repo.add_rust_file(
+        "compile_commands.json",
+        &format!(
+            "[{},{}]",
+            entry(repo_path.join("src/f0.c")),
+            entry(repo_path.join("src/f1.c")),
+        ),
+    )?;
+
+    run_git(&repo_path, &["init", "-q"]);
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(
+        &repo_path,
+        &["commit", "-q", "-m", "manifest generated here"],
+    );
+    Ok(repo_path)
+}
+
+/// A checkout does not regenerate compile_commands.json, so sources the new
+/// branch added are absent from a manifest that is otherwise byte-identical.
+/// They must survive the filter — while sources the manifest could have listed
+/// and did not stay filtered out, or the exception would swallow the filter.
+#[tokio::test]
+async fn manifest_keeps_sources_committed_after_it_was_generated() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    let repo_path = cdb_repo_at_threshold(&repo)?;
+    let repo_key = repo_path.to_string_lossy().to_string();
+    let index_dir = TempDir::new()?;
+    let options = EngineOptions {
+        use_compile_commands: true,
+        persist_enabled: true,
+        ..Default::default()
+    };
+
+    // First index records the commit the manifest belongs to.
+    {
+        let engine = CodeIntelEngine::with_options(
+            index_dir.path().to_path_buf(),
+            vec![repo_path.clone()],
+            options.clone(),
+        )
+        .await?;
+        engine.complete_initialization().await?;
+        let symbols = engine
+            .find_symbols(&repo_key, None, Some("*"), None, None, 100)
+            .await?;
+        assert!(
+            symbols.contains("func_0") && !symbols.contains("func_2"),
+            "baseline: the manifest must filter before anything changed:\n{symbols}"
+        );
+    }
+
+    // The branch switch: a new source, the same manifest.
+    repo.add_rust_file("src/new.c", "void func_new(void) {}\n")?;
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-q", "-m", "branch adds a source"]);
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_path.clone()],
+        options,
+    )
+    .await?;
+    engine.complete_initialization().await?;
+    let symbols = engine
+        .find_symbols(&repo_key, None, Some("*"), None, None, 100)
+        .await?;
+    assert!(
+        symbols.contains("func_new"),
+        "a source added after the manifest was generated must survive the filter:\n{symbols}"
+    );
+    assert!(
+        !symbols.contains("func_2"),
+        "a source the manifest deliberately omits must stay filtered out:\n{symbols}"
+    );
+
+    Ok(())
+}
+
+/// The same widening must cover work that is not committed yet: after a
+/// checkout the sources a developer is midway through writing are just as
+/// invisible to the manifest as the committed ones.
+#[tokio::test]
+async fn manifest_keeps_untracked_sources() -> Result<()> {
+    use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+
+    let repo = TestRepo::new()?;
+    let repo_path = cdb_repo_at_threshold(&repo)?;
+    let repo_key = repo_path.to_string_lossy().to_string();
+    let index_dir = TempDir::new()?;
+
+    let engine = CodeIntelEngine::with_options(
+        index_dir.path().to_path_buf(),
+        vec![repo_path.clone()],
+        EngineOptions {
+            use_compile_commands: true,
+            persist_enabled: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    engine.complete_initialization().await?;
+
+    // HEAD and the manifest are both unchanged, so only an explicit reindex
+    // rebuilds — which is also what drops the in-memory diff base.
+    repo.add_rust_file("src/scratch.c", "void func_scratch(void) {}\n")?;
+    engine.reindex(Some(&repo_key)).await?;
+
+    let symbols = engine
+        .find_symbols(&repo_key, None, Some("*"), None, None, 100)
+        .await?;
+    assert!(
+        symbols.contains("func_scratch"),
+        "an untracked source must survive the filter:\n{symbols}"
+    );
+    assert!(
+        !symbols.contains("func_2"),
+        "a source the manifest deliberately omits must stay filtered out:\n{symbols}"
+    );
+
+    Ok(())
+}
+
 /// Issue #26 regression: when the caller holds the shutdown `Sender`, the
 /// watcher must keep running and re-index files that change on disk. The
 /// original `main.rs` wiring dropped the `Sender` immediately, which made the

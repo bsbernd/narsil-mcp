@@ -46,6 +46,10 @@ pub struct RepoMetadata {
     /// against; a mismatch on startup means the cached symbols are stale.
     pub head_hash: Option<String>,
     pub cdb_hash: Option<String>,
+    /// git HEAD the compile_commands.json filter was applied at. A checkout
+    /// does not regenerate the manifest, so sources changed since this commit
+    /// are unlisted through no fault of their own and survive the filter.
+    pub cdb_head_hash: Option<String>,
     /// Indexer extraction-logic version (`crate::persist::INDEX_LOGIC_VERSION`)
     /// this index was built under; a mismatch forces a rebuild even when the
     /// fingerprint is unchanged.
@@ -748,6 +752,7 @@ impl CodeIntelEngine {
                                     + std::time::Duration::from_secs(persisted.updated_at),
                                 head_hash: persisted.head_hash.clone(),
                                 cdb_hash: persisted.cdb_hash.clone(),
+                                cdb_head_hash: persisted.cdb_head_hash.clone(),
                                 logic_version: persisted.logic_version,
                             };
 
@@ -1082,6 +1087,59 @@ impl CodeIntelEngine {
             }
         }
         any.then(|| format!("{:x}", hasher.finalize()))
+    }
+
+    /// The commit the current compile_commands.json describes. A manifest
+    /// byte-identical to the one the last index used still describes the commit
+    /// recorded then; a regenerated one describes the tree it was built from,
+    /// i.e. this HEAD. None when there is no manifest to filter with.
+    fn compile_commands_diff_base(&self, repo_name: &str, repo_path: &Path) -> Option<String> {
+        let current_cdb = self.compile_commands_hash(repo_path)?;
+        // An explicit reindex drops the in-memory metadata before rebuilding, so
+        // fall back to the persisted header: the base outlives both.
+        let prior = self
+            .repos
+            .get(repo_name)
+            .map(|meta| (meta.cdb_hash.clone(), meta.cdb_head_hash.clone()))
+            .or_else(|| {
+                let header = self
+                    .index_store
+                    .as_ref()?
+                    .load_repo_header(repo_path)
+                    .ok()?;
+                Some((header.cdb_hash, header.cdb_head_hash))
+            });
+        let carried = prior.and_then(|(prior_cdb, base)| {
+            (prior_cdb.as_deref() == Some(current_cdb.as_str()))
+                .then_some(base)
+                .flatten()
+        });
+        carried.or_else(|| self.git_head_hash(repo_path))
+    }
+
+    /// Repo-relative C/C++ sources the manifest cannot describe because they
+    /// changed after `base`. Empty when the repo is not a git checkout or when
+    /// `base` is a commit it no longer has.
+    fn sources_unlisted_since_cdb(
+        &self,
+        repo_path: &Path,
+        base: &str,
+    ) -> std::collections::HashSet<String> {
+        let repo = match GitRepo::new(repo_path) {
+            Ok(r) => r,
+            Err(_) => return std::collections::HashSet::new(),
+        };
+        repo.changed_files_since(base)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rel| {
+                let ext = Path::new(rel)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                is_c_source_ext(ext)
+            })
+            .collect()
     }
 
     /// git HEAD commit hash for `repo_path`, or None when it is not a git
@@ -1527,6 +1585,7 @@ impl CodeIntelEngine {
                 is_c_source_ext(ext)
             })
             .count();
+        let cdb_diff_base = self.compile_commands_diff_base(&repo_name, path);
         if self.options.use_compile_commands && cxx_source_count >= COMPILE_COMMANDS_MIN_CXX_SOURCES
         {
             let explicit: Option<&Path> = self.options.compile_commands_path.as_deref();
@@ -1563,7 +1622,15 @@ impl CodeIntelEngine {
                     covered, cxx_source_count, min_coverage_pct, repo_name
                 );
             } else {
+                // The build wrote the manifest at one commit; a checkout since
+                // then added sources it cannot list. Carry those, or they vanish
+                // from the index with nothing saying why.
+                let unlisted = cdb_diff_base
+                    .as_deref()
+                    .map(|base| self.sources_unlisted_since_cdb(path, base))
+                    .unwrap_or_default();
                 let before = files.len();
+                let mut carried = 0usize;
                 files.retain(|abs_path| {
                     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if is_c_header_ext(ext) {
@@ -1576,13 +1643,24 @@ impl CodeIntelEngine {
                         return true;
                     }
                     let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
+                    if unlisted.contains(rel.to_string_lossy().as_ref()) {
+                        carried += 1;
+                        return true;
+                    }
                     patterns.iter().any(|p| p.matches_path(rel))
                 });
+                let behind = cdb_diff_base
+                    .as_deref()
+                    .and_then(|base| GitRepo::new(path).ok().and_then(|r| r.commits_since(base)))
+                    .unwrap_or(0);
                 info!(
-                    "compile_commands filter: {} → {} files ({} filtered out)",
+                    "compile_commands filter: {} → {} files ({} filtered out, \
+                     {} carried past a manifest {} commit(s) behind HEAD)",
                     before,
                     files.len(),
-                    before - files.len()
+                    before - files.len(),
+                    carried,
+                    behind
                 );
             }
         }
@@ -1895,6 +1973,7 @@ impl CodeIntelEngine {
             last_indexed: SystemTime::now(),
             head_hash: self.git_head_hash(path),
             cdb_hash: self.compile_commands_hash(path),
+            cdb_head_hash: cdb_diff_base,
             logic_version: crate::persist::INDEX_LOGIC_VERSION,
         };
 
@@ -3947,6 +4026,10 @@ impl CodeIntelEngine {
             let mut persisted = PersistedIndex::new(PathBuf::from(&repo_name));
             persisted.head_hash = self.git_head_hash(repo_path);
             persisted.cdb_hash = self.compile_commands_hash(repo_path);
+            // Re-derived, not copied from memory: a build that regenerated the
+            // manifest since the last full index moved the base to HEAD, and
+            // writing the old base next to the new hash would strand it.
+            persisted.cdb_head_hash = self.compile_commands_diff_base(&repo_name, repo_path);
 
             // Group augmentation edges by the caller's file so each rides its
             // file's record (and the incremental watch path's keying).
@@ -5201,6 +5284,7 @@ impl CodeIntelEngine {
                         + meta.languages.keys().map(String::capacity).sum::<usize>()
                         + meta.head_hash.as_ref().map_or(0, String::capacity)
                         + meta.cdb_hash.as_ref().map_or(0, String::capacity)
+                        + meta.cdb_head_hash.as_ref().map_or(0, String::capacity)
                 })
                 .sum::<usize>();
 
@@ -5395,13 +5479,31 @@ impl CodeIntelEngine {
                     self.symbols.get(key).map(|s| s.len()).unwrap_or(0)
                 ));
                 output.push_str(&format!(
-                    "- Git: {}\n\n",
+                    "- Git: {}\n",
                     if self.git_repos.contains_key(key) {
                         "enabled"
                     } else {
                         "disabled"
                     }
                 ));
+                // A manifest older than HEAD still drives the index filter; say
+                // so, since the widening cannot restore the missing compile flags.
+                if let Some(base) = meta.cdb_head_hash.as_deref() {
+                    if meta.head_hash.as_deref() != Some(base) {
+                        let behind = GitRepo::new(&meta.path)
+                            .ok()
+                            .and_then(|r| r.commits_since(base))
+                            .unwrap_or(0);
+                        output.push_str(&format!(
+                            "- compile_commands.json: generated at {}, HEAD is {} \
+                             ({} commit(s) behind) — regenerate it for accurate C/C++ flags\n",
+                            short_hash(base),
+                            meta.head_hash.as_deref().map(short_hash).unwrap_or("?"),
+                            behind
+                        ));
+                    }
+                }
+                output.push('\n');
             }
         }
 
@@ -11342,6 +11444,11 @@ fn content_sha256(bytes: &[u8]) -> String {
 
 fn is_c_header_ext(ext: &str) -> bool {
     matches!(ext, "h" | "hpp" | "hh" | "hxx" | "h++")
+}
+
+/// Abbreviate a commit hash for display. Hex is ASCII, so the byte cut is safe.
+fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(8)]
 }
 
 fn load_compile_commands_filter(
