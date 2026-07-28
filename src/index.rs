@@ -288,6 +288,57 @@ fn scope_matches(rules: &[ScopeRule], rel: &str, abs: &str) -> bool {
     })
 }
 
+/// How long a query waits for an in-flight index update before it is refused.
+/// Long enough to absorb a small incremental batch, far short of a checkout.
+const INDEX_LEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Per-repo index lease. A query holds the read side for the duration of its
+/// tool call, an index update the write side. tokio's RwLock is
+/// write-preferring, so a waiting update also keeps new queries out — the
+/// update is one busy window, not a race renewed per file batch.
+type IndexLease = Arc<tokio::sync::RwLock<()>>;
+
+/// Refusal handed to a query whose repo is mid-update. Retryable: the same
+/// request succeeds once the update finishes.
+#[derive(Debug)]
+pub struct IndexBusy {
+    /// Canonical repo path whose index is being updated.
+    pub repo: String,
+}
+
+impl std::fmt::Display for IndexBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EAGAIN: index update in progress for {} — retry the request",
+            self.repo
+        )
+    }
+}
+
+impl std::error::Error for IndexBusy {}
+
+/// JSON-RPC error code for [`IndexBusy`], in the implementation-defined range.
+/// Distinct from the generic -32000 so a client can tell retry from failure.
+pub const JSONRPC_INDEX_BUSY: i32 = -32001;
+
+/// Write leases held for one index update, plus the gate admitting a single
+/// updater at a time. Dropping it reopens the affected repos to queries.
+pub struct IndexUpdateLeases<'a> {
+    /// Held for the whole update: writers never interleave, so the order in
+    /// which they take per-repo leases cannot deadlock them against each other.
+    _gate: tokio::sync::MutexGuard<'a, ()>,
+    /// Held write leases, keyed by canonical repo path.
+    leases: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl IndexUpdateLeases<'_> {
+    /// Whether this update window already covers `repo_key`.
+    pub fn covers(&self, repo_key: &str) -> bool {
+        self.leases.contains_key(repo_key)
+    }
+}
+
 /// The main code intelligence engine
 pub struct CodeIntelEngine {
     /// Base path for index storage (stored for potential future use)
@@ -361,6 +412,12 @@ pub struct CodeIntelEngine {
     /// the watch path can drop changes to out-of-scope files. Absent = not
     /// scoped (full index), which keeps unrelated repos untouched.
     index_filtered_repos: DashMap<String, bool>,
+    /// Per-repo index leases keyed by canonical repo path, created on first use.
+    index_leases: DashMap<String, IndexLease>,
+    /// Admits one index update at a time. Updates take several per-repo leases
+    /// at once (reindex_all, a watch batch spanning repos); serializing them
+    /// makes their acquisition order irrelevant.
+    update_gate: tokio::sync::Mutex<()>,
 }
 
 impl CodeIntelEngine {
@@ -624,6 +681,8 @@ impl CodeIntelEngine {
             default_index_filter,
             repo_settings,
             index_filtered_repos: DashMap::new(),
+            index_leases: DashMap::new(),
+            update_gate: tokio::sync::Mutex::new(()),
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -834,6 +893,11 @@ impl CodeIntelEngine {
             }
 
             if repo_path.exists() {
+                // A query landing mid-build would be answered from a repo whose
+                // symbols are still being filled in.
+                let _leases = self
+                    .index_update_leases(std::slice::from_ref(&repo_name))
+                    .await;
                 if let Err(e) = self.index_repo(repo_path).await {
                     warn!("Failed to index {:?}: {}", repo_path, e);
                 } else {
@@ -1356,6 +1420,8 @@ impl CodeIntelEngine {
         Ok(())
     }
 
+    /// Build (or rebuild) the index for `path`. The caller holds the repo's
+    /// update lease — `reindex` needs it across the clears preceding this call.
     async fn index_repo(&self, path: &Path) -> Result<()> {
         let start_time = std::time::Instant::now();
         let repo_name = canonical_repo_key(path)?;
@@ -2218,7 +2284,70 @@ impl CodeIntelEngine {
         }
     }
 
+    /// The lease for `repo_key`, created on first use.
+    fn index_lease(&self, repo_key: &str) -> IndexLease {
+        self.index_leases
+            .entry(repo_key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// Read lease for a query against `repo_key`, or None when an index update
+    /// holds — or is waiting for — the write side. None is the EAGAIN case: the
+    /// caller must refuse rather than answer from an index being rebuilt.
+    pub async fn try_query_lease(
+        &self,
+        repo_key: &str,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let lease = self.index_lease(repo_key);
+        tokio::time::timeout(INDEX_LEASE_GRACE, lease.read_owned())
+            .await
+            .ok()
+    }
+
+    /// Write leases over `repo_keys` for one index update. Waits for in-flight
+    /// queries to drain; queries arriving meanwhile are refused.
+    pub async fn index_update_leases(&self, repo_keys: &[String]) -> IndexUpdateLeases<'_> {
+        let gate = self.update_gate.lock().await;
+        let mut leases = HashMap::with_capacity(repo_keys.len());
+        for key in repo_keys {
+            if !leases.contains_key(key) {
+                leases.insert(key.clone(), self.index_lease(key).write_owned().await);
+            }
+        }
+        IndexUpdateLeases {
+            _gate: gate,
+            leases,
+        }
+    }
+
+    /// Canonical keys of every configured repo — what a query naming no repo
+    /// reads, since those tools search all of them.
+    pub fn all_repo_keys(&self) -> Vec<String> {
+        self.repo_paths
+            .iter()
+            .filter_map(|path| canonical_repo_key(path).ok())
+            .collect()
+    }
+
+    /// Canonical keys of the repos a watch batch touches, deduplicated.
+    pub fn repos_for_changes(&self, changes: &[crate::persist::FileChange]) -> Vec<String> {
+        let mut keys: Vec<String> = changes
+            .iter()
+            .filter_map(|change| {
+                self.repo_paths
+                    .iter()
+                    .find(|repo| path_is_within_repo(&change.path, repo))
+            })
+            .filter_map(|repo| canonical_repo_key(repo).ok())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub async fn reindex_all(&self) -> Result<()> {
+        let _leases = self.index_update_leases(&self.all_repo_keys()).await;
         self.repos.clear();
         self.symbols.clear();
         self.file_cache.clear();
@@ -2237,6 +2366,12 @@ impl CodeIntelEngine {
             Some(name) => {
                 let repo_key = self.resolve_repo(name)?;
                 let path = PathBuf::from(&repo_key);
+                // Held across the clears below: without it a query lands
+                // between "symbols removed" and "symbols rebuilt" and is
+                // answered from an empty index.
+                let _leases = self
+                    .index_update_leases(std::slice::from_ref(&repo_key))
+                    .await;
                 self.repos.remove(&repo_key);
                 self.symbols.remove(&repo_key);
                 // Reset call graph so stale nodes from a branch switch don't linger.
@@ -4270,6 +4405,10 @@ impl CodeIntelEngine {
 
     /// Process file changes detected by the watcher.
     /// Returns the number of files re-indexed.
+    ///
+    /// The caller holds the update leases for the batch's repos (see
+    /// `run_watch_mode`) — the window spans several batches on a branch
+    /// switch, so it cannot be taken here.
     pub async fn process_file_changes(
         &self,
         changes: &[crate::persist::FileChange],
@@ -12190,6 +12329,64 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// The lease is what a query consults to decide between answering and
+    /// EAGAIN: while an update holds the write side no read lease is handed
+    /// out, and the grace bounds how long the query waits to find that out.
+    #[tokio::test]
+    async fn query_lease_is_refused_while_an_update_holds_the_repo() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        assert!(engine.try_query_lease(&repo_key).await.is_some());
+
+        let update = engine
+            .index_update_leases(std::slice::from_ref(&repo_key))
+            .await;
+        let waited = std::time::Instant::now();
+        assert!(engine.try_query_lease(&repo_key).await.is_none());
+        assert!(waited.elapsed() >= INDEX_LEASE_GRACE);
+
+        drop(update);
+        assert!(engine.try_query_lease(&repo_key).await.is_some());
+    }
+
+    /// A watch batch names files; the update window needs the repos they belong
+    /// to, once each, so one checkout burst takes one lease per repo.
+    #[tokio::test]
+    async fn repos_for_changes_maps_files_to_their_repo_once() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+
+        let changes = vec![
+            crate::persist::FileChange {
+                path: repo.join("a.rs"),
+                change_type: crate::persist::ChangeType::Modified,
+            },
+            crate::persist::FileChange {
+                path: repo.join("sub/b.rs"),
+                change_type: crate::persist::ChangeType::Created,
+            },
+            crate::persist::FileChange {
+                path: temp.path().join("outside/c.rs"),
+                change_type: crate::persist::ChangeType::Modified,
+            },
+        ];
+
+        assert_eq!(
+            engine.repos_for_changes(&changes),
+            vec![canonical_repo_key(&repo).unwrap()]
+        );
     }
 
     /// linux.git has 41k contributor identities; the default page must show the

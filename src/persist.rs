@@ -983,6 +983,12 @@ pub async fn run_watch_mode(
             Some(changes) = rx.recv() => {
                 if !changes.is_empty() {
                     debug!("Detected {} file change(s)", changes.len());
+                    // Hold the update leases for every repo this batch touches,
+                    // so a query sees the index either before the batch or
+                    // after it, never mid-apply.
+                    let _window = engine
+                        .index_update_leases(&engine.repos_for_changes(&changes))
+                        .await;
                     match engine.process_file_changes(&changes).await {
                         Ok(count) => {
                             if count > 0 {
