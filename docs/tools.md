@@ -296,6 +296,20 @@ Everything else is capped by defaults it does not let you change. A response
 over 48 KB is truncated on a line boundary by the response budget with a notice
 naming what was dropped.
 
+## While an index is updating
+
+A branch switch, a `reindex` and the initial index all rebuild a repo's index.
+For as long as that lasts, a tool that reads the index answers with JSON-RPC
+error **-32001** and a message starting `EAGAIN: index update in progress` —
+retry the same request rather than treating the failure as an answer. The
+alternative would be a reply mixing both branches, or an empty one, with
+nothing to distinguish it from the truth.
+
+The base and git groups are never refused, so `get_index_status`, `list_repos`,
+`reindex` and the git tools still work while a rebuild is running. A request
+that names no `repo` reads every indexed repo, so one repo mid-update is enough
+to refuse it.
+
 ## Caveats
 
 Behaviour verified by measurement, not read off the descriptions. Each is
