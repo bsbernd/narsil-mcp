@@ -337,7 +337,33 @@ fn normalize_arg_aliases(args: &mut Value) {
                 }
             }
         }
+        // Every schema names its arguments in snake_case, but clients reach for
+        // camelCase (`maxDepth`); unrecognised, the key is ignored and the tool
+        // answers with the default as if nothing had been asked for.
+        for (key, value) in obj.clone() {
+            let snake = snake_case(&key);
+            if snake != key && !obj.contains_key(&snake) {
+                obj.insert(snake, value);
+            }
+        }
     }
+}
+
+/// `maxDepth` -> `max_depth`. Returns the input unchanged when there is nothing
+/// to convert.
+fn snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() {
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Require a non-empty string argument, erroring with a message naming the
@@ -525,5 +551,22 @@ mod tests {
         let mut args = serde_json::json!({"commit": "real", "commit_hash": "alias"});
         normalize_arg_aliases(&mut args);
         assert_eq!(args.get_str("commit"), Some("real"));
+    }
+
+    #[test]
+    fn test_camel_case_reaches_the_snake_case_argument() {
+        // Regression: get_project_structure(maxDepth=2) ignored the depth and
+        // walked the default 4 levels, with nothing in the output saying so.
+        let mut args = serde_json::json!({"repo": "r", "maxDepth": 2, "maxTotalEntries": 10});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_u64("max_depth"), Some(2));
+        assert_eq!(args.get_u64("max_total_entries"), Some(10));
+    }
+
+    #[test]
+    fn test_explicit_snake_case_wins_over_camel_case() {
+        let mut args = serde_json::json!({"max_depth": 1, "maxDepth": 9});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_u64("max_depth"), Some(1));
     }
 }
