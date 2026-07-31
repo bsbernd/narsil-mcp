@@ -2338,11 +2338,22 @@ impl CodeIntelEngine {
                 for (callee_name, refs) in gtags_refs {
                     let edges: Vec<(String, CallEdge)> = refs
                         .into_iter()
-                        .filter_map(|(rel_file, line, _text)| {
+                        .filter_map(|(rel_file, line, text)| {
+                            // `global -rx` reports uses, not calls: a parameter
+                            // of the same name, a declaration, a mention in a
+                            // comment. Only a call belongs in the graph.
+                            if !is_call_site(&text, &callee_name) {
+                                return None;
+                            }
                             let caller = funcs_by_file
                                 .get(rel_file.as_str())?
                                 .iter()
                                 .find(|sym| sym.start_line <= line && line <= sym.end_line)?;
+                            // A definition is not a call to itself; its
+                            // signature line matches the call syntax above.
+                            if caller.name == callee_name && caller.start_line == line {
+                                return None;
+                            }
                             Some((
                                 CallGraph::qualified_key(&caller.file_path, &caller.name),
                                 CallEdge {
@@ -12229,6 +12240,30 @@ fn get_language_id(path: &str) -> &'static str {
     }
 }
 
+/// Whether `text`, the source line of a gtags reference, calls `name`: the
+/// name as a whole word followed by `(`. A parameter of the same name, a
+/// prototype's caller-less mention, an address-of use and a comment all name
+/// the function without calling it, and gtags reports every one of them.
+fn is_call_site(text: &str, name: &str) -> bool {
+    if crate::security_rules::is_comment_only_line(text) {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(found) = text[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        let part_of_a_longer_name = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+        if !part_of_a_longer_name && text[end..].trim_start().starts_with('(') {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Lines a fallback hit spans: enough to hold a call and its arguments, short
 /// enough that a term at the top of a file and one at the bottom are never
 /// counted as the same hit.
@@ -12573,6 +12608,38 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// gtags answers with every use of a name. These are the ones that made
+    /// `dash_prefixed` its own caller and turned its `what`/`value` parameters
+    /// into calls to unrelated functions of those names.
+    #[test]
+    fn only_a_call_becomes_an_edge() {
+        assert!(is_call_site(
+            "\tret = dash_prefixed(progname, what);",
+            "dash_prefixed"
+        ));
+        assert!(is_call_site("\tif (mount_opt (arg))", "mount_opt"));
+
+        // The definition's own signature line, a parameter, an address-of use
+        // and a comment: all uses, none of them calls.
+        assert!(!is_call_site(
+            "static int dash_prefixed(const char *progname, const char *what, const char *value)",
+            "what"
+        ));
+        assert!(!is_call_site(
+            "\thandler = &dash_prefixed;",
+            "dash_prefixed"
+        ));
+        assert!(!is_call_site(
+            "// dash_prefixed() builds the -o string",
+            "dash_prefixed"
+        ));
+        // A longer name that merely ends with the one asked about.
+        assert!(!is_call_site(
+            "\tret = my_dash_prefixed(x);",
+            "dash_prefixed"
+        ));
     }
 
     /// A repo's directory name is how it is talked about — in `--repos`, in a
