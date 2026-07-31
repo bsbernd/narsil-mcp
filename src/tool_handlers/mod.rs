@@ -327,6 +327,7 @@ fn normalize_arg_aliases(args: &mut Value) {
         ("path", "file_path"),
         ("repo", "repo_path"),
         ("symbol", "symbol_name"),
+        ("commit", "commit_hash"),
     ];
     if let Some(obj) = args.as_object_mut() {
         for (canonical, alias) in ALIASES {
@@ -507,5 +508,22 @@ mod tests {
         let mut args = serde_json::json!({"symbol": "real", "symbol_name": "alias"});
         normalize_arg_aliases(&mut args);
         assert_eq!(args.get_str("symbol"), Some("real"));
+    }
+
+    #[test]
+    fn test_commit_hash_aliases_to_commit() {
+        // Regression: unaliased, `commit_hash` left `commit` empty and
+        // get_commit_diff ran `git show ''` — an "ambiguous argument ''" error
+        // that reads as a broken hash rather than a wrong argument name.
+        let mut args = serde_json::json!({"repo": "r", "commit_hash": "846d0f2552a1"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("commit"), Some("846d0f2552a1"));
+    }
+
+    #[test]
+    fn test_explicit_commit_wins_over_commit_hash() {
+        let mut args = serde_json::json!({"commit": "real", "commit_hash": "alias"});
+        normalize_arg_aliases(&mut args);
+        assert_eq!(args.get_str("commit"), Some("real"));
     }
 }

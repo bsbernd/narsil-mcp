@@ -106,7 +106,9 @@ impl ToolHandler for GetCommitDiffHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let commit = args.get_str("commit").unwrap_or("");
+        // An empty commit reaches git as `show ''`, whose "ambiguous argument"
+        // error names neither the tool nor the argument that was missing.
+        let commit = super::require_arg(&args, "commit", "get_commit_diff")?;
         let path = args.get_str("path");
         engine.get_commit_diff(repo, commit, path).await
     }
