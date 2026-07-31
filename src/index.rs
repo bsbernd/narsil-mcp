@@ -2521,6 +2521,11 @@ impl CodeIntelEngine {
     /// engine's repository maps — use it directly as the lookup key.
     pub(crate) fn resolve_repo(&self, input: &str) -> Result<String> {
         if input.is_empty() {
+            // With a single indexed repo there is nothing to disambiguate, so
+            // naming it adds nothing the engine doesn't already know.
+            if let [only] = self.indexed_repo_paths().as_slice() {
+                return Ok(only.to_string_lossy().into_owned());
+            }
             return Err(self.repo_not_found_error(input));
         }
 
@@ -12546,6 +12551,22 @@ mod tests {
         let err = engine.resolve_repo("linux").unwrap_err().to_string();
         assert!(err.contains("a/linux.git"), "{err}");
         assert!(err.contains("b/linux.git"), "{err}");
+    }
+
+    /// With one indexed repo, naming it adds nothing the engine doesn't know.
+    #[tokio::test]
+    async fn resolve_repo_defaults_to_the_only_indexed_repo() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.resolve_repo("").unwrap(),
+            canonical_repo_key(&repo).unwrap()
+        );
     }
 
     /// The lease is what a query consults to decide between answering and
