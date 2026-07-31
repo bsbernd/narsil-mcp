@@ -1008,11 +1008,11 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "File path relative to repository"},
+                    "path": {"type": "string", "description": "File path relative to repository (optional; defaults to the indexed files defining the symbol)"},
                     "symbol": {"type": "string", "description": "Symbol/function name to track"},
                     "max_commits": {"type": "integer", "description": "Maximum commits to return (default: 10)"}
                 },
-                "required": ["repo", "path", "symbol"]
+                "required": ["repo", "symbol"]
             }),
             requires_api_key: false,
             aliases: vec!["symbol_history", "function_history"],

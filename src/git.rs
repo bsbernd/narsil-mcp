@@ -437,25 +437,30 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// Find commits that modified a specific function/symbol
+    /// Find commits that modified a specific function/symbol, in the given
+    /// files. An empty `file_paths` searches the whole tree.
     pub fn symbol_history(
         &self,
-        file_path: &str,
+        file_paths: &[String],
         function_name: &str,
         max_commits: usize,
     ) -> Result<Vec<FileCommit>> {
-        Self::validate_input(file_path, "file_path")?;
+        for file_path in file_paths {
+            Self::validate_input(file_path, "file_path")?;
+        }
         Self::validate_input(function_name, "function_name")?;
 
+        let mut args = vec![
+            "log".to_string(),
+            "--format=%H|%h|%an|%ae|%at|%s".to_string(),
+            format!("-{}", max_commits),
+            format!("-S{}", function_name),
+            "--".to_string(),
+        ];
+        args.extend(file_paths.iter().cloned());
+
         let output = Command::new("git")
-            .args([
-                "log",
-                "--format=%H|%h|%an|%ae|%at|%s",
-                &format!("-{}", max_commits),
-                &format!("-S{}", function_name),
-                "--",
-                file_path,
-            ])
+            .args(&args)
             .current_dir(&self.root)
             .output()
             .context("Failed to run git log")?;
@@ -842,6 +847,25 @@ mod tests {
         let missing = "0123456789abcdef0123456789abcdef01234567";
         assert!(repo.changed_files_since(missing).unwrap().is_empty());
         assert_eq!(repo.commits_since(missing), None);
+    }
+
+    /// Without a file the caller gets `git log -S` over the files passed in;
+    /// an empty pathspec would make git refuse the command outright.
+    #[test]
+    fn symbol_history_searches_every_named_file() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.c"), "void shared(void) {}").unwrap();
+        std::fs::write(p.join("b.c"), "int untouched;").unwrap();
+        run_git(p, &["add", "a.c", "b.c"]);
+        run_git(p, &["commit", "-q", "-m", "add shared"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let paths = vec!["a.c".to_string(), "b.c".to_string()];
+        let history = repo.symbol_history(&paths, "shared", 10).unwrap();
+        assert_eq!(history.len(), 1, "history was: {:?}", history);
+        assert_eq!(history[0].subject, "add shared");
     }
 
     #[test]

@@ -4928,8 +4928,25 @@ impl CodeIntelEngine {
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let repo_path = PathBuf::from(&repo_key);
-        // Validate path to prevent traversal attacks
-        validate_path(&repo_path, path)?;
+        // `git log -S` needs a pathspec, and an empty one is an error rather
+        // than "search everywhere". The index knows where the symbol lives, so
+        // ask it instead of scanning the whole history of a large tree.
+        let paths = if path.is_empty() {
+            let files = self.symbol_files(&repo_key, symbol);
+            if files.is_empty() {
+                return Err(anyhow!(
+                    "No indexed file defines '{}' in {}. Pass 'path' to search a \
+                     specific file, or find the symbol first with find_symbols.",
+                    symbol,
+                    repo_key
+                ));
+            }
+            files
+        } else {
+            // Validate path to prevent traversal attacks
+            validate_path(&repo_path, path)?;
+            vec![path.to_string()]
+        };
 
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
             anyhow!(
@@ -4938,8 +4955,30 @@ impl CodeIntelEngine {
             )
         })?;
 
-        let history = git_repo.symbol_history(path, symbol, max_commits)?;
-        Ok(git_repo.history_markdown(&history))
+        let history = git_repo.symbol_history(&paths, symbol, max_commits)?;
+        let mut output = git_repo.history_markdown(&history);
+        if path.is_empty() {
+            // The caller named no file, so say which ones the answer covers —
+            // an empty history is otherwise indistinguishable from a miss.
+            output.push_str(&format!("\n**Files searched**: {}\n", paths.join(", ")));
+        }
+        Ok(output)
+    }
+
+    /// Repo-relative files where `symbol` is indexed.
+    fn symbol_files(&self, repo_key: &str, symbol: &str) -> Vec<String> {
+        let Some(symbols) = self.symbols.get(repo_key) else {
+            return Vec::new();
+        };
+        let mut files: Vec<String> = symbols
+            .value()
+            .iter()
+            .filter(|indexed| indexed.name == symbol)
+            .map(|indexed| indexed.file_path.clone())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
     }
 
     /// Get the diff for a specific commit
