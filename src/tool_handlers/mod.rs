@@ -200,6 +200,7 @@ impl ToolRegistry {
         mut args: Value,
     ) -> Result<String> {
         normalize_arg_aliases(&mut args);
+        resolve_repo_from_path(engine, name, &mut args);
         // Index-backed tools must not answer from an index that is being
         // rebuilt: hold a read lease for the call, or refuse with EAGAIN.
         let _leases = query_leases(engine, name, &args).await?;
@@ -350,6 +351,56 @@ fn normalize_arg_aliases(args: &mut Value) {
     }
 }
 
+/// An absolute `path` already names the repository it lives in: take `repo`
+/// from it and make the path repo-relative, so a path pasted from a search
+/// result or an editor works without restating the repo. Silent when the path
+/// is outside every indexed repo — the handler's own error is the better one.
+///
+/// Only for tools that take a `repo` at all; for the repo-discovery tools
+/// (discover_repos, validate_repo) the path is the subject of the call, not a
+/// file inside an indexed repo. The path is rewritten only where the schema
+/// also declares `path`, which is what makes that argument repo-relative.
+fn resolve_repo_from_path(engine: &CodeIntelEngine, tool: &str, args: &mut Value) {
+    if args.get_str("repo").is_some_and(|repo| !repo.is_empty()) {
+        return;
+    }
+    let Some(path) = args.get_str("path").map(str::to_string) else {
+        return;
+    };
+    if !std::path::Path::new(&path).is_absolute() {
+        return;
+    }
+    let Some(metadata) = crate::tool_metadata::get_tool_metadata(tool) else {
+        return;
+    };
+    let properties = &metadata.input_schema["properties"];
+    if properties["repo"].is_null() {
+        return;
+    }
+    let Ok(repo) = engine.resolve_repo(&path) else {
+        return;
+    };
+    let relative = std::path::Path::new(&path)
+        .canonicalize()
+        .ok()
+        .and_then(|canonical| {
+            canonical
+                .strip_prefix(&repo)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        });
+
+    let takes_repo_relative_path = !properties["path"].is_null();
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("repo".to_string(), Value::String(repo));
+        if let Some(relative) = relative {
+            if takes_repo_relative_path {
+                obj.insert("path".to_string(), Value::String(relative));
+            }
+        }
+    }
+}
+
 /// `maxDepth` -> `max_depth`. Returns the input unchanged when there is nothing
 /// to convert.
 fn snake_case(name: &str) -> String {
@@ -429,6 +480,48 @@ mod tests {
         // refused by the very update it is asking about.
         let status = registry.dispatch("get_index_status", &engine, args).await;
         assert!(status.is_ok(), "{:?}", status.err());
+    }
+
+    /// A path pasted from a search result or an editor is absolute and already
+    /// says which repo it belongs to; the caller should not have to restate it.
+    #[tokio::test]
+    async fn absolute_path_supplies_the_repo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "fn main() {}").unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+
+        let mut args = serde_json::json!({ "path": repo.join("src/lib.rs").to_str().unwrap() });
+        resolve_repo_from_path(&engine, "get_file", &mut args);
+        assert_eq!(args.get_str("repo"), Some(repo.to_str().unwrap()));
+        assert_eq!(args.get_str("path"), Some("src/lib.rs"));
+
+        // get_project_structure has no `path` argument, so only the repo is
+        // filled in — its `path` is not repo-relative to rewrite.
+        let mut args = serde_json::json!({ "path": repo.join("src").to_str().unwrap() });
+        resolve_repo_from_path(&engine, "get_project_structure", &mut args);
+        assert_eq!(args.get_str("repo"), Some(repo.to_str().unwrap()));
+    }
+
+    /// validate_repo's path IS the subject of the call: rewriting it, or
+    /// pinning the call to some other repo, would answer a different question.
+    #[tokio::test]
+    async fn repo_discovery_tools_keep_their_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+
+        let inside = repo.join("src");
+        let mut args = serde_json::json!({ "path": inside.to_str().unwrap() });
+        resolve_repo_from_path(&engine, "validate_repo", &mut args);
+        assert_eq!(args.get_str("repo"), None);
+        assert_eq!(args.get_str("path"), inside.to_str());
     }
 
     #[test]
