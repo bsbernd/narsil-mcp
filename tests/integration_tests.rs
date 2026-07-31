@@ -2087,11 +2087,9 @@ fn test_get_excerpt_error_invalid_path() -> Result<()> {
 
 #[test]
 fn test_get_excerpt_error_missing_path() -> Result<()> {
-    // Reproduces a recurring misuse: callers pass get_file's arguments
-    // (file/start_line/end_line) to get_excerpt, which only understands
-    // path/lines. Before the fix, the missing `path` silently resolved to
-    // the repo root directory and failed with the generic, unhelpful
-    // "Failed to read file". It must now name the required arguments.
+    // A call naming no file at all: the missing `path` used to resolve to the
+    // repo root directory and fail with the generic, unhelpful "Failed to read
+    // file". It must name the arguments the tool needs instead.
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "fn main() {}")?;
 
@@ -2103,7 +2101,6 @@ fn test_get_excerpt_error_missing_path() -> Result<()> {
         "get_excerpt",
         json!({
             "repo": repo_name,
-            "file": "src/lib.rs",
             "start_line": 1,
             "end_line": 1
         }),
@@ -2113,7 +2110,6 @@ fn test_get_excerpt_error_missing_path() -> Result<()> {
     let error_msg = response["error"]["message"].as_str().unwrap();
     assert!(error_msg.contains("path"));
     assert!(error_msg.contains("lines"));
-    assert!(error_msg.contains("get_file("));
     assert!(!error_msg.contains("Failed to read file"));
 
     Ok(())
@@ -2145,11 +2141,39 @@ fn test_get_excerpt_error_directory_path() -> Result<()> {
 }
 
 #[test]
-fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
-    // Reproduces a second variant of the get_file/get_excerpt argument mix-up:
-    // a valid `path` but start_line/end_line instead of `lines`. Before the
-    // fix this silently produced "0 excerpt(s) from 0 match line(s)" instead
-    // of an error.
+fn test_get_excerpt_reads_a_start_end_line_range() -> Result<()> {
+    // get_file's argument shape, sent to get_excerpt — including `file` for the
+    // path. It says unambiguously which lines are wanted, so the range is read
+    // rather than refused with a "call the other tool" error.
+    let repo = TestRepo::new()?;
+    repo.add_rust_file("src/lib.rs", "fn first() {}\nfn second() {}\nfn third() {}")?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_excerpt",
+        json!({
+            "repo": repo_name,
+            "file": "src/lib.rs",
+            "start_line": 2,
+            "end_line": 2
+        }),
+    )?;
+
+    assert!(response["error"].is_null(), "response: {}", response);
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("second"), "text was: {}", text);
+    assert!(!text.contains("third"), "range not honoured: {}", text);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_excerpt_error_without_lines_or_range() -> Result<()> {
+    // Neither `lines` nor a range: an empty `lines` used to read as
+    // "0 excerpt(s) from 0 match line(s)", which looks like an answer.
     let repo = TestRepo::new()?;
     repo.add_rust_file("src/lib.rs", "fn main() {}")?;
 
@@ -2161,9 +2185,7 @@ fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
         "get_excerpt",
         json!({
             "repo": repo_name,
-            "path": "src/lib.rs",
-            "start_line": 1,
-            "end_line": 1
+            "path": "src/lib.rs"
         }),
     )?;
 
@@ -2171,7 +2193,6 @@ fn test_get_excerpt_error_start_end_line_instead_of_lines() -> Result<()> {
     let error_msg = response["error"]["message"].as_str().unwrap();
     assert!(error_msg.contains("lines"));
     assert!(error_msg.contains("start_line"));
-    assert!(error_msg.contains("get_file("));
 
     Ok(())
 }

@@ -79,9 +79,8 @@ impl ToolHandler for GetExcerptHandler {
             // error points at the fix instead of a downstream read failure.
             return Err(anyhow::anyhow!(
                 "get_excerpt requires 'path' (a file path) and 'lines' (an array \
-                 of line numbers to extract context around); for a literal \
-                 start/end line range use get_file instead, e.g. \
-                 get_file(repo=\"...\", path=\"src/foo.c\", start_line=100, end_line=160)"
+                 of line numbers to extract context around); to read one literal \
+                 start/end line range pass start_line/end_line instead of 'lines'"
             ));
         }
         let lines: Vec<usize> = args
@@ -92,17 +91,21 @@ impl ToolHandler for GetExcerptHandler {
                     .collect()
             })
             .unwrap_or_default();
-        if lines.is_empty() && (args.get("start_line").is_some() || args.get("end_line").is_some())
-        {
-            // Same mistake as the missing-path case, just with a valid path:
-            // start_line/end_line belong to get_file, not get_excerpt. Without
-            // this check the empty `lines` silently yields "0 excerpt(s)"
-            // instead of pointing at the fix.
+        let start_line = args.get_u64("start_line").map(|v| v as usize);
+        let end_line = args.get_u64("end_line").map(|v| v as usize);
+        if lines.is_empty() && (start_line.is_some() || end_line.is_some()) {
+            // A start/end range is get_file's argument shape, but it says
+            // unambiguously which lines the caller wants — read them rather
+            // than erroring and making the caller re-issue the same request
+            // against the other tool.
+            return engine.get_file(repo, path, start_line, end_line).await;
+        }
+        if lines.is_empty() {
+            // Neither argument shape: without this the empty `lines` reads as
+            // "0 excerpt(s)", which looks like an answer about the file.
             return Err(anyhow::anyhow!(
-                "get_excerpt takes 'lines' (an array of line numbers to \
-                 extract context around), not 'start_line'/'end_line'; for a \
-                 literal start/end line range use get_file instead, e.g. \
-                 get_file(repo=\"...\", path=\"src/foo.c\", start_line=100, end_line=160)"
+                "get_excerpt requires 'lines' (an array of line numbers to extract \
+                 context around), or a 'start_line'/'end_line' range"
             ));
         }
         let config = ExcerptConfig {

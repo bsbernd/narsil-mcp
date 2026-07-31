@@ -325,6 +325,7 @@ fn normalize_arg_aliases(args: &mut Value) {
     // (canonical, alias) pairs.
     const ALIASES: &[(&str, &str)] = &[
         ("path", "file_path"),
+        ("path", "file"),
         ("repo", "repo_path"),
         ("symbol", "symbol_name"),
         ("commit", "commit_hash"),

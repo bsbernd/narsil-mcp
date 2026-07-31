@@ -191,7 +191,7 @@ lazy_static! {
 
         map.insert("get_excerpt", ToolMetadata {
             name: "get_excerpt",
-            description: "Context around a list of specific line numbers, expanded to function or class boundaries. Takes `lines`, not a range — for a range use get_file.",
+            description: "Context around a list of specific line numbers, expanded to function or class boundaries. Takes `lines`; a `start_line`/`end_line` range is read as one plain range, like get_file.",
             category: ToolCategory::Repository,
             tags: ["excerpt", "context", "lines", "code"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -203,12 +203,14 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line numbers to extract around (1-indexed)"},
+                    "start_line": {"type": "integer", "description": "First line of a plain range, in place of `lines`"},
+                    "end_line": {"type": "integer", "description": "Last line of a plain range, in place of `lines`"},
                     "context_before": {"type": "integer", "description": "Lines of context before (default: 5)"},
                     "context_after": {"type": "integer", "description": "Lines of context after (default: 5)"},
                     "expand_to_scope": {"type": "boolean", "description": "Expand to function/class boundaries (default: true)"},
                     "max_lines": {"type": "integer", "description": "Maximum lines per excerpt (default: 50)"}
                 },
-                "required": ["repo", "path", "lines"]
+                "required": ["repo", "path"]
             }),
             requires_api_key: false,
             aliases: vec!["excerpt", "code_excerpt"],
