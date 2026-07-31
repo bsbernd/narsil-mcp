@@ -182,12 +182,10 @@ async fn test_resolve_repo_accepts_indexed_repo_path() {
     );
 }
 
-/// Test that resolve_repo rejects bare short names like "linux.git".
-///
-/// Short names cannot disambiguate between two indexed repos that share the
-/// same basename (the original collision bug), so they are no longer accepted.
+/// Test that resolve_repo accepts a bare short name naming one indexed repo,
+/// and still rejects one that names none.
 #[tokio::test]
-async fn test_resolve_repo_rejects_bare_short_name() {
+async fn test_resolve_repo_accepts_unambiguous_bare_short_name() {
     let temp_dir = TempDir::new().unwrap();
     let repo_path = temp_dir.path().join("test-repo");
     fs::create_dir(&repo_path).unwrap();
@@ -200,7 +198,12 @@ async fn test_resolve_repo_rejects_bare_short_name() {
     engine.complete_initialization().await.unwrap();
 
     let result = engine.get_project_structure("test-repo", 3, 0, 0).await;
-    let err = result.expect_err("bare short name must be rejected");
+    assert!(result.is_ok(), "bare name: {:?}", result.err());
+
+    let err = engine
+        .get_project_structure("no-such-repo", 3, 0, 0)
+        .await
+        .expect_err("an unknown name must still be rejected");
     let msg = format!("{:#}", err);
     assert!(
         msg.contains("list_repos"),

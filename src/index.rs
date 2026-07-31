@@ -2513,10 +2513,9 @@ impl CodeIntelEngine {
     /// repo root, and any subdirectory of an indexed repo also resolves to
     /// that repo's root (so `"."` from inside a repo subdirectory works).
     ///
-    /// Bare short names (e.g. `"linux.git"`) are rejected with an error that
-    /// points the caller at `list_repos`: short names cannot disambiguate
-    /// between multiple indexed repos that share the same basename, so the
-    /// caller must pass a path.
+    /// A bare short name (e.g. `"linux.git"`) matches an indexed repo's
+    /// directory name, with or without the trailing `.git`; when several repos
+    /// share that name the caller is asked for a path instead.
     ///
     /// The returned string is the canonical absolute path as stored in the
     /// engine's repository maps — use it directly as the lookup key.
@@ -2525,23 +2524,11 @@ impl CodeIntelEngine {
             return Err(self.repo_not_found_error(input));
         }
 
-        // Reject anything that isn't a path-like input. Bare short names are
-        // ambiguous (two repos can share a basename), so require an explicit
-        // path or ".".
+        // A bare short name is not a path, so match it against the indexed
+        // repos' directory names instead.
         let looks_like_path = input == "." || input.contains('/') || input.contains('\\');
         if !looks_like_path {
-            let repo_paths: Vec<_> = self
-                .repos
-                .iter()
-                .map(|r| r.value().path.display().to_string())
-                .collect();
-            return Err(anyhow!(
-                "Repository '{}' must be passed as an absolute path, relative path, or '.'. \
-                 Indexed repositories: {}. \
-                 Use list_repos to see all indexed repositories.",
-                input,
-                repo_paths.join(", ")
-            ));
+            return self.resolve_repo_by_name(input);
         }
 
         // Resolve the input to an absolute canonical path on disk.
@@ -2583,6 +2570,50 @@ impl CodeIntelEngine {
         }
 
         Err(self.repo_not_found_error(input))
+    }
+
+    /// Canonical paths of every repository the engine answers for: the indexed
+    /// set plus the configured repos whose first index pass hasn't run yet.
+    fn indexed_repo_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .map(|entry| entry.value().path.clone())
+            .chain(self.repo_paths.iter().cloned())
+            .filter_map(|path| path.canonicalize().ok())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Resolve a bare name (`libfuse`, `linux.git`) against the indexed repos'
+    /// directory names, matching with or without a trailing `.git`. Only an
+    /// unambiguous match resolves — a shared basename is precisely what passing
+    /// a path settles.
+    fn resolve_repo_by_name(&self, name: &str) -> Result<String> {
+        let matches: Vec<String> = self
+            .indexed_repo_paths()
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|base| base.to_str())
+                    .is_some_and(|base| base == name || base.trim_end_matches(".git") == name)
+            })
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+
+        match matches.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(self.repo_not_found_error(name)),
+            several => Err(anyhow!(
+                "Repository name '{}' matches {} indexed repositories: {}. \
+                 Pass the path of the one you mean.",
+                name,
+                several.len(),
+                several.join(", ")
+            )),
+        }
     }
 
     /// Get a reference to the engine options
@@ -12475,6 +12506,46 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// A repo's directory name is how it is talked about — in `--repos`, in a
+    /// shell prompt, in the session's working directory — so it must resolve
+    /// while it names exactly one indexed repo.
+    #[tokio::test]
+    async fn resolve_repo_accepts_an_unambiguous_bare_name() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("libfuse.git");
+        std::fs::create_dir(&repo).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        assert_eq!(engine.resolve_repo("libfuse.git").unwrap(), repo_key);
+        // `.git` is part of the directory name, not of the repo's name.
+        assert_eq!(engine.resolve_repo("libfuse").unwrap(), repo_key);
+        assert!(engine.resolve_repo("no-such-repo").is_err());
+    }
+
+    /// Two repos sharing a basename is exactly what passing a path settles, so
+    /// the error has to name them rather than list every indexed repo.
+    #[tokio::test]
+    async fn resolve_repo_names_the_candidates_for_an_ambiguous_name() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("a/linux.git");
+        let second = temp.path().join("b/linux.git");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let engine = CodeIntelEngine::new(
+            temp.path().join("index"),
+            vec![first.clone(), second.clone()],
+        )
+        .await
+        .unwrap();
+
+        let err = engine.resolve_repo("linux").unwrap_err().to_string();
+        assert!(err.contains("a/linux.git"), "{err}");
+        assert!(err.contains("b/linux.git"), "{err}");
     }
 
     /// The lease is what a query consults to decide between answering and
