@@ -293,8 +293,10 @@ fn scope_matches(rules: &[ScopeRule], rel: &str, abs: &str) -> bool {
 }
 
 /// How long a query waits for an in-flight index update before it is refused.
-/// Long enough to absorb a small incremental batch, far short of a checkout.
-const INDEX_LEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Long enough to absorb the incremental batches a save or a small commit
+/// triggers — those finish in well under a second, and a caller told to retry
+/// waits longer than that anyway — while still far short of a checkout.
+const INDEX_LEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Per-repo index lease. A query holds the read side for the duration of its
 /// tool call, an index update the write side. tokio's RwLock is
@@ -314,8 +316,9 @@ impl std::fmt::Display for IndexBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "EAGAIN: index update in progress for {} — retry the request",
-            self.repo
+            "EAGAIN: index update in progress for {} — waited {}s, retry the request",
+            self.repo,
+            INDEX_LEASE_GRACE.as_secs_f32()
         )
     }
 }
