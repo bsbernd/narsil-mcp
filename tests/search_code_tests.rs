@@ -79,6 +79,49 @@ async fn test_search_code_multi_token_non_adjacent() -> Result<()> {
     Ok(())
 }
 
+/// The busybox shape: an applet opens with a `//config:` help block naming
+/// every term, and implements them far below. The hit must land on the code.
+#[tokio::test]
+async fn test_search_code_fallback_prefers_code_over_comments() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "util-linux/mount.c",
+        "//config:config MOUNT\n\
+         //config:\tOptions: bind, move, remount are supported by this applet.\n\
+         //config:\tSee the manual for cmdopts handling of long options.\n\
+         \n\
+         int mount_main(int argc, char **argv)\n\
+         {\n\
+         \tfor (i = 1; argv[i]; i++) {\n\
+         \t\tcmdopts = append_mount_options(cmdopts, argv[i]);\n\
+         \t}\n\
+         }\n",
+    )?;
+    let repo_path = repo.path().canonicalize()?;
+    let (engine, _index) = engine_for(vec![repo_path.clone()]).await?;
+
+    let out = engine
+        .search_code(
+            Some(&repo_path.to_string_lossy()),
+            "append_mount_options cmdopts argv",
+            None,
+            10,
+            None,
+        )
+        .await?;
+
+    assert!(out.contains("mount.c"), "file must be found:\n{out}");
+    assert!(
+        out.contains("append_mount_options"),
+        "the excerpt must show the code implementing the terms:\n{out}"
+    );
+    assert!(
+        !out.contains("//config:config MOUNT"),
+        "the help block must not be the anchor:\n{out}"
+    );
+    Ok(())
+}
+
 /// An exact-phrase hit on a single line must still win over the fallback and
 /// must not trigger the fallback note.
 #[tokio::test]

@@ -3457,15 +3457,12 @@ impl CodeIntelEngine {
                     }
 
                     let lines: Vec<&str> = content.lines().collect();
-                    let anchor = lines
-                        .iter()
-                        .position(|l| {
-                            let line_lower = l.to_lowercase();
-                            tokens.iter().any(|t| line_lower.contains(t.as_str()))
-                        })
-                        .unwrap_or(0);
+                    let (anchor, coverage) = best_anchor(&lines, &tokens);
                     let anchor_line = lines.get(anchor).copied().unwrap_or("");
-                    let score = calculate_relevance(anchor_line, &query_lower);
+                    // Coverage dominates: a file whose terms sit together in
+                    // code must outrank one that mentions them scattered
+                    // through a help-text block.
+                    let score = coverage + calculate_relevance(anchor_line, &query_lower);
                     results.push((
                         repo_name.clone(),
                         make_excerpt(&lines, anchor, &rel_path, score),
@@ -12230,6 +12227,68 @@ fn get_language_id(path: &str) -> &'static str {
         Some("sh" | "bash") => "bash",
         _ => "",
     }
+}
+
+/// Lines a fallback hit spans: enough to hold a call and its arguments, short
+/// enough that a term at the top of a file and one at the bottom are never
+/// counted as the same hit.
+const FALLBACK_WINDOW: usize = 5;
+
+/// What a token found only in a comment contributes to a window's coverage.
+/// Not zero — a comment naming every term still beats no anchor at all — but
+/// far below code, so a help-text block cannot outrank the code implementing
+/// the same terms.
+const COMMENT_TOKEN_WEIGHT: f32 = 0.25;
+
+/// The line to anchor a multi-line fallback hit at, and how well that hit
+/// covers the query: the window of [`FALLBACK_WINDOW`] lines holding the most
+/// distinct tokens, counting code ahead of comments. Ties go to the earliest.
+///
+/// Tokens past the 64th do not count towards coverage; a query that long is
+/// already answered by the tokens before it.
+fn best_anchor(lines: &[&str], tokens: &[String]) -> (usize, f32) {
+    // Per line: the tokens it holds, and whether it is code. Computed once, so
+    // the window scan below stays off the O(lines × tokens) path.
+    let per_line: Vec<(u64, bool)> = lines
+        .iter()
+        .map(|line| {
+            let lower = line.to_lowercase();
+            let mut held = 0u64;
+            for (index, token) in tokens.iter().enumerate().take(64) {
+                if lower.contains(token.as_str()) {
+                    held |= 1 << index;
+                }
+            }
+            (held, !crate::security_rules::is_comment_only_line(line))
+        })
+        .collect();
+
+    let mut best = (0, 0.0);
+    for start in 0..per_line.len() {
+        let mut in_code = 0u64;
+        let mut in_comment = 0u64;
+        for (held, is_code) in per_line.iter().skip(start).take(FALLBACK_WINDOW) {
+            if *is_code {
+                in_code |= held;
+            } else {
+                in_comment |= held;
+            }
+        }
+        let coverage = in_code.count_ones() as f32
+            + COMMENT_TOKEN_WEIGHT * (in_comment & !in_code).count_ones() as f32;
+        if coverage > best.1 {
+            // Anchor at the first line of the window that holds anything, so
+            // the excerpt is centred on the match rather than on the run-up.
+            let offset = per_line
+                .iter()
+                .skip(start)
+                .take(FALLBACK_WINDOW)
+                .position(|(held, _)| *held != 0)
+                .unwrap_or(0);
+            best = (start + offset, coverage);
+        }
+    }
+    best
 }
 
 fn calculate_relevance(line: &str, query: &str) -> f32 {

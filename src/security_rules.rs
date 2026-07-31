@@ -2708,7 +2708,7 @@ fn byte_to_line_col(code: &str, byte_offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-fn is_comment_only_line(line: &str) -> bool {
+pub(crate) fn is_comment_only_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("//")
         || trimmed.starts_with("///")
