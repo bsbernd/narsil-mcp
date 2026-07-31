@@ -3299,11 +3299,11 @@ impl CodeIntelEngine {
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
             let marker = if line_num >= symbol.start_line && line_num <= symbol.end_line {
-                "â†’"
+                "→"
             } else {
                 " "
             };
-            output.push_str(&format!("{} {:4} â”‚ {}\n", marker, line_num, line));
+            output.push_str(&format!("{} {:4} │ {}\n", marker, line_num, line));
         }
 
         output.push_str("```\n");
@@ -3551,7 +3551,7 @@ impl CodeIntelEngine {
         output.push('\n');
 
         for (i, line) in lines[start..end].iter().enumerate() {
-            output.push_str(&format!("{:4} â”‚ {}\n", start + i + 1, line));
+            output.push_str(&format!("{:4} │ {}\n", start + i + 1, line));
         }
 
         output.push_str("```\n");
@@ -6225,14 +6225,14 @@ impl CodeIntelEngine {
         })?;
 
         let mut output = String::new();
-        output.push_str(&format!("# Call Path: `{}` â†’ `{}`\n\n", from, to));
+        output.push_str(&format!("# Call Path: `{}` → `{}`\n\n", from, to));
 
         match call_graph.find_call_path(from, to) {
             Some(path) => {
                 output.push_str(&format!("Found path with {} steps:\n\n", path.len() - 1));
                 for (i, func) in path.iter().enumerate() {
                     if i > 0 {
-                        output.push_str("  â†“\n");
+                        output.push_str("  ↓\n");
                     }
                     output.push_str(&format!("{}. `{}`\n", i + 1, func));
                 }
@@ -6286,15 +6286,15 @@ impl CodeIntelEngine {
                 // Add health assessment
                 output.push_str("\n## Health Assessment\n\n");
                 if metrics.cyclomatic > 10 {
-                    output.push_str("âš ï¸ **High cyclomatic complexity** - Consider refactoring into smaller functions.\n");
+                    output.push_str("⚠️ **High cyclomatic complexity** - Consider refactoring into smaller functions.\n");
                 } else if metrics.cyclomatic > 5 {
-                    output.push_str("âš¡ **Moderate complexity** - Function is manageable but could be simplified.\n");
+                    output.push_str("⚡ **Moderate complexity** - Function is manageable but could be simplified.\n");
                 } else {
-                    output.push_str("âœ… **Low complexity** - Function is well-structured.\n");
+                    output.push_str("✅ **Low complexity** - Function is well-structured.\n");
                 }
 
                 if metrics.max_depth > 4 {
-                    output.push_str("âš ï¸ **Deep nesting** - Consider early returns or extracting nested logic.\n");
+                    output.push_str("⚠️ **Deep nesting** - Consider early returns or extracting nested logic.\n");
                 }
             }
             None => {

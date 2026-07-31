@@ -150,25 +150,25 @@ impl SymbolKind {
     /// Get icon for display
     pub fn icon(&self) -> &'static str {
         match self {
-            SymbolKind::Struct => "ðŸ“¦",
-            SymbolKind::Class => "ðŸ›ï¸",
-            SymbolKind::Enum => "ðŸ“‹",
-            SymbolKind::Interface => "ðŸ“œ",
-            SymbolKind::Trait => "ðŸ”§",
-            SymbolKind::TypeAlias => "ðŸ·ï¸",
-            SymbolKind::Function => "âš¡",
-            SymbolKind::Method => "ðŸ”¹",
-            SymbolKind::Constructor => "ðŸ”¨",
-            SymbolKind::Module => "ðŸ“",
-            SymbolKind::Namespace => "ðŸ“‚",
-            SymbolKind::Package => "ðŸ“¦",
-            SymbolKind::Constant => "ðŸ”’",
-            SymbolKind::Variable => "ðŸ’¾",
-            SymbolKind::Field => "ðŸ”·",
-            SymbolKind::Parameter => "ðŸ“¥",
-            SymbolKind::Implementation => "âš™ï¸",
-            SymbolKind::Macro => "ðŸŽ¯",
-            SymbolKind::Unknown => "â“",
+            SymbolKind::Struct => "📦",
+            SymbolKind::Class => "🏛️",
+            SymbolKind::Enum => "📋",
+            SymbolKind::Interface => "📜",
+            SymbolKind::Trait => "🔧",
+            SymbolKind::TypeAlias => "🏷️",
+            SymbolKind::Function => "⚡",
+            SymbolKind::Method => "🔹",
+            SymbolKind::Constructor => "🔨",
+            SymbolKind::Module => "📁",
+            SymbolKind::Namespace => "📂",
+            SymbolKind::Package => "📦",
+            SymbolKind::Constant => "🔒",
+            SymbolKind::Variable => "💾",
+            SymbolKind::Field => "🔷",
+            SymbolKind::Parameter => "📥",
+            SymbolKind::Implementation => "⚙️",
+            SymbolKind::Macro => "🎯",
+            SymbolKind::Unknown => "❓",
         }
     }
 }
@@ -245,6 +245,41 @@ impl Symbol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the whole icon table was stored double-encoded, so every
+    /// symbol listing carried `âš¡` where it meant `⚡`.
+    #[test]
+    fn icons_are_not_double_encoded() {
+        for kind in [
+            SymbolKind::Struct,
+            SymbolKind::Class,
+            SymbolKind::Enum,
+            SymbolKind::Interface,
+            SymbolKind::Trait,
+            SymbolKind::TypeAlias,
+            SymbolKind::Function,
+            SymbolKind::Method,
+            SymbolKind::Constructor,
+            SymbolKind::Module,
+            SymbolKind::Namespace,
+            SymbolKind::Package,
+            SymbolKind::Constant,
+            SymbolKind::Variable,
+            SymbolKind::Field,
+            SymbolKind::Parameter,
+            SymbolKind::Implementation,
+            SymbolKind::Macro,
+            SymbolKind::Unknown,
+        ] {
+            let icon = kind.icon();
+            assert!(
+                !crate::extract::is_double_encoded(icon),
+                "{:?} icon is mojibake: {}",
+                kind,
+                icon
+            );
+        }
+    }
 
     #[test]
     fn test_symbol_kind_classification() {

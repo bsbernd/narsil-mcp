@@ -296,19 +296,28 @@ fn format_excerpt(
         .map(|(i, line)| {
             let line_num = start_offset + i + 1;
             let marker = if match_set.contains(&line_num) {
-                "â†’"
+                "→"
             } else {
                 " "
             };
 
             if include_line_numbers {
-                format!("{} {:4} â”‚ {}", marker, line_num, line)
+                format!("{} {:4} │ {}", marker, line_num, line)
             } else {
                 format!("{} {}", marker, line)
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether `text` carries the signature of UTF-8 that was read as cp1252 and
+/// re-encoded: the leading byte of a multi-byte sequence surfaces as a Latin-1
+/// supplement character (`â`, `ð`, `Ã`). Every excerpt narsil returned was
+/// mangled that way once, in the source literals themselves.
+#[cfg(test)]
+pub(crate) fn is_double_encoded(text: &str) -> bool {
+    text.chars().any(|ch| ('\u{c0}'..='\u{ff}').contains(&ch))
 }
 
 /// Calculate relevance score based on match density
@@ -338,6 +347,16 @@ pub fn select_best_excerpt(excerpts: &[Excerpt], max_count: usize) -> Vec<&Excer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the gutter and the match marker were stored double-encoded
+    /// in this file, so every excerpt came back with `â”‚` in place of `│`.
+    #[test]
+    fn excerpt_gutter_is_not_double_encoded() {
+        let excerpt = format_excerpt(&["fn main() {}", "let x = 1;"], 0, &[1], true);
+        assert!(excerpt.contains('│'), "gutter missing: {}", excerpt);
+        assert!(excerpt.contains('→'), "match marker missing: {}", excerpt);
+        assert!(!is_double_encoded(&excerpt), "mojibake: {}", excerpt);
+    }
 
     #[test]
     fn test_extract_excerpt() {
