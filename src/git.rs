@@ -416,18 +416,28 @@ impl GitRepo {
             Self::validate_input(path, "file_path")?;
         }
 
-        let mut args = vec!["show", "--format=", "--patch", commit];
+        let show = |rev: &str| {
+            let mut args = vec!["show", "--format=", "--patch", rev];
+            if let Some(path) = file_path {
+                args.push("--");
+                args.push(path);
+            }
+            Command::new("git")
+                .args(&args)
+                .current_dir(&self.root)
+                .output()
+                .context("Failed to run git show")
+        };
 
-        if let Some(path) = file_path {
-            args.push("--");
-            args.push(path);
+        let mut output = show(commit)?;
+        if !output.status.success() {
+            // A name `git show` cannot resolve may still be an StGit patch:
+            // those live under refs/patches/<branch>/ and are not part of the
+            // revision namespace git searches.
+            if let Some(patch_ref) = self.stgit_patch_ref(commit) {
+                output = show(&patch_ref)?;
+            }
         }
-
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(&self.root)
-            .output()
-            .context("Failed to run git show")?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -435,6 +445,21 @@ impl GitRepo {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// The ref StGit keeps for patch `name` on the current branch, if it exists.
+    fn stgit_patch_ref(&self, name: &str) -> Option<String> {
+        let branch = self.current_branch().ok()?;
+        if branch.is_empty() {
+            return None;
+        }
+        let patch_ref = format!("refs/patches/{}/{}", branch, name);
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &patch_ref])
+            .current_dir(&self.root)
+            .output()
+            .ok()?;
+        output.status.success().then_some(patch_ref)
     }
 
     /// Find commits that modified a specific function/symbol, in the given
@@ -847,6 +872,39 @@ mod tests {
         let missing = "0123456789abcdef0123456789abcdef01234567";
         assert!(repo.changed_files_since(missing).unwrap().is_empty());
         assert_eq!(repo.commits_since(missing), None);
+    }
+
+    /// StGit names its patches in `stg series`, and those names are what a
+    /// caller passes on; git resolves them only via refs/patches/<branch>/.
+    #[test]
+    fn commit_diff_resolves_an_stgit_patch_name() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q", "-b", "work"]);
+        std::fs::write(p.join("a.c"), "int a;").unwrap();
+        run_git(p, &["add", "a.c"]);
+        run_git(p, &["commit", "-q", "-m", "base"]);
+        std::fs::write(p.join("a.c"), "int a_patched;").unwrap();
+        run_git(p, &["commit", "-qa", "-m", "the patch"]);
+        run_git(p, &["update-ref", "refs/patches/work/my-patch", "HEAD"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let diff = repo.commit_diff("my-patch", None).unwrap();
+        assert!(diff.contains("a_patched"), "diff was: {}", diff);
+    }
+
+    /// A genuinely unknown name must still fail, and say so as git does.
+    #[test]
+    fn commit_diff_reports_an_unknown_revision() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.c"), "int a;").unwrap();
+        run_git(p, &["add", "a.c"]);
+        run_git(p, &["commit", "-q", "-m", "base"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        assert!(repo.commit_diff("no-such-patch", None).is_err());
     }
 
     /// Without a file the caller gets `git log -S` over the files passed in;
