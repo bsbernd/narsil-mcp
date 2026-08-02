@@ -6031,6 +6031,7 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Callers of `{}`\n\n", function));
+        output.push_str(&ambiguity_note(&call_graph, function));
 
         if transitive {
             let callers = call_graph.get_transitive_callers(function, max_depth);
@@ -6218,6 +6219,7 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Callees of `{}`\n\n", function));
+        output.push_str(&ambiguity_note(&call_graph, function));
 
         if transitive {
             let callees = call_graph.get_transitive_callees(function, max_depth);
@@ -12164,6 +12166,36 @@ fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
     parent_canonical.starts_with(repo_canonical)
 }
 
+/// Header naming every definition of `function` when the graph holds more than
+/// one, so edges gathered from a single file cannot read as the whole picture.
+/// Empty when the name is unambiguous.
+fn ambiguity_note(call_graph: &CallGraph, function: &str) -> String {
+    let matches = call_graph.find_all_functions(function);
+    if matches.len() < 2 {
+        return String::new();
+    }
+    let chosen = call_graph.find_function(function).unwrap_or_default();
+    let others: Vec<String> = matches
+        .iter()
+        .filter(|key| **key != chosen)
+        .map(|key| format!("`{}`", key))
+        .collect();
+
+    format!(
+        "> `{}` has {} definitions. Showing `{}`.\n\
+         > Also defined in: {}.\n\
+         > Pass the file-qualified name (e.g. `{}`) to select another.\n\n",
+        function,
+        matches.len(),
+        chosen,
+        others.join(", "),
+        matches
+            .iter()
+            .find(|key| **key != chosen)
+            .unwrap_or(&chosen),
+    )
+}
+
 /// One file's section of a commit diff: its header through to the next one.
 struct DiffFile<'a> {
     /// Path the header names; the post-commit name for a rename.
@@ -12761,6 +12793,41 @@ mod tests {
             "\tret = my_dash_prefixed(x);",
             "dash_prefixed"
         ));
+    }
+
+    /// Two examples in one repo each define a static `update_fs_loop`. The
+    /// alphabetically first one wins the lookup, so the answer has to say that
+    /// a choice was made and how to make the other one.
+    #[test]
+    fn a_repeated_function_name_names_its_other_definitions() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+
+        let source = "static void update_fs_loop(int fd) { (void)fd; }\n";
+        let files: Vec<(String, String, tree_sitter::Tree)> =
+            ["example/invalidate_path.c", "example/notify_prune.c"]
+                .iter()
+                .map(|path| {
+                    (
+                        path.to_string(),
+                        source.to_string(),
+                        parser.parse(source, None).unwrap(),
+                    )
+                })
+                .collect();
+
+        let call_graph = CallGraph::new();
+        call_graph.build_from_files(&files).unwrap();
+
+        let note = ambiguity_note(&call_graph, "update_fs_loop");
+        assert!(note.contains("has 2 definitions"));
+        assert!(note.contains("Showing `example/invalidate_path.c::update_fs_loop`"));
+        assert!(note.contains("`example/notify_prune.c::update_fs_loop`"));
+
+        // A name defined once says nothing at all.
+        assert!(ambiguity_note(&call_graph, "no_such_function").is_empty());
     }
 
     /// A commit's file list is what a review compares against; it has to
