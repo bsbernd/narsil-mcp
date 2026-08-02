@@ -5050,15 +5050,70 @@ impl CodeIntelEngine {
         })?;
 
         let diff = git_repo.commit_diff(commit, path)?;
+        let files = split_diff_by_file(&diff);
 
         let mut output = String::new();
         output.push_str(&format!("# Commit Diff: `{}`\n\n", commit));
         if let Some(p) = path {
             output.push_str(&format!("**File**: `{}`\n\n", p));
         }
+        output.push_str(&format!("**Files changed**: {}\n\n", files.len()));
+        for file in &files {
+            output.push_str(&format!("- `{}` ({} bytes)\n", file.path, file.text.len()));
+        }
+        output.push('\n');
+
+        // Whole file sections only: a cut inside a hunk loses the files behind
+        // it without trace. Leave room for the header above and the footer below.
+        let budget = response_budget::MAX_RESPONSE_BYTES.saturating_sub(output.len() + 2048);
+        let mut used = 0;
+        let mut shown = 0;
+        let mut cut_inside = None;
         output.push_str("```diff\n");
-        output.push_str(&diff);
-        output.push_str("\n```\n");
+        for file in &files {
+            let room = budget.saturating_sub(used);
+            if file.text.len() > room {
+                // One file bigger than the whole budget: show its head rather
+                // than nothing, cut on a line boundary.
+                if shown == 0 {
+                    let head = response_budget::truncate_on_char_boundary(file.text, room);
+                    output.push_str(&head[..head.rfind('\n').map_or(head.len(), |nl| nl + 1)]);
+                    cut_inside = Some(file.path);
+                    shown = 1;
+                }
+                break;
+            }
+            output.push_str(file.text);
+            used += file.text.len();
+            shown += 1;
+        }
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str("```\n");
+
+        if let Some(cut) = cut_inside {
+            output.push_str(&format!(
+                "\n*`{}` alone exceeds the {} KB budget and is cut above.*\n",
+                cut,
+                response_budget::MAX_RESPONSE_BYTES / 1024
+            ));
+        }
+
+        if shown < files.len() {
+            output.push_str("\n## Files not shown\n\n");
+            for file in &files[shown..] {
+                output.push_str(&format!("- `{}` ({} bytes)\n", file.path, file.text.len()));
+            }
+            output.push_str(&format!(
+                "\n*Showing {} of {} files. One file at a time: \
+                 get_commit_diff(commit=\"{}\", path=\"{}\").*\n",
+                shown,
+                files.len(),
+                commit,
+                files[shown].path
+            ));
+        }
 
         Ok(output)
     }
@@ -12109,6 +12164,53 @@ fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
     parent_canonical.starts_with(repo_canonical)
 }
 
+/// One file's section of a commit diff: its header through to the next one.
+struct DiffFile<'a> {
+    /// Path the header names; the post-commit name for a rename.
+    path: &'a str,
+    /// Section text, header included.
+    text: &'a str,
+}
+
+/// Split a `git show` patch into per-file sections, in git's order. Text before
+/// the first header rides along with the first section rather than being lost.
+fn split_diff_by_file(diff: &str) -> Vec<DiffFile<'_>> {
+    let mut headers: Vec<usize> = Vec::new();
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") || line.starts_with("diff --cc ") {
+            headers.push(offset);
+        }
+        offset += line.len();
+    }
+
+    headers
+        .iter()
+        .enumerate()
+        .map(|(idx, header_start)| {
+            let end = headers.get(idx + 1).copied().unwrap_or(diff.len());
+            let header_line = diff[*header_start..end].lines().next().unwrap_or("");
+            DiffFile {
+                path: diff_header_path(header_line),
+                text: &diff[if idx == 0 { 0 } else { *header_start }..end],
+            }
+        })
+        .collect()
+}
+
+/// The path named by a `diff --git a/x b/x` or `diff --cc x` header line.
+fn diff_header_path(header: &str) -> &str {
+    if let Some(rest) = header.strip_prefix("diff --cc ") {
+        return rest;
+    }
+    let rest = header.strip_prefix("diff --git ").unwrap_or(header);
+    // The b-side is what the file is called after the commit.
+    match rest.rfind(" b/") {
+        Some(pos) => &rest[pos + 3..],
+        None => rest,
+    }
+}
+
 /// Validate a repo-relative pathspec handed to a git command: containment
 /// only, no existence check. A commit's diff legitimately names files the
 /// working tree no longer has. Shell metacharacters and a leading `-` are
@@ -12659,6 +12761,109 @@ mod tests {
             "\tret = my_dash_prefixed(x);",
             "dash_prefixed"
         ));
+    }
+
+    /// A commit's file list is what a review compares against; it has to
+    /// survive the response budget even when the hunks do not.
+    #[test]
+    fn a_diff_splits_into_one_section_per_file() {
+        let diff = "\
+diff --git a/test/conftest.py b/test/conftest.py
+deleted file mode 100644
+--- a/test/conftest.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-import pytest
+diff --git a/old_name.c b/new_name.c
+similarity index 90%
+--- a/old_name.c
++++ b/new_name.c
+@@ -1 +1 @@
+-int old;
++int new;
+";
+        let files = split_diff_by_file(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "test/conftest.py");
+        assert!(files[0].text.contains("-import pytest"));
+        // A rename is named by what the commit leaves behind.
+        assert_eq!(files[1].path, "new_name.c");
+        assert!(files[1].text.contains("+int new;"));
+
+        assert!(split_diff_by_file("").is_empty());
+    }
+
+    /// End to end on the tool: a commit too big for the response budget still
+    /// says what it touched, and the file it deletes can be asked for by name.
+    #[tokio::test]
+    async fn a_commit_diff_lists_its_files_and_serves_a_deleted_one() {
+        fn run_git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {:?} failed", args);
+        }
+        // Two files whose rewrite alone outgrows the budget, so the third
+        // (deleted) file can only survive in the inventory.
+        fn bulk(tag: &str) -> String {
+            (0..2000)
+                .map(|line| format!("{} line {}\n", tag, line))
+                .collect()
+        }
+
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        write_file(&repo.join("bulk_a.txt"), &bulk("before"));
+        write_file(&repo.join("bulk_b.txt"), &bulk("before"));
+        write_file(&repo.join("test_ctests.py"), "import pytest\n");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+
+        write_file(&repo.join("bulk_a.txt"), &bulk("after"));
+        write_file(&repo.join("bulk_b.txt"), &bulk("after"));
+        run_git(&repo, &["rm", "-q", "test_ctests.py"]);
+        run_git(&repo, &["commit", "-q", "-am", "drop the pytest suite"]);
+
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let diff = engine
+            .get_commit_diff(repo_arg, "HEAD", None)
+            .await
+            .unwrap();
+        assert!(diff.contains("**Files changed**: 3"), "diff was: {}", diff);
+        // Every file is named even though the hunks do not all fit.
+        for file in ["bulk_a.txt", "bulk_b.txt", "test_ctests.py"] {
+            assert!(diff.contains(file), "{} missing from the inventory", file);
+        }
+        assert!(diff.contains("## Files not shown"));
+        assert!(diff.contains("get_commit_diff(commit=\"HEAD\""));
+
+        // The deleted file is gone from the working tree; its diff is not.
+        let deleted = engine
+            .get_commit_diff(repo_arg, "HEAD", Some("test_ctests.py"))
+            .await
+            .unwrap();
+        assert!(deleted.contains("-import pytest"), "diff was: {}", deleted);
     }
 
     /// The file a commit deletes is absent from the working tree, and it is
