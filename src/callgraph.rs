@@ -1122,6 +1122,15 @@ impl CallGraph {
             }
         }
 
+        // 4b. Receiver-qualified name: source and review notes call the method
+        // `TestRunner.run_one`, while its key is `<file>::run_one`.
+        if let Some(method) = method_of_receiver_qualified(query) {
+            let mut matches = self.keys_ending_in_name(method);
+            if !matches.is_empty() {
+                return Some(matches.remove(0));
+            }
+        }
+
         // 5. Case-insensitive suffix match (deterministic)
         let mut matches: Vec<String> = self
             .nodes
@@ -1149,18 +1158,29 @@ impl CallGraph {
         None
     }
 
-    /// Find all functions matching a query (returns multiple matches for disambiguation).
-    pub fn find_all_functions(&self, query: &str) -> Vec<String> {
-        let mut matches = Vec::new();
-        let suffix = format!("::{}", query);
-        for entry in self.nodes.iter() {
-            let key = entry.key();
-            if key.ends_with(&suffix) || key == query {
-                matches.push(key.clone());
-            }
-        }
+    /// Keys whose function-name part is exactly `name`, sorted.
+    fn keys_ending_in_name(&self, name: &str) -> Vec<String> {
+        let suffix = format!("::{}", name);
+        let mut matches: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|entry| entry.key().ends_with(&suffix) || entry.key() == name)
+            .map(|entry| entry.key().clone())
+            .collect();
         matches.sort();
         matches
+    }
+
+    /// Find all functions matching a query (returns multiple matches for disambiguation).
+    pub fn find_all_functions(&self, query: &str) -> Vec<String> {
+        let matches = self.keys_ending_in_name(query);
+        if !matches.is_empty() {
+            return matches;
+        }
+        match method_of_receiver_qualified(query) {
+            Some(method) => self.keys_ending_in_name(method),
+            None => matches,
+        }
     }
 
     /// Get similar function names for suggestions when a function is not found
@@ -1594,6 +1614,19 @@ impl CallGraph {
     }
 }
 
+/// The method part of a receiver-qualified query (`TestRunner.run_one` ->
+/// `run_one`). `None` for a plain name, and for anything path-qualified, which
+/// the `::` and `/` rules already resolve.
+fn method_of_receiver_qualified(query: &str) -> Option<&str> {
+    if query.contains("::") || query.contains('/') {
+        return None;
+    }
+    query
+        .rsplit_once('.')
+        .map(|(_, method)| method)
+        .filter(|method| !method.is_empty())
+}
+
 /// Helper function to extract function name from a node (not a method to avoid recursion warning)
 fn extract_function_name(node: Node, source: &[u8]) -> Option<String> {
     // Look for name in children
@@ -2013,6 +2046,52 @@ if __name__ == \"__main__\":
             .map(|edge| edge.target)
             .collect();
         assert_eq!(helper_callers, vec!["mod.py::target".to_string()]);
+    }
+
+    /// `TestRunner.run_one` is how the method is written in the source and in
+    /// a review note; the graph keys it as `<file>::run_one`.
+    #[test]
+    fn a_method_resolves_under_its_class_name() {
+        let source = "\
+class TestRunner:
+    def run_one(self):
+        return 1
+
+    def run_all(self):
+        self.run_one()
+";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let graph = CallGraph::new();
+        graph
+            .build_from_files(&[("run-tests.py".to_string(), source.to_string(), tree)])
+            .unwrap();
+
+        assert_eq!(
+            graph.find_function("TestRunner.run_one"),
+            Some("run-tests.py::run_one".to_string())
+        );
+        assert_eq!(
+            graph.find_all_functions("TestRunner.run_one"),
+            vec!["run-tests.py::run_one".to_string()]
+        );
+        let callers: Vec<String> = graph
+            .get_callers("TestRunner.run_one")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(callers, vec!["run-tests.py::run_all".to_string()]);
+
+        // A file-qualified key still wins over the dotted fallback.
+        assert_eq!(
+            graph.find_function("run-tests.py::run_all"),
+            Some("run-tests.py::run_all".to_string())
+        );
+        assert_eq!(graph.find_function("TestRunner.no_such_method"), None);
     }
 
     /// A test runner class whose methods only call each other through `self`
