@@ -843,7 +843,9 @@ impl CallGraph {
                 "identifier" | "field_identifier" => {
                     target = child.utf8_text(source).ok().map(|s| s.to_string());
                 }
-                "field_expression" | "member_expression" => {
+                // field_expression is C/C++, member_expression JavaScript,
+                // attribute Python — all of them `receiver.method(...)`.
+                "field_expression" | "member_expression" | "attribute" => {
                     // Method call: extract the method name
                     if let Some(method) = self.get_last_identifier(child, source) {
                         target = Some(method);
@@ -2011,6 +2013,44 @@ if __name__ == \"__main__\":
             .map(|edge| edge.target)
             .collect();
         assert_eq!(helper_callers, vec!["mod.py::target".to_string()]);
+    }
+
+    /// A test runner class whose methods only call each other through `self`
+    /// used to come back with no edges in either direction.
+    #[test]
+    fn python_self_method_call_is_an_edge() {
+        let source = "\
+class TestRunner:
+    def run_one(self):
+        return 1
+
+    def run_all(self):
+        self.run_one()
+";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let graph = CallGraph::new();
+        graph
+            .build_from_files(&[("run-tests.py".to_string(), source.to_string(), tree)])
+            .unwrap();
+
+        let callees: Vec<String> = graph
+            .get_callees("run_all")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(callees, vec!["run-tests.py::run_one".to_string()]);
+
+        let callers: Vec<String> = graph
+            .get_callers("run_one")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(callers, vec!["run-tests.py::run_all".to_string()]);
     }
 
     #[test]
