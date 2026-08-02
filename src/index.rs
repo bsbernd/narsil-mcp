@@ -5036,10 +5036,10 @@ impl CodeIntelEngine {
         path: Option<&str>,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
-        let repo_path = PathBuf::from(&repo_key);
-        // Validate path to prevent traversal attacks
+        // A commit's path is a pathspec, not a file that has to exist now: the
+        // commit may be the one that deletes it.
         if let Some(p) = path {
-            validate_path(&repo_path, p)?;
+            validate_pathspec(p)?;
         }
 
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
@@ -12109,6 +12109,25 @@ fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
     parent_canonical.starts_with(repo_canonical)
 }
 
+/// Validate a repo-relative pathspec handed to a git command: containment
+/// only, no existence check. A commit's diff legitimately names files the
+/// working tree no longer has. Shell metacharacters and a leading `-` are
+/// rejected further down by GitRepo::validate_input.
+fn validate_pathspec(requested: &str) -> Result<()> {
+    if requested.starts_with('/') {
+        return Err(anyhow!("Absolute paths not allowed"));
+    }
+    if Path::new(requested)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "Path traversal attempt blocked: '..' is not allowed in a pathspec"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a requested path is within the repository root to prevent path traversal attacks
 fn validate_path(repo_root: &Path, requested: &str) -> Result<PathBuf> {
     // Don't allow paths starting with /
@@ -12640,6 +12659,18 @@ mod tests {
             "\tret = my_dash_prefixed(x);",
             "dash_prefixed"
         ));
+    }
+
+    /// The file a commit deletes is absent from the working tree, and it is
+    /// exactly the file a review asks that commit's diff about.
+    #[test]
+    fn a_pathspec_need_not_exist_but_must_stay_in_the_repo() {
+        assert!(validate_pathspec("test/test_ctests.py").is_ok());
+        assert!(validate_pathspec("no/such/file/anywhere.c").is_ok());
+
+        assert!(validate_pathspec("/etc/passwd").is_err());
+        assert!(validate_pathspec("../outside.c").is_err());
+        assert!(validate_pathspec("test/../../outside.c").is_err());
     }
 
     /// A repo's directory name is how it is talked about — in `--repos`, in a
