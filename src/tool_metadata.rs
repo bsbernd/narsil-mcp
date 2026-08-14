@@ -1745,7 +1745,9 @@ lazy_static! {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Glob patterns for files to exclude from analysis (public API surface)"
-                    }
+                    },
+                    "limit": {"type": "integer", "description": "Max unused exports to list (default: 50; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first unused export to list (default: 0)"}
                 },
                 "required": ["repo"]
             }),

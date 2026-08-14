@@ -249,9 +249,10 @@ impl UnusedExportReport {
         self.unused_exports.len()
     }
 
-    /// Format the report as markdown
+    /// Format the report as markdown, paging the unused-export table to
+    /// `window` (a repo with a real public API can produce thousands of rows).
     #[must_use]
-    pub fn to_markdown(&self) -> String {
+    pub fn to_markdown(&self, window: crate::response_budget::ListWindow) -> String {
         let mut md = String::new();
         md.push_str("# Unused Export Analysis\n\n");
 
@@ -271,11 +272,17 @@ impl UnusedExportReport {
             md.push_str("| File | Symbol | Kind | Line |\n");
             md.push_str("|------|--------|------|------|\n");
 
-            for export in &self.unused_exports {
+            let (page, capped) =
+                crate::response_budget::cap(&self.unused_exports, window, "find_unused_exports");
+            for export in page {
                 md.push_str(&format!(
                     "| `{}` | `{}` | {} | {} |\n",
                     export.file_path, export.symbol_name, export.symbol_kind, export.line
                 ));
+            }
+            if capped.truncated() {
+                md.push('\n');
+                md.push_str(&capped.footer());
             }
         }
 
@@ -2100,7 +2107,7 @@ func example() int {
     #[test]
     fn test_unused_export_report_to_markdown_empty() {
         let report = UnusedExportReport::new();
-        let md = report.to_markdown();
+        let md = report.to_markdown(crate::response_budget::ListWindow::new(0, 0));
 
         assert!(md.contains("Unused Export Analysis"));
         assert!(md.contains("No unused exports detected"));
@@ -2121,7 +2128,7 @@ func example() int {
             None,
         ));
 
-        let md = report.to_markdown();
+        let md = report.to_markdown(crate::response_budget::ListWindow::new(0, 0));
         assert!(md.contains("Files Analyzed**: 5"));
         assert!(md.contains("Files Excluded**: 2"));
         assert!(md.contains("Total Exports**: 10"));

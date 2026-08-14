@@ -223,8 +223,9 @@ impl ToolHandler for FindUnusedExportsHandler {
             })
             .unwrap_or_default();
 
+        let window = super::list_window(&args, crate::response_budget::DEFAULT_LIST_LIMIT as u64);
         engine
-            .find_unused_exports(repo, exclude_entry_points, exclude_patterns)
+            .find_unused_exports(repo, exclude_entry_points, exclude_patterns, window)
             .await
     }
 }

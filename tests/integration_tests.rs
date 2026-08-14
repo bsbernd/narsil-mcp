@@ -2642,6 +2642,40 @@ fn test_get_symbol_definition_notes_other_real_definitions() -> Result<()> {
 }
 
 #[test]
+fn test_find_unused_exports_caps_output() -> Result<()> {
+    let repo = TestRepo::new()?;
+    // Not lib.rs/main.rs: those are treated as entry points and skipped
+    // wholesale by exclude_entry_points (default true).
+    let mut content = String::new();
+    for export_idx in 0..55 {
+        content.push_str(&format!(
+            "pub fn unused_export_{export_idx}() -> i32 {{ {export_idx} }}\n"
+        ));
+    }
+    repo.add_rust_file("src/exports.rs", &content)?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_unused_exports",
+        json!({
+            "repo": repo_name
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert_eq!(content.matches("unused_export_").count(), 50);
+    assert!(content.contains("Showing 50 of 55"));
+
+    Ok(())
+}
+
+#[test]
 fn test_infer_types_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 

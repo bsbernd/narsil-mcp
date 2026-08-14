@@ -9604,6 +9604,7 @@ impl CodeIntelEngine {
         repo_name: &str,
         exclude_entry_points: bool,
         exclude_patterns: Vec<String>,
+        window: response_budget::ListWindow,
     ) -> Result<String> {
         use crate::dead_code::{find_unused_exports, UnusedExportConfig};
         use crate::incremental::ExportedSymbol;
@@ -9689,7 +9690,7 @@ impl CodeIntelEngine {
             &config,
         );
 
-        Ok(report.to_markdown())
+        Ok(report.to_markdown(window))
     }
 
     /// Fuzzy workspace symbol search
