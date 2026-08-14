@@ -2333,6 +2333,60 @@ fn test_hybrid_search_error_missing_query() -> Result<()> {
 }
 
 #[test]
+fn test_hybrid_search_tfidf_finalizes_vocabulary() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn calculate_total(items: &[i32]) -> i32 {
+            items.iter().sum()
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/other.rs",
+        r#"
+        pub fn unrelated_helper() -> bool {
+            true
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "hybrid_search",
+        json!({
+            "repo": repo_name,
+            "query": "calculate_total items sum",
+            "mode": "tfidf",
+            "max_results": 5
+        }),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    // Without tfidf_engine.finalize() the vocabulary is never rebuilt, embed()
+    // returns an all-zero vector for every snippet, and cosine similarity (a
+    // dot product of two zero vectors) is exactly 0.0000 for every result
+    // regardless of query relevance — the unrelated other.rs would then tie
+    // with, or even outrank, the genuinely relevant lib.rs. Check the score
+    // on the top-ranked (rank 1) result only: other.rs sharing no vocabulary
+    // with the query legitimately scores 0.0000, so asserting no zero score
+    // appears anywhere in the output would be a false failure.
+    let (top_result, _) = content.split_once("## 2.").unwrap_or((content, ""));
+    assert!(top_result.contains("lib.rs"));
+    assert!(!top_result.contains("Score**: 0.0000"));
+
+    Ok(())
+}
+
+#[test]
 fn test_infer_types_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 

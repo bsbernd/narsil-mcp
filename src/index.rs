@@ -7285,6 +7285,12 @@ impl CodeIntelEngine {
             }
         }
 
+        // Build the vocabulary from the snippets just indexed above: index_snippet
+        // only accumulates document frequencies, embed() reads a vocabulary that
+        // is empty until finalize() rebuilds it — skipping this leaves every
+        // TF-IDF vector zero, so the fusion below would rank on store order.
+        tfidf_engine.finalize();
+
         // Perform search based on mode
         let results = match mode {
             "bm25" => hybrid_engine.search_bm25(query, max_results),
