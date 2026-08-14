@@ -428,6 +428,10 @@ pub struct CodeIntelEngine {
     /// Per-repo cached `.gitignore` matcher, so the watch path rejects the same
     /// paths the index-time WalkBuilder would (built lazily on first use).
     gitignore_matchers: DashMap<PathBuf, Arc<ignore::gitignore::Gitignore>>,
+    /// C/C++ sources the compile_commands.json coverage filter dropped for the
+    /// most recent index of each repo (absolute paths), so a symbol query that
+    /// comes up empty for one of them can say why instead of "not found".
+    compile_commands_filtered_files: DashMap<String, Vec<PathBuf>>,
     /// Last time a `global -u` ran per repo, to debounce gtags refreshes under
     /// a burst of file events.
     gtags_last_refresh: DashMap<PathBuf, std::time::Instant>,
@@ -708,6 +712,7 @@ impl CodeIntelEngine {
             knowledge_graph,
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
             gitignore_matchers: DashMap::new(),
+            compile_commands_filtered_files: DashMap::new(),
             gtags_last_refresh: DashMap::new(),
             default_lsp_scope,
             default_index_filter,
@@ -1295,6 +1300,42 @@ impl CodeIntelEngine {
             .unwrap_or(COMPILE_COMMANDS_DEFAULT_MIN_COVERAGE_PCT)
     }
 
+    /// Note appended to a zero-symbol find_symbols answer when `file_glob`
+    /// matches a file the compile_commands.json coverage filter dropped from
+    /// this repo's index, so the miss reads as "not indexed", not "no
+    /// symbols" or "parser failure".
+    fn compile_commands_filter_note(&self, repo: &str, file_glob: Option<&glob::Pattern>) -> String {
+        let Some(glob) = file_glob else {
+            return String::new();
+        };
+        let Some(filtered) = self.compile_commands_filtered_files.get(repo) else {
+            return String::new();
+        };
+        let repo_path = Path::new(repo);
+        let matches: Vec<String> = filtered
+            .iter()
+            .filter_map(|abs| {
+                let rel = abs.strip_prefix(repo_path).unwrap_or(abs).to_string_lossy();
+                glob.matches(&rel).then(|| rel.into_owned())
+            })
+            .collect();
+        if matches.is_empty() {
+            return String::new();
+        }
+        format!(
+            "> Note: {} matched by `file_pattern` and not listed in this repo's \
+             compile_commands.json, so the index excluded {} from the base build \
+             (not a parser failure). Regenerate the manifest to include {}, then reindex.\n\n",
+            matches
+                .iter()
+                .map(|f| format!("`{}`", f))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if matches.len() == 1 { "it" } else { "them" },
+            if matches.len() == 1 { "it" } else { "them" },
+        )
+    }
+
     /// Whether gtags is intended for `repo_path`, ignoring whether a GTAGS db
     /// exists yet (used by the auto-generate gate, which runs before the db is
     /// built). The per-repo `gtags: { enabled }` override wins over the global
@@ -1633,6 +1674,10 @@ impl CodeIntelEngine {
             })
             .count();
         let cdb_diff_base = self.compile_commands_diff_base(&repo_name, path);
+        // Reset before deciding: a repo that no longer engages the filter (or
+        // whose manifest is now stale) must not keep reporting last run's
+        // exclusions as the reason a file has no symbols.
+        self.compile_commands_filtered_files.remove(&repo_name);
         if self.options.use_compile_commands && cxx_source_count >= COMPILE_COMMANDS_MIN_CXX_SOURCES
         {
             let explicit: Option<&Path> = self.options.compile_commands_path.as_deref();
@@ -1678,6 +1723,7 @@ impl CodeIntelEngine {
                     .unwrap_or_default();
                 let before = files.len();
                 let mut carried = 0usize;
+                let mut filtered_out: Vec<PathBuf> = Vec::new();
                 files.retain(|abs_path| {
                     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if is_c_header_ext(ext) {
@@ -1694,8 +1740,14 @@ impl CodeIntelEngine {
                         carried += 1;
                         return true;
                     }
-                    patterns.iter().any(|p| p.matches_path(rel))
+                    let keep = patterns.iter().any(|p| p.matches_path(rel));
+                    if !keep {
+                        filtered_out.push(abs_path.clone());
+                    }
+                    keep
                 });
+                self.compile_commands_filtered_files
+                    .insert(repo_name.clone(), filtered_out);
                 let behind = cdb_diff_base
                     .as_deref()
                     .and_then(|base| GitRepo::new(path).ok().and_then(|r| r.commits_since(base)))
@@ -3096,6 +3148,15 @@ impl CodeIntelEngine {
 
         let total = filtered.len();
 
+        // A file_pattern that matched nothing is indistinguishable from "this
+        // file has no symbols" unless the compile_commands filter is the
+        // actual reason -- name it instead of a bare zero.
+        let filter_note = if total == 0 {
+            self.compile_commands_filter_note(&repo, file_glob.as_ref())
+        } else {
+            String::new()
+        };
+
         // Collect dependent files for smart invalidation (from displayed results only).
         let dependent_files: Vec<String> = filtered
             .iter()
@@ -3112,6 +3173,9 @@ impl CodeIntelEngine {
             ));
         } else {
             output.push_str(&format!("Found {} symbols\n\n", total));
+        }
+        if !filter_note.is_empty() {
+            output.push_str(&filter_note);
         }
 
         // Group displayed results by kind.
@@ -13712,6 +13776,76 @@ similarity index 90%
             set.contains(&foo.canonicalize().unwrap()),
             "set must contain canonical path to lib/foo.c, got: {:?}",
             set
+        );
+    }
+
+    /// find_symbols on a file the compile_commands filter dropped must say
+    /// so, not read as "this file genuinely has no symbols".
+    #[tokio::test]
+    async fn find_symbols_names_compile_commands_filter_as_the_reason_for_zero() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        // 5 sources clears COMPILE_COMMANDS_MIN_CXX_SOURCES; listing 4 of them
+        // (80%) clears the coverage threshold, so the filter engages and
+        // drops exactly the one file left off the manifest: e.c.
+        let listed_names = ["a.c", "b.c", "c.c", "d.c"];
+        for name in listed_names {
+            write_file(&repo.join(name), &format!("void {}(void) {{}}\n", name.replace('.', "_")));
+        }
+        write_file(&repo.join("e.c"), "void e_func(void) {}\n");
+
+        let entries: Vec<String> = listed_names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"directory": "{}", "command": "cc -c {}", "file": "{}"}}"#,
+                    repo.display(),
+                    name,
+                    repo.join(name).canonicalize().unwrap().display()
+                )
+            })
+            .collect();
+        write_file(
+            &repo.join("compile_commands.json"),
+            &format!("[{}]", entries.join(",")),
+        );
+
+        let engine = CodeIntelEngine::with_options(
+            tmp.path().join("index"),
+            vec![repo.to_path_buf()],
+            EngineOptions {
+                use_compile_commands: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(repo).unwrap();
+
+        let output = engine
+            .find_symbols(&repo_key, None, Some("*"), Some("e.c"), None, 100)
+            .await
+            .unwrap();
+
+        assert!(
+            output.contains("Found 0 symbols"),
+            "e.c should be excluded from the index, got:\n{output}"
+        );
+        assert!(
+            output.contains("compile_commands.json") && output.contains("e.c"),
+            "zero-symbol answer must name the compile_commands filter as the reason, got:\n{output}"
+        );
+
+        // A listed file is unaffected and carries no such note.
+        let output = engine
+            .find_symbols(&repo_key, None, Some("*"), Some("a.c"), None, 100)
+            .await
+            .unwrap();
+        assert!(output.contains("a_c"), "a.c's own symbol should be found:\n{output}");
+        assert!(
+            !output.contains("compile_commands.json"),
+            "a listed file must not carry the exclusion note:\n{output}"
         );
     }
 }
