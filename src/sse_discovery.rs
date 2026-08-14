@@ -133,6 +133,50 @@ pub fn find_server_for_repos(repos: &[PathBuf]) -> Option<String> {
     find_at(&path, repos)
 }
 
+/// [`find_server_for_repos`], retried until `retry_budget` elapses. A stdio
+/// process started moments before its SSE counterpart registers otherwise
+/// loses the race for its whole lifetime: local-index mode, once entered by
+/// the caller, is never re-evaluated. `retry_budget` of zero probes exactly
+/// once, matching the pre-retry behavior.
+///
+/// `find_server_for_repos` runs synchronous blocking I/O (file locking, an
+/// HTTP probe), so each attempt runs on a blocking-pool thread; only the
+/// wait between attempts is a plain async sleep.
+pub async fn find_server_for_repos_with_retry(
+    repos: &[PathBuf],
+    retry_budget: Duration,
+) -> Option<String> {
+    let path = discovery_file_path().ok()?;
+    find_at_with_retry(&path, repos, retry_budget).await
+}
+
+/// Same as [`find_server_for_repos_with_retry`] but reads from an explicit
+/// path; used by tests.
+pub async fn find_at_with_retry(
+    path: &Path,
+    repos: &[PathBuf],
+    retry_budget: Duration,
+) -> Option<String> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + retry_budget;
+    loop {
+        let probe_path = path.to_path_buf();
+        let probe_repos = repos.to_vec();
+        let found = tokio::task::spawn_blocking(move || find_at(&probe_path, &probe_repos))
+            .await
+            .ok()
+            .flatten();
+        if found.is_some() || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        debug!(
+            "SSE discovery: no match yet, retrying for up to {:?} more",
+            deadline.saturating_duration_since(std::time::Instant::now())
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Same as [`find_server_for_repos`] but reads from an explicit path;
 /// used by tests.
 pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<String> {
@@ -519,6 +563,67 @@ mod tests {
                 .any(|r| r.url == UNREACHABLE_URL || r.url == "http://127.0.0.1:3"),
             "matching-but-unreachable entries should be pruned, got {:?}",
             surviving
+        );
+    }
+
+    /// A minimal listener that answers exactly one connection with a bare
+    /// 200 -- enough for http_probe, which only checks the status code.
+    fn spawn_single_shot_200_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The regression this whole feature exists for: a stdio process started
+    /// before its SSE counterpart registers must still find it, as long as
+    /// registration lands inside the retry budget.
+    #[tokio::test]
+    async fn find_at_with_retry_picks_up_a_server_registered_after_the_first_probe() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json");
+        // No record at t=0: the first probe inside the loop must miss.
+        let url = spawn_single_shot_200_server();
+
+        let writer_path = path.clone();
+        let writer_url = url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            write_records(&writer_path, &[record(&writer_url, &["/r"])]);
+        });
+
+        let found =
+            find_at_with_retry(&path, &[PathBuf::from("/r")], Duration::from_secs(3)).await;
+        assert_eq!(
+            found.as_deref(),
+            Some(url.as_str()),
+            "a retry budget spanning the late registration must still find it"
+        );
+    }
+
+    /// retry_budget of zero must behave exactly like the pre-retry single
+    /// probe: no waiting for a registration that arrives moments later.
+    #[tokio::test]
+    async fn find_at_with_retry_zero_budget_does_not_sleep() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json"); // no records at all
+
+        let start = std::time::Instant::now();
+        let found = find_at_with_retry(&path, &[PathBuf::from("/r")], Duration::ZERO).await;
+        let elapsed = start.elapsed();
+
+        assert!(found.is_none());
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "zero retry budget must not wait for a retry, took {:?}",
+            elapsed
         );
     }
 }

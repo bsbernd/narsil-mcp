@@ -195,6 +195,14 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_SSE_KEEPALIVE_SECS", default_value = "15")]
     sse_keepalive_secs: u64,
 
+    /// How long a stdio process retries the SSE discovery probe before
+    /// falling through to a local index. 0 (default) probes once, matching
+    /// prior behavior. A stdio process started moments before its SSE
+    /// counterpart otherwise loses the race for its whole lifetime: local
+    /// mode, once entered, is never re-evaluated.
+    #[arg(long, env = "NARSIL_DISCOVERY_RETRY_SECS", default_value = "0")]
+    discovery_retry_secs: u64,
+
     /// Tool preset (minimal, balanced, full, security-focused)
     /// Overrides the preset from config file
     #[arg(long, env = "NARSIL_PRESET")]
@@ -365,15 +373,12 @@ async fn main() -> Result<()> {
     // anything that fails (no registry file, no matching repos, transport
     // error) falls through to the normal local-index path.
     if matches!(server_args.transport, Transport::Stdio) {
-        // The discovery probe uses a blocking HTTP client whose own runtime is
-        // dropped when the call returns; run it via spawn_blocking so that drop
-        // does not happen inside this async context (which would panic).
-        let probe_repos = repos.clone();
+        // --discovery-retry-secs (default 0, i.e. one probe) bounds how long
+        // this process waits out the race against its SSE counterpart
+        // starting moments later — see find_server_for_repos_with_retry.
+        let retry_budget = std::time::Duration::from_secs(server_args.discovery_retry_secs);
         let discovered =
-            tokio::task::spawn_blocking(move || sse_discovery::find_server_for_repos(&probe_repos))
-                .await
-                .ok()
-                .flatten();
+            sse_discovery::find_server_for_repos_with_retry(&repos, retry_budget).await;
         if let Some(proxy_url) = discovered {
             info!("SSE discovery: delegating stdio to {}", proxy_url);
             // The upstream daemon decides its own tool list; nothing on this
