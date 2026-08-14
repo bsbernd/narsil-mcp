@@ -1023,6 +1023,7 @@ impl CodeIntelEngine {
     /// be the repo-relative path.
     fn index_symbol_embeddings(
         &self,
+        repo: &str,
         symbol: &Symbol,
         neural_docs: &mut Vec<crate::neural::NeuralDocument>,
     ) {
@@ -1030,9 +1031,12 @@ impl CodeIntelEngine {
             Some(ref sig) => sig,
             None => return,
         };
-        let symbol_id = format!("{}::{}", symbol.file_path, symbol.name);
+        // file_path is repo-relative, so two repos can share the same one --
+        // prefix with repo to keep the embedding store's document id unique.
+        let symbol_id = format!("{}::{}::{}", repo, symbol.file_path, symbol.name);
         self.embedding_engine.index_snippet(
             symbol_id.clone(),
+            repo.to_string(),
             symbol.file_path.clone(),
             sig.clone(),
             symbol.start_line,
@@ -1735,7 +1739,7 @@ impl CodeIntelEngine {
 
                 if let Some(symbols) = reused {
                     for symbol in &symbols {
-                        self.index_symbol_embeddings(symbol, &mut neural_docs);
+                        self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
                     }
                     symbols_vec.extend(symbols);
                 } else if cxx_augment && is_cxx {
@@ -1753,7 +1757,7 @@ impl CodeIntelEngine {
                 } else {
                     for mut symbol in parsed.symbols {
                         symbol.file_path = relative_path.clone();
-                        self.index_symbol_embeddings(&symbol, &mut neural_docs);
+                        self.index_symbol_embeddings(&repo_name, &symbol, &mut neural_docs);
                         symbols_vec.push(symbol);
                     }
                 }
@@ -1840,7 +1844,7 @@ impl CodeIntelEngine {
             // the tree-sitter baseline unchanged.
             for group in cxx_groups {
                 for symbol in &group.symbols {
-                    self.index_symbol_embeddings(symbol, &mut neural_docs);
+                    self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
                 }
                 symbols_vec.extend(group.symbols);
             }
@@ -1934,7 +1938,7 @@ impl CodeIntelEngine {
                 match joined {
                     Ok(file_symbols) => {
                         for symbol in &file_symbols {
-                            self.index_symbol_embeddings(symbol, &mut neural_docs);
+                            self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
                         }
                         symbols_vec.extend(file_symbols);
                     }
@@ -5791,6 +5795,7 @@ impl CodeIntelEngine {
             .embedding_engine
             .find_similar_code(query, max_results * 2) // Get more to filter
             .into_iter()
+            .filter(|r| repo_name.is_none_or(|rn| r.document.repo == rn))
             .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
             .take(max_results)
             .collect();
@@ -5852,13 +5857,19 @@ impl CodeIntelEngine {
                 )
             })?;
 
-        // Create symbol ID
-        let symbol_id = format!("{}::{}", symbol.file_path, symbol.name);
+        // Create symbol ID, matching the repo-prefixed form index_symbol_embeddings
+        // stores it under (file_path is repo-relative, so two repos can collide).
+        let symbol_id = format!("{}::{}::{}", repo, symbol.file_path, symbol.name);
 
-        // Find similar code to this symbol
-        let results = self
+        // Find similar code to this symbol, scoped to the same repo -- the
+        // embedding store is shared across every indexed repo.
+        let results: Vec<_> = self
             .embedding_engine
-            .find_similar_to_doc(&symbol_id, max_results);
+            .find_similar_to_doc(&symbol_id, max_results * 2)
+            .into_iter()
+            .filter(|r| r.document.repo == repo)
+            .take(max_results)
+            .collect();
 
         let mut output = String::new();
         output.push_str(&format!("# Code Similar to Symbol: `{}`\n\n", symbol_name));

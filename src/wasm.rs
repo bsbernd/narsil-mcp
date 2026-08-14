@@ -108,6 +108,7 @@ impl WasmCodeIntel {
                         let doc_id = format!("{}:{}:{}", path, symbol.name, symbol.start_line);
                         self.embeddings.index_snippet(
                             doc_id,
+                            String::new(), // wasm is single-file/single-session; no repo concept
                             path.to_string(),
                             body,
                             symbol.start_line,

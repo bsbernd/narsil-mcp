@@ -177,6 +177,11 @@ pub struct EmbeddingStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddedDocument {
     pub id: String,
+    /// Canonical repo key (as used in CodeIntelEngine::repos), so a store
+    /// shared across repos can be filtered back down to one. Empty for
+    /// callers with no repo concept (the wasm build, hybrid_search's
+    /// per-call ephemeral engine).
+    pub repo: String,
     pub file_path: String,
     pub content: String,
     pub start_line: usize,
@@ -278,6 +283,7 @@ impl VectorStore {
                 .iter()
                 .map(|doc| {
                     doc.id.capacity()
+                        + doc.repo.capacity()
                         + doc.file_path.capacity()
                         + doc.content.capacity()
                         + doc.embedding.capacity() * std::mem::size_of::<f32>()
@@ -397,6 +403,7 @@ impl EmbeddingEngine {
     pub fn index_snippet(
         &self,
         id: String,
+        repo: String,
         file_path: String,
         content: String,
         start_line: usize,
@@ -405,6 +412,7 @@ impl EmbeddingEngine {
         self.provider.write().add_document(&content);
         self.store.add(EmbeddedDocument {
             id,
+            repo,
             file_path,
             content,
             start_line,
@@ -535,6 +543,7 @@ mod tests {
 
         let doc1 = EmbeddedDocument {
             id: "doc1".to_string(),
+            repo: "test".to_string(),
             file_path: "test.rs".to_string(),
             content: "fn hello()".to_string(),
             start_line: 1,
@@ -544,6 +553,7 @@ mod tests {
 
         let doc2 = EmbeddedDocument {
             id: "doc2".to_string(),
+            repo: "test".to_string(),
             file_path: "test2.rs".to_string(),
             content: "fn goodbye()".to_string(),
             start_line: 10,
@@ -574,6 +584,7 @@ mod tests {
 
         engine.index_snippet(
             "repo1:doc".to_string(),
+            "test".to_string(),
             "repo1/src/lib.rs".to_string(),
             "fn hello_world() { println!(\"hello\"); }".to_string(),
             1,
@@ -583,6 +594,7 @@ mod tests {
 
         engine.index_snippet(
             "repo2:doc".to_string(),
+            "test".to_string(),
             "repo2/src/lib.rs".to_string(),
             "fn goodbye_world() { println!(\"goodbye\"); }".to_string(),
             1,
@@ -606,6 +618,7 @@ mod tests {
         let baseline = engine.heap_bytes();
         engine.index_snippet(
             "doc1".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
             1,
@@ -631,6 +644,7 @@ mod tests {
 
         engine.index_snippet(
             "test1".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn calculate_sum(a: i32, b: i32) -> i32 { a + b }".to_string(),
             1,
@@ -639,6 +653,7 @@ mod tests {
 
         engine.index_snippet(
             "test2".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn calculate_product(x: i32, y: i32) -> i32 { x * y }".to_string(),
             3,
@@ -647,6 +662,7 @@ mod tests {
 
         engine.index_snippet(
             "test3".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn print_hello() { println!(\"Hello\"); }".to_string(),
             5,
@@ -680,6 +696,7 @@ mod tests {
 
         engine.index_snippet(
             "doc1".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn fibonacci(n: u32) -> u32 { if n <= 1 { n } else { fibonacci(n-1) + fibonacci(n-2) } }".to_string(),
             1,
@@ -688,6 +705,7 @@ mod tests {
 
         engine.index_snippet(
             "doc2".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn factorial(n: u32) -> u32 { if n <= 1 { 1 } else { n * factorial(n-1) } }"
                 .to_string(),
@@ -697,6 +715,7 @@ mod tests {
 
         engine.index_snippet(
             "doc3".to_string(),
+            "test".to_string(),
             "test.rs".to_string(),
             "fn print_message(msg: &str) { println!(\"{}\", msg); }".to_string(),
             13,
@@ -754,6 +773,7 @@ mod tests {
         let mut store = VectorStore::new();
         store.add(EmbeddedDocument {
             id: "a".to_string(),
+            repo: "test".to_string(),
             file_path: "a.rs".to_string(),
             content: "fn a()".to_string(),
             start_line: 1,
@@ -762,6 +782,7 @@ mod tests {
         });
         store.add(EmbeddedDocument {
             id: "c".to_string(),
+            repo: "test".to_string(),
             file_path: "c.rs".to_string(),
             content: "fn c()".to_string(),
             start_line: 1,
@@ -779,6 +800,7 @@ mod tests {
         let make_result = |id: &str, sim: f32| SimilarityResult {
             document: EmbeddedDocument {
                 id: id.to_string(),
+                repo: "test".to_string(),
                 file_path: format!("{}.rs", id),
                 content: format!("fn {}()", id),
                 start_line: 1,

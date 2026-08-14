@@ -322,9 +322,12 @@ impl HybridSearchEngine {
 
         self.bm25_index.inner.write().add_document(search_doc);
 
-        // Index in TF-IDF
+        // Index in TF-IDF. This engine is rebuilt fresh and scoped to (at
+        // most) the caller's requested repo on every hybrid_search() call, so
+        // its documents don't need a repo tag to disambiguate.
         self.tfidf_engine.index_snippet(
             chunk.id.clone(),
+            String::new(),
             chunk.file_path.clone(),
             chunk.content.clone(),
             chunk.start_line,

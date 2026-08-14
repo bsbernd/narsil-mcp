@@ -18,6 +18,11 @@ struct TestMcpServer {
 impl TestMcpServer {
     /// Start a new MCP server instance with a test repository
     fn start_with_repo(repo_path: &Path) -> Result<Self> {
+        Self::start_with_repos(&[repo_path])
+    }
+
+    /// Start a new MCP server instance indexing several repositories at once
+    fn start_with_repos(repo_paths: &[&Path]) -> Result<Self> {
         let temp_dir = TempDir::new()?;
         let binary_path = if cfg!(debug_assertions) {
             "target/debug/narsil-mcp"
@@ -25,9 +30,16 @@ impl TestMcpServer {
             "target/release/narsil-mcp"
         };
 
+        // --repos takes a comma-separated list (main.rs: value_delimiter = ',').
+        let repos_arg = repo_paths
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(",");
+
         let mut process = Command::new(binary_path)
             .arg("--repos")
-            .arg(repo_path.to_str().unwrap())
+            .arg(repos_arg)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -2382,6 +2394,74 @@ fn test_hybrid_search_tfidf_finalizes_vocabulary() -> Result<()> {
     let (top_result, _) = content.split_once("## 2.").unwrap_or((content, ""));
     assert!(top_result.contains("lib.rs"));
     assert!(!top_result.contains("Score**: 0.0000"));
+
+    Ok(())
+}
+
+#[test]
+fn test_find_similar_code_scoped_to_repo() -> Result<()> {
+    // Distinct relative paths: both repos would otherwise render as the same
+    // "src/lib.rs", making a cross-repo leak invisible in the file_path field
+    // that's actually checked below (document content is empty after
+    // finalize() by design, so it can't be used to tell the repos apart).
+    let repo_a = TestRepo::new()?;
+    repo_a.add_rust_file(
+        "src/alpha_module.rs",
+        r#"
+        pub fn unique_alpha_calculation(x: i32) -> i32 {
+            x * 2
+        }
+    "#,
+    )?;
+    let repo_b = TestRepo::new()?;
+    repo_b.add_rust_file(
+        "src/beta_module.rs",
+        r#"
+        pub fn unique_beta_calculation(x: i32) -> i32 {
+            x * 2
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repos(&[repo_a.path(), repo_b.path()])?;
+    let repo_a_name = repo_a.path().to_str().unwrap();
+    let repo_b_name = repo_b.path().to_str().unwrap();
+    server.wait_for_repo(repo_a_name, Duration::from_secs(30))?;
+    server.wait_for_repo(repo_b_name, Duration::from_secs(30))?;
+
+    // find_similar_code: the embedding store is shared across every indexed
+    // repo, so a query scoped to repo_a must not surface repo_b's file.
+    let response = server.call_tool(
+        "find_similar_code",
+        json!({
+            "repo": repo_a_name,
+            "query": "unique_alpha_calculation",
+            "max_results": 5
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(!content.contains("Found 0 similar"));
+    assert!(content.contains("alpha_module.rs"));
+    assert!(!content.contains("beta_module.rs"));
+
+    // find_similar_to_symbol: same store, reached through a symbol lookup
+    // instead of a text query.
+    let response = server.call_tool(
+        "find_similar_to_symbol",
+        json!({
+            "repo": repo_a_name,
+            "symbol": "unique_alpha_calculation",
+            "max_results": 5
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(!content.contains("beta_module.rs"));
 
     Ok(())
 }
