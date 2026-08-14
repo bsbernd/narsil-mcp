@@ -8,6 +8,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+/// Commits a `--since=<days> days ago` log walk reads before stopping, for
+/// any caller-supplied `days`. Without it `days=3650` on a repo with a long
+/// history buffers the entire multi-year `git log` output (numstat or
+/// name-only) into memory via `Command::output()` before any render-side
+/// cap applies -- large enough to end the MCP connection. 500 commits is
+/// far past what a "recent changes" or "hotspots" query needs; both
+/// render-side caps already stop at 20.
+const MAX_LOG_COMMITS: &str = "500";
+
 /// Git blame information for a line
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlameInfo {
@@ -276,6 +285,7 @@ impl GitRepo {
                 "--format=%H|%h|%an|%ae|%at|%s",
                 "--numstat",
                 &format!("--since={} days ago", days),
+                &format!("--max-count={}", MAX_LOG_COMMITS),
             ])
             .current_dir(&self.root)
             .output()
@@ -297,6 +307,7 @@ impl GitRepo {
                 "--format=%H %ae",
                 "--name-only",
                 &format!("--since={} days ago", days),
+                &format!("--max-count={}", MAX_LOG_COMMITS),
             ])
             .current_dir(&self.root)
             .output()
@@ -815,6 +826,42 @@ mod tests {
             info.unpushed[0].contains("ahead commit"),
             "unpushed subject missing: {:?}",
             info.unpushed
+        );
+    }
+
+/// One more commit than [`MAX_LOG_COMMITS`] allows, so a caller-visible
+    /// count strictly under the created total proves the cap took effect
+    /// rather than every commit simply falling outside `--since`.
+    #[test]
+    fn recent_changes_and_change_frequency_cap_at_max_log_commits() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.txt"), "0").unwrap();
+        run_git(p, &["add", "a.txt"]);
+        run_git(p, &["commit", "-q", "-m", "step"]);
+        let max_commits: usize = MAX_LOG_COMMITS.parse().unwrap();
+        for step in 1..(max_commits + 1) {
+            std::fs::write(p.join("a.txt"), step.to_string()).unwrap();
+            run_git(p, &["commit", "-qa", "-m", "step"]);
+        }
+
+        let repo = GitRepo::new(p).unwrap();
+        let changes = repo.recent_changes(3650).unwrap();
+        assert_eq!(
+            changes.len(),
+            max_commits,
+            "git log --max-count must cap recent_changes at {max_commits}"
+        );
+
+        let frequency = repo.change_frequency(3650).unwrap();
+        let a_txt = frequency
+            .iter()
+            .find(|f| f.file_path == "a.txt")
+            .expect("a.txt should appear in change_frequency");
+        assert_eq!(
+            a_txt.total_commits, max_commits,
+            "git log --max-count must cap change_frequency's commit count at {max_commits}"
         );
     }
 
