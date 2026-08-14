@@ -28,6 +28,11 @@ fn validate_regex_pattern(pattern: &str) -> Result<regex::Regex, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchDocument {
     pub id: String,
+    /// Canonical repo key (as used in CodeIntelEngine::repos), so a store
+    /// shared across repos can be filtered back down to one. Empty for
+    /// callers with no repo concept (the wasm build, hybrid_search's
+    /// per-call ephemeral engine).
+    pub repo: String,
     pub file_path: String,
     /// Document content; None for the persistent file index (content lives in file_cache)
     pub content: Option<String>,
@@ -49,6 +54,7 @@ impl SearchDocument {
             crate::metrics::hashmap_table_bytes::<String, usize>(self.term_freq.capacity())
                 + self.term_freq.keys().map(String::capacity).sum::<usize>();
         self.id.capacity()
+            + self.repo.capacity()
             + self.file_path.capacity()
             + self.content.as_ref().map_or(0, String::capacity)
             + term_freq
@@ -201,13 +207,15 @@ impl SearchIndex {
     }
 
     /// Index content from a file
-    pub fn index_file(&mut self, file_path: &str, content: &str) {
-        self.add_document(build_file_doc(file_path, content));
+    pub fn index_file(&mut self, repo: &str, file_path: &str, content: &str) {
+        self.add_document(build_file_doc(repo, file_path, content));
     }
 
     /// Index a symbol (function, class, etc.)
+    #[allow(clippy::too_many_arguments)]
     pub fn index_symbol(
         &mut self,
+        repo: &str,
         file_path: &str,
         name: &str,
         content: &str,
@@ -221,6 +229,7 @@ impl SearchIndex {
 
         self.add_document(SearchDocument {
             id: format!("{}::{}", file_path, name),
+            repo: repo.to_string(),
             file_path: file_path.to_string(),
             content: Some(content.to_string()),
             doc_type,
@@ -522,12 +531,13 @@ fn split_identifier(ident: &str) -> Vec<String> {
 /// Build a SearchDocument for a file without touching any shared state.
 /// Pure function — safe to call from rayon parallel iterators.
 /// content is set to None; snippets are generated from file_cache at query time.
-pub(crate) fn build_file_doc(file_path: &str, content: &str) -> SearchDocument {
+pub(crate) fn build_file_doc(repo: &str, file_path: &str, content: &str) -> SearchDocument {
     let tokens = tokenize_code(content);
     let doc_len = tokens.len();
     let term_freq = count_terms(&tokens);
     SearchDocument {
         id: file_path.to_string(),
+        repo: repo.to_string(),
         file_path: file_path.to_string(),
         content: None,
         doc_type: DocType::File,
@@ -592,8 +602,8 @@ impl ConcurrentSearchIndex {
         }
     }
 
-    pub fn index_file(&self, file_path: &str, content: &str) {
-        self.inner.write().index_file(file_path, content);
+    pub fn index_file(&self, repo: &str, file_path: &str, content: &str) {
+        self.inner.write().index_file(repo, file_path, content);
     }
 
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
@@ -634,7 +644,7 @@ mod tests {
     fn test_search_index() {
         let mut index = SearchIndex::new();
 
-        index.index_file(
+        index.index_file("test", 
             "user.rs",
             r#"
             pub fn get_user_by_id(id: u32) -> User {
@@ -643,7 +653,7 @@ mod tests {
         "#,
         );
 
-        index.index_file(
+        index.index_file("test", 
             "order.rs",
             r#"
             pub fn create_order(user: &User) -> Order {
@@ -663,10 +673,10 @@ mod tests {
         // A fresh index still holds the static synonym table, so the baseline
         // is non-zero; indexing real content must push it strictly higher.
         let baseline = index.heap_bytes();
-        index.index_file("user.rs", "pub fn get_user_by_id(id: u32) -> User { user }");
+        index.index_file("test", "user.rs", "pub fn get_user_by_id(id: u32) -> User { user }");
         let after_one = index.heap_bytes();
         assert!(after_one > baseline, "indexing a file must grow heap_bytes");
-        index.index_file(
+        index.index_file("test", 
             "order.rs",
             "pub fn create_order(user: &User) -> Order { order }",
         );
@@ -733,8 +743,8 @@ mod tests {
     fn test_sort_handles_nan_scores() {
         let mut index = SearchIndex::new();
 
-        index.index_file("a.rs", "fn hello() { }");
-        index.index_file("b.rs", "fn world() { }");
+        index.index_file("test", "a.rs", "fn hello() { }");
+        index.index_file("test", "b.rs", "fn world() { }");
 
         // Search should not panic even if scores could theoretically be NaN
         let results = index.search("hello", 10);

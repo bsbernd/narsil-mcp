@@ -122,6 +122,7 @@ impl WasmCodeIntel {
                 // Index file content for search
                 let doc = SearchDocument {
                     id: path.to_string(),
+                    repo: String::new(), // wasm is single-file/single-session; no repo concept
                     file_path: path.to_string(),
                     content: Some(content.to_string()),
                     doc_type: DocType::File,

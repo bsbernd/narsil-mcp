@@ -311,6 +311,10 @@ impl HybridSearchEngine {
             });
         let search_doc = SearchDocument {
             id: chunk.id.clone(),
+            // Ephemeral engine, scoped to (at most) one repo per hybrid_search()
+            // call -- see the matching comment on the tfidf_engine.index_snippet
+            // call just below.
+            repo: String::new(),
             file_path: chunk.file_path.clone(),
             content: Some(chunk.content.clone()),
             doc_type,

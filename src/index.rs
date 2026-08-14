@@ -1697,7 +1697,7 @@ impl CodeIntelEngine {
                     .unwrap_or(file_path)
                     .to_string_lossy()
                     .to_string();
-                build_file_doc(&relative_path, content)
+                build_file_doc(&repo_name, &relative_path, content)
             })
             .collect();
 
@@ -4468,7 +4468,8 @@ impl CodeIntelEngine {
             }
             self.file_cache
                 .insert(abs_path.clone(), Arc::new(content.clone()));
-            self.search_index.index_file(&relative_path, &content);
+            self.search_index
+                .index_file(&repo_name, &relative_path, &content);
             self.query_cache.invalidate_for_file(&relative_path);
 
             let content_hash = content_sha256(content.as_bytes());
@@ -4743,7 +4744,8 @@ impl CodeIntelEngine {
                                 .insert(change.path.clone(), Arc::new(content.clone()));
 
                             // Update search index
-                            self.search_index.index_file(&rel_path, &content);
+                            self.search_index
+                                .index_file(&repo_name, &rel_path, &content);
 
                             // Smart cache invalidation - only invalidate entries that depend on this file
                             self.query_cache.invalidate_for_file(&rel_path);
@@ -5705,6 +5707,7 @@ impl CodeIntelEngine {
             .search_index
             .search(query, max_results * 2) // Get more results to filter
             .into_iter()
+            .filter(|r| repo_name.is_none_or(|rn| r.document.repo == rn))
             .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
             .take(max_results)
             .collect();

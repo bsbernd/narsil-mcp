@@ -2467,6 +2467,54 @@ fn test_find_similar_code_scoped_to_repo() -> Result<()> {
 }
 
 #[test]
+fn test_semantic_search_scoped_to_repo() -> Result<()> {
+    // Distinct relative paths so a cross-repo leak is visible in file_path.
+    let repo_a = TestRepo::new()?;
+    repo_a.add_rust_file(
+        "src/alpha_module.rs",
+        r#"
+        pub fn unique_alpha_calculation(x: i32) -> i32 {
+            x * 2
+        }
+    "#,
+    )?;
+    let repo_b = TestRepo::new()?;
+    repo_b.add_rust_file(
+        "src/beta_module.rs",
+        r#"
+        pub fn unique_alpha_calculation(x: i32) -> i32 {
+            x * 2
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repos(&[repo_a.path(), repo_b.path()])?;
+    let repo_a_name = repo_a.path().to_str().unwrap();
+    let repo_b_name = repo_b.path().to_str().unwrap();
+    server.wait_for_repo(repo_a_name, Duration::from_secs(30))?;
+    server.wait_for_repo(repo_b_name, Duration::from_secs(30))?;
+
+    // The search index is shared across every indexed repo, so a query
+    // scoped to repo_a must not surface repo_b's file.
+    let response = server.call_tool(
+        "semantic_search",
+        json!({
+            "repo": repo_a_name,
+            "query": "unique_alpha_calculation",
+            "max_results": 5
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(content.contains("alpha_module.rs"));
+    assert!(!content.contains("beta_module.rs"));
+
+    Ok(())
+}
+
+#[test]
 fn test_infer_types_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 
