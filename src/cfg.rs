@@ -1315,8 +1315,14 @@ impl CfgBuilder {
 
         let merge = self.create_block("match_end");
 
-        // Process each arm
-        let mut cursor = node.walk();
+        // Process each arm. match_arm nodes are children of the match's
+        // match_block, not of the match_expression itself (grammar:
+        // match_expression -> "match" value body:(match_block); match_block
+        // -> "{" match_arm* "}") -- walking node's own children directly, as
+        // a naive port of process_switch's shape would, finds none and
+        // silently produces a match with no arms.
+        let arms_container = find_child_by_kind(node, "match_block").unwrap_or(node);
+        let mut cursor = arms_container.walk();
         if cursor.goto_first_child() {
             let mut arm_count = 0;
             loop {
@@ -3535,6 +3541,60 @@ mod tests {
     // ===================================================================================
     // Multi-Language CFG Support Tests (Go, Java, C#, Kotlin)
     // ===================================================================================
+
+    /// process_match walked match_expression's own direct children looking
+    /// for match_arm nodes, but tree-sitter-rust nests them one level deeper
+    /// inside match_block (match_expression -> "match" value
+    /// body:(match_block); match_block -> match_arm*). Every match
+    /// statement -- sync or async, tail position or not -- silently got zero
+    /// arms: one condition block, an unreachable merge block, no edges
+    /// between them. Not actually async-specific despite how it first
+    /// presented (get_control_flow degenerate on an async fn, fine on a
+    /// sync one) -- that sync fn simply had no bare match statement in it.
+    #[test]
+    fn match_statement_produces_a_branching_cfg() {
+        fn cfg_for(source: &str) -> ControlFlowGraph {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let cfgs = analyze_function(&tree, source, "test.rs").unwrap();
+            assert!(!cfgs.is_empty(), "no CFG built for: {source}");
+            cfgs[0].clone()
+        }
+
+        // A 2-arm match, like an if/else, should produce one condition
+        // block, one block per arm, and a merge block: 4 blocks, 4 edges.
+        for (label, source) in [
+            (
+                "sync fn, bare match as the tail expression",
+                r#"fn test(r: Result<i32, ()>) -> i32 { match r { Ok(v) => v, Err(_) => 0 } }"#,
+            ),
+            (
+                "async fn, match over an awaited call (the originally reported shape)",
+                r#"async fn test() -> i32 { match foo().await { Ok(x) => x, Err(_) => 0 } }"#,
+            ),
+            (
+                "let-bound match RHS (already worked before this fix)",
+                r#"fn test(r: Result<i32, ()>) -> i32 { let x = match r { Ok(v) => v, Err(_) => 0 }; x }"#,
+            ),
+        ] {
+            let cfg = cfg_for(source);
+            assert_eq!(
+                cfg.blocks.len(),
+                4,
+                "{label}: expected 4 blocks (condition, 2 arms, merge), got {}",
+                cfg.blocks.len()
+            );
+            assert_eq!(
+                cfg.edges.len(),
+                4,
+                "{label}: expected 4 edges (2 jumps in, 2 fall-throughs out), got {}",
+                cfg.edges.len()
+            );
+        }
+    }
 
     #[test]
     fn test_go_switch_statement_cfg() {
