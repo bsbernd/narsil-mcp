@@ -292,6 +292,23 @@ fn scope_matches(rules: &[ScopeRule], rel: &str, abs: &str) -> bool {
     })
 }
 
+/// True for git merge-conflict leftovers (`foo_BACKUP_1234.c`, `foo.orig`,
+/// `foo.rej`, ...) that a merge tool or `git apply --reject` writes next to
+/// the real source file. They are untracked and never gitignored, so the
+/// index walk below would otherwise index them alongside the tracked file
+/// they were generated from.
+fn is_merge_conflict_artifact(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.ends_with(".orig") || name.ends_with(".rej") {
+        return true;
+    }
+    ["_BACKUP_", "_BASE_", "_LOCAL_", "_REMOTE_"]
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
 /// How long a query waits for an in-flight index update before it is refused.
 /// Long enough to absorb the incremental batches a save or a small commit
 /// triggers — those finish in well under a second, and a caller told to retry
@@ -1389,10 +1406,11 @@ impl CodeIntelEngine {
     }
 
     /// True when the indexer would never have indexed `abs_path` under
-    /// `repo_path` — a dotfile/dir or a `.gitignore`d path — mirroring the
-    /// index-time `WalkBuilder` (`hidden(true)` + git ignores). The watch path
-    /// consults this so build output written into a watched tree never triggers
-    /// a re-index or a gtags refresh (an in-tree kernel build emits `*.o`,
+    /// `repo_path` — a dotfile/dir, a `.gitignore`d path, or a merge-conflict
+    /// artifact — mirroring the index-time `WalkBuilder` (`hidden(true)` +
+    /// git ignores + `is_merge_conflict_artifact`). The watch path consults
+    /// this so build output written into a watched tree never triggers a
+    /// re-index or a gtags refresh (an in-tree kernel build emits `*.o`,
     /// `*.o.d`, `include/generated/*.h`, `*.mod.c`, …).
     fn is_ignored_for_index(&self, repo_path: &Path, abs_path: &Path) -> bool {
         let rel = abs_path.strip_prefix(repo_path).unwrap_or(abs_path);
@@ -1403,6 +1421,9 @@ impl CodeIntelEngine {
             .components()
             .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')))
         {
+            return true;
+        }
+        if is_merge_conflict_artifact(abs_path) {
             return true;
         }
         self.gitignore_for(repo_path)
@@ -1541,6 +1562,7 @@ impl CodeIntelEngine {
         let mut files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .filter(|e| !is_merge_conflict_artifact(e.path()))
             .map(|e| e.path().to_path_buf())
             .collect();
 
@@ -12781,6 +12803,29 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn is_merge_conflict_artifact_matches_known_shapes() {
+        assert!(is_merge_conflict_artifact(Path::new(
+            "src/sqe_op_BACKUP_324467.c"
+        )));
+        assert!(is_merge_conflict_artifact(Path::new(
+            "src/sqe_op_BASE_324467.c"
+        )));
+        assert!(is_merge_conflict_artifact(Path::new(
+            "src/sqe_op_LOCAL_324467.c"
+        )));
+        assert!(is_merge_conflict_artifact(Path::new(
+            "src/sqe_op_REMOTE_324467.c"
+        )));
+        assert!(is_merge_conflict_artifact(Path::new("src/mount.c.orig")));
+        assert!(is_merge_conflict_artifact(Path::new("src/mount.c.rej")));
+
+        assert!(!is_merge_conflict_artifact(Path::new("src/sqe_op.c")));
+        assert!(!is_merge_conflict_artifact(Path::new(
+            "src/backup_service.c"
+        )));
     }
 
     /// gtags answers with every use of a name. These are the ones that made

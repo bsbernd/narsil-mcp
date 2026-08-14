@@ -2515,6 +2515,86 @@ fn test_semantic_search_scoped_to_repo() -> Result<()> {
 }
 
 #[test]
+fn test_index_excludes_merge_conflict_artifacts() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+        pub fn real_function() -> i32 {
+            1
+        }
+    "#,
+    )?;
+    // Untracked leftovers a merge tool or `git apply --reject` writes next
+    // to the real file -- must not be indexed alongside it.
+    repo.add_rust_file(
+        "src/lib_BACKUP_12345.rs",
+        r#"
+        pub fn backup_function() -> i32 {
+            2
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/lib_BASE_12345.rs",
+        r#"
+        pub fn base_function() -> i32 {
+            3
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/lib_LOCAL_12345.rs",
+        r#"
+        pub fn local_function() -> i32 {
+            4
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/lib_REMOTE_12345.rs",
+        r#"
+        pub fn remote_function() -> i32 {
+            5
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/lib.rs.orig",
+        r#"
+        pub fn orig_function() -> i32 {
+            6
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_symbols",
+        json!({
+            "repo": repo_name,
+            "symbol_type": "all"
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert!(content.contains("real_function"));
+    assert!(!content.contains("backup_function"));
+    assert!(!content.contains("base_function"));
+    assert!(!content.contains("local_function"));
+    assert!(!content.contains("remote_function"));
+    assert!(!content.contains("orig_function"));
+
+    Ok(())
+}
+
+#[test]
 fn test_infer_types_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 
