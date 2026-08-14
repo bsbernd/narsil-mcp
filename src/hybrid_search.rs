@@ -27,6 +27,9 @@ pub struct HybridSearchConfig {
     pub candidate_multiplier: usize,
 }
 
+/// Chunks from one file the TF-IDF side of RRF fusion may contribute.
+const MAX_TFIDF_HITS_PER_FILE: usize = 2;
+
 impl Default for HybridSearchConfig {
     fn default() -> Self {
         Self {
@@ -221,8 +224,19 @@ impl HybridSearchEngine {
             });
         }
 
-        // Process TF-IDF results
+        // Process TF-IDF results. Capped per file: a degenerate or near-tied
+        // ranking otherwise lets one file's chunks fill most of the fused
+        // list, crowding out results from files that matched better overall.
+        let mut tfidf_hits_per_file: HashMap<String, usize> = HashMap::new();
         for (rank, result) in tfidf_results.iter().enumerate() {
+            let file_count = tfidf_hits_per_file
+                .entry(result.document.file_path.clone())
+                .or_insert(0);
+            if *file_count >= MAX_TFIDF_HITS_PER_FILE {
+                continue;
+            }
+            *file_count += 1;
+
             let id = &result.document.id;
             let rrf_score = self.config.tfidf_weight / (k + rank as f64 + 1.0);
 
@@ -539,6 +553,57 @@ mod tests {
                 "Results should be sorted by score"
             );
         }
+    }
+
+    #[test]
+    fn test_tfidf_hits_capped_per_file() {
+        let engine = create_test_engine();
+
+        // Five chunks all from the same file, plus one from a different file.
+        for i in 0..5 {
+            let chunk = CodeChunk {
+                id: format!("hot.rs:{}:func{}", i, i),
+                content: format!(
+                    "fn hot_function_{}() {{ let value = {}; calculate(value); }}",
+                    i, i
+                ),
+                file_path: "hot.rs".to_string(),
+                start_line: i + 1,
+                end_line: i + 1,
+                language: "rust".to_string(),
+                symbol_context: None,
+                chunk_type: ChunkType::Function,
+                doc_comment: None,
+                imports: Vec::new(),
+            };
+            engine.index_chunk(&chunk);
+        }
+        let other = CodeChunk {
+            id: "other.rs:0:unrelated".to_string(),
+            content: "fn unrelated() { do_nothing(); }".to_string(),
+            file_path: "other.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            language: "rust".to_string(),
+            symbol_context: None,
+            chunk_type: ChunkType::Function,
+            doc_comment: None,
+            imports: Vec::new(),
+        };
+        engine.index_chunk(&other);
+
+        let results = engine.search("function calculate", 10);
+
+        let hot_tfidf_hits = results
+            .iter()
+            .filter(|r| r.file_path == "hot.rs" && r.tfidf_rank.is_some())
+            .count();
+        assert!(
+            hot_tfidf_hits <= MAX_TFIDF_HITS_PER_FILE,
+            "expected at most {} TF-IDF hits from one file, got {}",
+            MAX_TFIDF_HITS_PER_FILE,
+            hot_tfidf_hits
+        );
     }
 
     #[test]
