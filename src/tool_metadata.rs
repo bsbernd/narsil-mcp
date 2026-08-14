@@ -1031,7 +1031,9 @@ lazy_static! {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"}
+                    "repo": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Max rows to list in each of the modified-files and unpushed-commits sections (default: 20; 0 = all)"},
+                    "offset": {"type": "integer", "description": "Index of the first row to list in each section (default: 0)"}
                 },
                 "required": ["repo"]
             }),

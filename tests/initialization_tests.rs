@@ -229,7 +229,12 @@ async fn test_get_branch_info_works_before_indexing_completes() {
 
     // WHEN: get_branch_info is called immediately, without ever calling
     // complete_initialization().
-    let result = engine.get_branch_info(repo_path.to_str().unwrap()).await;
+    let result = engine
+        .get_branch_info(
+            repo_path.to_str().unwrap(),
+            narsil_mcp::response_budget::ListWindow::new(0, 0),
+        )
+        .await;
 
     // THEN: it must succeed rather than fail with the "repo not found" error
     // resolve_repo used to produce while self.repos was still empty.

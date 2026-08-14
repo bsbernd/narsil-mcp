@@ -10,6 +10,11 @@ use crate::index::CodeIntelEngine;
 /// generic list default: the list is ranked, so the tail is never the answer.
 const DEFAULT_CONTRIBUTOR_LIMIT: u64 = 30;
 
+/// get_branch_info rows (modified files, unpushed commits) returned when the
+/// caller passes no `limit`. Matches get_recent_changes' render cap for the
+/// same commit-list shape.
+const DEFAULT_BRANCH_INFO_LIMIT: u64 = 20;
+
 /// Handler for get_blame tool
 pub struct GetBlameHandler;
 
@@ -145,7 +150,8 @@ impl ToolHandler for GetBranchInfoHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        engine.get_branch_info(repo).await
+        let window = super::list_window(&args, DEFAULT_BRANCH_INFO_LIMIT);
+        engine.get_branch_info(repo, window).await
     }
 }
 

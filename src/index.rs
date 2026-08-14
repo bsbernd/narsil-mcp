@@ -5147,7 +5147,11 @@ impl CodeIntelEngine {
     }
 
     /// Get current branch and repository status
-    pub async fn get_branch_info(&self, repo: &str) -> Result<String> {
+    pub async fn get_branch_info(
+        &self,
+        repo: &str,
+        window: response_budget::ListWindow,
+    ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
             anyhow!(
@@ -5179,8 +5183,13 @@ impl CodeIntelEngine {
 
         if !modified.is_empty() {
             output.push_str("## Working Tree Changes\n\n");
-            for file in &modified {
+            let (page, capped) = response_budget::cap(&modified, window, "get_branch_info");
+            for file in page {
                 output.push_str(&format!("- `{}`\n", file));
+            }
+            if capped.truncated() {
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         } else {
             output.push_str("*No changes in working tree*\n");
@@ -5189,8 +5198,13 @@ impl CodeIntelEngine {
         if let Some(up) = &upstream {
             if !up.unpushed.is_empty() {
                 output.push_str("\n## Unpushed Commits\n\n");
-                for commit in &up.unpushed {
+                let (page, capped) = response_budget::cap(&up.unpushed, window, "get_branch_info");
+                for commit in page {
                     output.push_str(&format!("- {}\n", commit));
+                }
+                if capped.truncated() {
+                    output.push('\n');
+                    output.push_str(&capped.footer());
                 }
             }
         }
@@ -12805,6 +12819,28 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    /// Run a git command in `dir`, asserting success. gpg signing is disabled
+    /// and identity is set via env so the test does not depend on global config.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn is_merge_conflict_artifact_matches_known_shapes() {
         assert!(is_merge_conflict_artifact(Path::new(
@@ -12826,6 +12862,70 @@ mod tests {
         assert!(!is_merge_conflict_artifact(Path::new(
             "src/backup_service.c"
         )));
+    }
+
+    /// A branch far ahead of its upstream, with a large working tree, used
+    /// to dump every commit subject and every changed path unbounded.
+    #[tokio::test]
+    async fn get_branch_info_caps_unpushed_commits_and_modified_files() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path();
+        run_git(repo_path, &["init", "-q"]);
+        write_file(&repo_path.join("a.txt"), "base");
+        run_git(repo_path, &["add", "a.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "base"]);
+        run_git(repo_path, &["branch", "up"]);
+        run_git(repo_path, &["branch", "--set-upstream-to=up"]);
+
+        // 25 unpushed commits, well past the default limit of 20.
+        for step in 0..25 {
+            write_file(&repo_path.join("a.txt"), &step.to_string());
+            run_git(repo_path, &["commit", "-qa", "-m", &format!("step {step}")]);
+        }
+        // 25 untracked (modified) files, same shape.
+        for file_idx in 0..25 {
+            write_file(&repo_path.join(format!("untracked_{file_idx}.txt")), "x");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo_path.to_path_buf()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo_key = canonical_repo_key(repo_path).unwrap();
+
+        let output = engine
+            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 20))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.matches(" step ").count(),
+            20,
+            "limit=20 should cap unpushed commits at 20, got:\n{output}"
+        );
+        assert_eq!(
+            output.matches("- `untracked_").count(),
+            20,
+            "limit=20 should cap modified files at 20, got:\n{output}"
+        );
+        assert!(
+            output.contains("Showing 20 of 25"),
+            "footer should name the total and next page:\n{output}"
+        );
+
+        // limit=0 is the documented escape hatch for "give me everything".
+        let output = engine
+            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 0))
+            .await
+            .unwrap();
+        assert_eq!(output.matches(" step ").count(), 25);
+        assert_eq!(output.matches("- `untracked_").count(), 25);
     }
 
     /// gtags answers with every use of a name. These are the ones that made
