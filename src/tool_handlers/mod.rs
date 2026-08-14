@@ -267,7 +267,15 @@ async fn query_leases(
             Some(lease) => leases.push(lease),
             // Returning drops the leases taken so far, so a refused query never
             // holds up the update it collided with.
-            None => return Err(IndexBusy { repo }.into()),
+            None => {
+                let (indexed_repos, total_repos) = engine.indexing_progress();
+                return Err(IndexBusy {
+                    repo,
+                    indexed_repos,
+                    total_repos,
+                }
+                .into());
+            }
         }
     }
     Ok(leases)

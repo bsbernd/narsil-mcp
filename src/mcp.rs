@@ -670,11 +670,18 @@ mod tests {
             Some(json!(1)),
             &anyhow::Error::from(crate::index::IndexBusy {
                 repo: "/repo".to_string(),
+                indexed_repos: 3,
+                total_repos: 5,
             }),
         );
         let error = busy.error.expect("IndexBusy is an error response");
         assert_eq!(error.code, crate::index::JSONRPC_INDEX_BUSY);
         assert!(error.message.contains("EAGAIN"));
+        assert!(
+            error.message.contains("3/5 repos indexed"),
+            "message should carry the same progress counters get_index_status reports: {}",
+            error.message
+        );
 
         let other = McpServer::tool_error_response(Some(json!(1)), &anyhow::anyhow!("boom"));
         assert_eq!(other.error.expect("still an error").code, -32000);

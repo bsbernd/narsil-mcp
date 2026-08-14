@@ -327,15 +327,23 @@ type IndexLease = Arc<tokio::sync::RwLock<()>>;
 pub struct IndexBusy {
     /// Canonical repo path whose index is being updated.
     pub repo: String,
+    /// Repos indexed so far, out of the total configured — the same counters
+    /// get_index_status reports, so a caller can tell a slow first-time index
+    /// from one that looks stuck without a separate call.
+    pub indexed_repos: usize,
+    pub total_repos: usize,
 }
 
 impl std::fmt::Display for IndexBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "EAGAIN: index update in progress for {} — waited {}s, retry the request",
+            "EAGAIN: index update in progress for {} — waited {}s, retry the request \
+             ({}/{} repos indexed)",
             self.repo,
-            INDEX_LEASE_GRACE.as_secs_f32()
+            INDEX_LEASE_GRACE.as_secs_f32(),
+            self.indexed_repos,
+            self.total_repos,
         )
     }
 }
@@ -1004,6 +1012,16 @@ impl CodeIntelEngine {
     }
 
     /// Get detailed initialization status
+    /// (repos indexed so far, total repos configured) -- the same counters
+    /// get_initialization_status reports, exposed directly for IndexBusy's
+    /// EAGAIN message.
+    pub fn indexing_progress(&self) -> (usize, usize) {
+        (
+            self.indexed_repos_count.load(Ordering::Acquire),
+            self.total_repos_count.load(Ordering::Acquire),
+        )
+    }
+
     pub fn get_initialization_status(&self) -> HashMap<String, serde_json::Value> {
         let mut status = HashMap::new();
         status.insert(
