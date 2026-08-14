@@ -3227,20 +3227,21 @@ impl CodeIntelEngine {
         // "Type::method" (the natural way to name an inherent-impl method) would
         // otherwise never match anything but the bare method name itself.
         let method_tail = symbol_name.rsplit("::").next().unwrap_or(symbol_name);
-        let symbol = match symbols
+        let matches: Vec<&Symbol> = symbols
             .iter()
             .filter(|s| {
                 s.name == symbol_name
                     || s.qualified_name.as_deref() == Some(symbol_name)
                     || (method_tail != symbol_name && s.name == method_tail)
             })
-            .reduce(|best, s| {
-                if definition_rank(s) > definition_rank(best) {
-                    s
-                } else {
-                    best
-                }
-            }) {
+            .collect();
+        let symbol = match matches.iter().copied().reduce(|best, s| {
+            if definition_rank(s) > definition_rank(best) {
+                s
+            } else {
+                best
+            }
+        }) {
             Some(s) => s,
             None => {
                 // AST miss (e.g. a file-local static the C parser dropped): consult
@@ -3297,6 +3298,7 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", symbol.name));
+        output.push_str(&symbol_definition_ambiguity_note(&matches, symbol));
         output.push_str(&format!("**File**: `{}`\n", symbol.file_path));
         output.push_str(&format!(
             "**Lines**: {}-{}\n",
@@ -12249,6 +12251,51 @@ fn ambiguity_note(call_graph: &CallGraph, function: &str) -> String {
             .iter()
             .find(|key| **key != chosen)
             .unwrap_or(&chosen),
+    )
+}
+
+/// Note naming every other real (body-having) definition of a symbol name,
+/// so a caller who only sees get_symbol_definition's rank-picked winner
+/// still learns a stub or an alternate implementation exists elsewhere
+/// (e.g. lib/fuse_service.c vs lib/fuse_service_stub.c). Empty when at most
+/// one distinct file defines the name — a header prototype alongside its
+/// single .c definition is the common case, not an ambiguity.
+fn symbol_definition_ambiguity_note(matches: &[&Symbol], chosen: &Symbol) -> String {
+    let looks_like_definition = |s: &Symbol| {
+        s.kind == chosen.kind && !matches!(s.kind, SymbolKind::Implementation) && s.line_count() > 1
+    };
+
+    let mut by_file: Vec<&str> = matches
+        .iter()
+        .filter(|s| looks_like_definition(s))
+        .map(|s| s.file_path.as_str())
+        .collect();
+    by_file.sort_unstable();
+    by_file.dedup();
+
+    if by_file.len() < 2 {
+        return String::new();
+    }
+
+    let others: Vec<&str> = by_file
+        .iter()
+        .filter(|f| **f != chosen.file_path)
+        .copied()
+        .collect();
+
+    format!(
+        "> `{}` has {} definitions. Showing `{}` ({}:{}).\n\
+         > Also defined in: {}.\n\n",
+        chosen.name,
+        by_file.len(),
+        chosen.name,
+        chosen.file_path,
+        chosen.start_line,
+        others
+            .iter()
+            .map(|f| format!("`{}`", f))
+            .collect::<Vec<_>>()
+            .join(", "),
     )
 }
 

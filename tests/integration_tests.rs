@@ -2595,6 +2595,53 @@ fn test_index_excludes_merge_conflict_artifacts() -> Result<()> {
 }
 
 #[test]
+fn test_get_symbol_definition_notes_other_real_definitions() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/real_impl.rs",
+        r#"
+        pub fn shared_name(x: i32) -> i32 {
+            x * 2
+        }
+    "#,
+    )?;
+    repo.add_rust_file(
+        "src/stub_impl.rs",
+        r#"
+        pub fn shared_name(x: i32) -> i32 {
+            0
+        }
+    "#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "get_symbol_definition",
+        json!({
+            "repo": repo_name,
+            "symbol": "shared_name"
+        }),
+    )?;
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+
+    assert!(content.contains("has 2 definitions"));
+    assert!(content.contains("Also defined in"));
+    // Whichever file get_symbol_definition picked as the primary answer, the
+    // note must name the OTHER one -- not just repeat the chosen file.
+    let names_real = content.contains("real_impl.rs");
+    let names_stub = content.contains("stub_impl.rs");
+    assert!(names_real && names_stub);
+
+    Ok(())
+}
+
+#[test]
 fn test_infer_types_error_missing_function() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 
