@@ -340,9 +340,18 @@ impl ConcurrentVectorStore {
 
     /// Re-compute every stored document's embedding using `embed_fn`.
     /// Used after vocabulary finalization to apply correct IDF values.
+    ///
+    /// Skips documents whose content is already empty: `finalize()` runs once
+    /// per repo indexed, and `clear_content()` (below) runs at the end of
+    /// every one of those calls, not just the last repo's. Without this skip,
+    /// each later repo's finalize() would re-embed every earlier repo's
+    /// already-cleared documents from empty content, zeroing their vectors.
     pub fn reembed_all(&self, embed_fn: impl Fn(&str) -> Vec<f32>) {
         let mut store = self.inner.write();
         for doc in &mut store.documents {
+            if doc.content.is_empty() {
+                continue;
+            }
             doc.embedding = embed_fn(&doc.content);
         }
     }
@@ -554,6 +563,41 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].document.id, "doc1"); // Should be most similar
         assert!(results[0].similarity > results[1].similarity);
+    }
+
+    #[test]
+    fn test_finalize_does_not_zero_earlier_repos_embeddings() {
+        // A single EmbeddingEngine is shared across every repo the server
+        // indexes; finalize() runs once per repo, not once per server. The
+        // second finalize() must not zero out the first repo's embedding.
+        let engine = EmbeddingEngine::new(100);
+
+        engine.index_snippet(
+            "repo1:doc".to_string(),
+            "repo1/src/lib.rs".to_string(),
+            "fn hello_world() { println!(\"hello\"); }".to_string(),
+            1,
+            1,
+        );
+        engine.finalize();
+
+        engine.index_snippet(
+            "repo2:doc".to_string(),
+            "repo2/src/lib.rs".to_string(),
+            "fn goodbye_world() { println!(\"goodbye\"); }".to_string(),
+            1,
+            1,
+        );
+        engine.finalize();
+
+        let repo1_doc = engine
+            .store
+            .get("repo1:doc")
+            .expect("repo1's document should still be in the store");
+        assert!(
+            repo1_doc.embedding.iter().any(|v| *v != 0.0),
+            "repo1's embedding was zeroed by repo2's finalize()"
+        );
     }
 
     #[test]
