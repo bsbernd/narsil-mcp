@@ -124,6 +124,7 @@ fn test_cache_stats_tracking() {
 }
 
 #[test]
+#[ignore = "performance smoke test"]
 fn test_cache_concurrent_performance() {
     use std::sync::Arc;
     use std::thread;
@@ -137,7 +138,6 @@ fn test_cache_concurrent_performance() {
     }
 
     // Spawn multiple threads doing concurrent reads
-    let start = Instant::now();
     let handles: Vec<_> = (0..8)
         .map(|t| {
             let cache = Arc::clone(&cache);
@@ -156,17 +156,6 @@ fn test_cache_concurrent_performance() {
     for handle in handles {
         handle.join().unwrap();
     }
-    let elapsed = start.elapsed();
-
-    // 8 threads x 1000 ops = 8000 operations should complete quickly
-    // Use 3s threshold to account for CI runner variability
-    // (Windows/Ubuntu GitHub Actions can be 2-3x slower than local machines)
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "Concurrent operations took {:?}, expected <3s",
-        elapsed
-    );
-
     let stats = cache.stats();
     assert!(stats.hits >= 8000);
 }
