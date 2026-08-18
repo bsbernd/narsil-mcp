@@ -4787,6 +4787,19 @@ impl CodeIntelEngine {
                                 .to_string_lossy()
                                 .to_string();
 
+                            if self.options.call_graph_enabled {
+                                if let (Some(call_graph), Some(tree)) =
+                                    (self.call_graphs.get(&repo_name), parsed.tree.clone())
+                                {
+                                    call_graph.remove_file(&rel_path);
+                                    call_graph.build_from_files(&[(
+                                        rel_path.clone(),
+                                        content.clone(),
+                                        tree,
+                                    )])?;
+                                }
+                            }
+
                             // Build this file's symbols once and reuse them for
                             // both the in-memory index and the persisted record.
                             let mut file_symbols: Vec<_> = parsed
@@ -4902,6 +4915,12 @@ impl CodeIntelEngine {
                         .unwrap_or(&change.path)
                         .to_string_lossy()
                         .to_string();
+
+                    if self.options.call_graph_enabled {
+                        if let Some(call_graph) = self.call_graphs.get(&repo_name) {
+                            call_graph.remove_file(&rel_path);
+                        }
+                    }
 
                     // Remove symbols for this file
                     if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
@@ -9499,7 +9518,7 @@ impl CodeIntelEngine {
             symbols.iter().map(|s| s.file_path.clone()).collect();
 
         // Parse imports from unique files only
-        for rel_path in unique_files {
+        for rel_path in &unique_files {
             let file_path = repo_path.join(&rel_path);
             if file_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&file_path) {
@@ -9565,13 +9584,13 @@ impl CodeIntelEngine {
             output.push_str("| File | Dependencies | Dependents |\n");
             output.push_str("|------|--------------|------------|\n");
 
-            let mut file_stats: Vec<_> = symbols
+            let mut file_stats: Vec<_> = unique_files
                 .iter()
-                .map(|s| {
-                    let path = repo_path.join(&s.file_path);
+                .map(|rel_path| {
+                    let path = repo_path.join(rel_path);
                     let deps = graph.dependencies(&path).len();
                     let dependents = graph.dependents(&path).len();
-                    (s.file_path.clone(), deps, dependents)
+                    (rel_path.clone(), deps, dependents)
                 })
                 .collect();
 
@@ -11895,7 +11914,7 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
                 imports.push(crate::incremental::Import {
                     source_file: std::path::PathBuf::from(file_path),
                     import_path,
-                    imported_symbols: vec![],
+                    imported_symbols: parse_imported_symbols(&trimmed[7..from_idx]),
                     import_type: crate::incremental::ImportType::EsModule,
                     line: line_num + 1,
                 });
@@ -11913,7 +11932,7 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
                     imports.push(crate::incremental::Import {
                         source_file: std::path::PathBuf::from(file_path),
                         import_path,
-                        imported_symbols: vec![],
+                        imported_symbols: parse_commonjs_imported_symbols(&trimmed[..start]),
                         import_type: crate::incremental::ImportType::CommonJs,
                         line: line_num + 1,
                     });
@@ -11922,12 +11941,15 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
         }
         // Python imports
         else if let Some(stripped) = trimmed.strip_prefix("from ") {
-            let import_path = stripped.split_whitespace().next().unwrap_or("").to_string();
+            let (import_path, imported_symbols) = stripped
+                .split_once(" import ")
+                .map(|(path, symbols)| (path.to_string(), parse_imported_symbols(symbols)))
+                .unwrap_or_else(|| (stripped.to_string(), Vec::new()));
             if !import_path.is_empty() {
                 imports.push(crate::incremental::Import {
                     source_file: std::path::PathBuf::from(file_path),
                     import_path,
-                    imported_symbols: vec![],
+                    imported_symbols,
                     import_type: crate::incremental::ImportType::Python,
                     line: line_num + 1,
                 });
@@ -11954,8 +11976,8 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
                 if !import_path.is_empty() {
                     imports.push(crate::incremental::Import {
                         source_file: std::path::PathBuf::from(file_path),
+                        imported_symbols: parse_imported_symbols(&import_path),
                         import_path,
-                        imported_symbols: vec![],
                         import_type: crate::incremental::ImportType::Python,
                         line: line_num + 1,
                     });
@@ -11979,10 +12001,15 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
             };
 
             if !import_path.is_empty() {
+                let imported_symbols = if let Some(brace_idx) = cleaned.find('{') {
+                    parse_imported_symbols(&cleaned[brace_idx..])
+                } else {
+                    parse_imported_symbols(cleaned.rsplit("::").next().unwrap_or(""))
+                };
                 imports.push(crate::incremental::Import {
                     source_file: std::path::PathBuf::from(file_path),
                     import_path,
-                    imported_symbols: vec![],
+                    imported_symbols,
                     import_type: crate::incremental::ImportType::Rust,
                     line: line_num + 1,
                 });
@@ -12006,6 +12033,41 @@ fn parse_imports_from_content(content: &str, file_path: &str) -> Vec<crate::incr
     }
 
     imports
+}
+
+fn parse_imported_symbols(bindings: &str) -> Vec<crate::incremental::ImportedSymbol> {
+    let bindings = bindings.trim().trim_matches(|ch| ch == '{' || ch == '}');
+    bindings
+        .split(',')
+        .filter_map(|binding| {
+            let binding = binding.trim();
+            if binding.is_empty() || binding == "*" {
+                return None;
+            }
+            let (name, alias) = binding
+                .split_once(" as ")
+                .map(|(name, alias)| (name.trim(), Some(alias.trim().to_string())))
+                .unwrap_or((binding, None));
+            Some(crate::incremental::ImportedSymbol {
+                name: name.to_string(),
+                alias,
+                is_default: false,
+            })
+        })
+        .collect()
+}
+
+fn parse_commonjs_imported_symbols(prefix: &str) -> Vec<crate::incremental::ImportedSymbol> {
+    if let Some(start) = prefix.find('{') {
+        if let Some(end) = prefix[start + 1..].find('}') {
+            return parse_imported_symbols(&prefix[start + 1..start + 1 + end]);
+        }
+    }
+    prefix
+        .rsplit(|ch: char| ch.is_whitespace() || ch == '=')
+        .find(|binding| !binding.is_empty())
+        .map(parse_imported_symbols)
+        .unwrap_or_default()
 }
 
 /// Format a vulnerability finding for output
