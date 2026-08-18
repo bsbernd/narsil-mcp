@@ -163,16 +163,13 @@ fn expand_to_scope(lines: &[&str], start: usize, end: usize) -> (usize, usize) {
             new_start = i;
             in_scope = true;
 
-            // Count opening braces
-            brace_count += line.chars().filter(|&c| c == '{').count() as i32;
-            brace_count -= line.chars().filter(|&c| c == '}').count() as i32;
             break;
         }
     }
 
     // If we found a scope start, scan forward to find the end
     if in_scope {
-        for (i, line) in lines.iter().enumerate().skip(start) {
+        for (i, line) in lines.iter().enumerate().skip(new_start) {
             brace_count += line.chars().filter(|&c| c == '{').count() as i32;
             brace_count -= line.chars().filter(|&c| c == '}').count() as i32;
 
@@ -377,6 +374,13 @@ fn main() {
         let excerpts = extract_excerpts(source, &[4], &config);
         assert!(!excerpts.is_empty());
         assert!(excerpts[0].content.contains("42"));
+    }
+
+    #[test]
+    fn scope_expansion_starts_brace_scan_at_scope_start() {
+        let source = ["fn main() {", "    if true {", "        work();", "    }", "}"];
+
+        assert_eq!(expand_to_scope(&source, 2, 3), (0, 5));
     }
 
     #[test]
