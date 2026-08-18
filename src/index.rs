@@ -1639,6 +1639,14 @@ impl CodeIntelEngine {
                     .into_owned();
                 scope_matches(index_filter_rules, &rel, &f.to_string_lossy())
             });
+        // The full walk result, kept only where the filter is active: a pull-in
+        // may only resolve a reference to a file the walker itself listed, never
+        // to an arbitrary path.
+        let all_files: std::collections::HashSet<PathBuf> = if repo_index_filtered {
+            files.iter().cloned().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         if repo_index_filtered {
             let before = files.len();
             let include = compile_scope(&self.options.include);
@@ -1764,19 +1772,97 @@ impl CodeIntelEngine {
             }
         }
 
+        // Whether the repo holds C/C++ at all, decided per repo before parsing:
+        // the gtags database has to exist before the --index-filter pull-in
+        // below can ask it where an out-of-scope callee is defined, and the
+        // backends that run (Auto needs compile_commands.json / a GTAGS db)
+        // follow from the same answer. gtags builds its database on demand
+        // first, size-gated, since it writes into the repo tree.
+        let cxx_present = files.iter().any(|file| {
+            file.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| is_c_source_ext(ext) || is_c_header_ext(ext))
+        });
+        if cxx_present
+            && self.gtags_generate_for_repo(path)
+            && self.gtags_repo_intended(path)
+            && !gtags_file_path(path).exists()
+        {
+            if files.len() > GTAGS_GENERATE_MAX_FILES {
+                info!(
+                    "gtags: skip auto-generate for {} ({} files > {} limit)",
+                    repo_name,
+                    files.len(),
+                    GTAGS_GENERATE_MAX_FILES
+                );
+            } else if crate::gtags::gtags_binary_present() {
+                if let Some(gtags) = &self.gtags_manager {
+                    gtags.ensure_database(path).await;
+                }
+            }
+        }
+        // An existing GTAGS predating the current sources drifts its line numbers,
+        // which the line-window symbol merge cannot pair — silently degrading gtags
+        // cross-validation. Refresh it (writes into the repo, so opt-in via
+        // --gtags-generate) before the augment runs, else warn.
+        if cxx_present
+            && self.gtags_repo_intended(path)
+            && gtags_file_path(path).exists()
+            && gtags_database_stale(path, &files)
+        {
+            if self.gtags_generate_for_repo(path) && crate::gtags::gtags_binary_present() {
+                if let Some(gtags) = &self.gtags_manager {
+                    gtags.update_database(path).await;
+                }
+            } else {
+                warn!(
+                    "gtags: GTAGS in {:?} is older than indexed sources; symbol \
+                     cross-validation will be degraded. Run `global -u` (or pass \
+                     --gtags-generate to refresh automatically).",
+                    path
+                );
+            }
+        }
+
         // Parse files in parallel
         let parse_phase_start = std::time::Instant::now();
         let metrics = Arc::clone(&self.metrics);
-        let parsed_results: Vec<_> = files
-            .par_iter()
-            .filter_map(|file_path| {
-                let parse_start = std::time::Instant::now();
-                let content = std::fs::read_to_string(file_path).ok()?;
-                let parsed = self.parser.parse_file(file_path, &content).ok()?;
-                metrics.record_file_parse(parse_start.elapsed());
-                Some((file_path.clone(), content, parsed))
-            })
-            .collect();
+        let parse_files =
+            |to_parse: &[PathBuf]| -> Vec<(PathBuf, String, crate::parser::ParsedFile)> {
+                to_parse
+                    .par_iter()
+                    .filter_map(|file_path| {
+                        let parse_start = std::time::Instant::now();
+                        let content = std::fs::read_to_string(file_path).ok()?;
+                        let parsed = self.parser.parse_file(file_path, &content).ok()?;
+                        metrics.record_file_parse(parse_start.elapsed());
+                        Some((file_path.clone(), content, parsed))
+                    })
+                    .collect()
+            };
+        let mut parsed_results = parse_files(&files);
+
+        // --index-filter keeps only the files its rules name, so a definition or
+        // header that in-scope code calls or includes directly is left out and
+        // reads as "not indexed". Index those specific files too.
+        if repo_index_filtered {
+            let pulled_in = self
+                .pull_in_referenced_files(path, &all_files, &parsed_results)
+                .await;
+            if !pulled_in.files.is_empty() {
+                let extra = parse_files(&pulled_in.files);
+                info!(
+                    "--index-filter: pulled in {} file(s) referenced by in-scope code in {} \
+                     ({} via #include, {} via gtags)",
+                    pulled_in.files.len(),
+                    repo_name,
+                    pulled_in.from_includes,
+                    pulled_in.from_gtags
+                );
+                files.extend(pulled_in.files);
+                parsed_results.extend(extra);
+            }
+        }
 
         // Tokenize all files in parallel and build SearchDocuments.
         // tokenize_code is the dominant cost of the old serial index_file loop;
@@ -1874,49 +1960,6 @@ impl CodeIntelEngine {
             repo_name
         );
 
-        // Now that parsing has revealed the language set, decide per repo which
-        // backends actually run (Auto needs compile_commands.json / a GTAGS db).
-        // gtags can build its database on demand first, size-gated, since it
-        // writes into the repo tree.
-        let cxx_present = languages.keys().any(|lang| is_cxx_language(lang));
-        if cxx_present
-            && self.gtags_generate_for_repo(path)
-            && self.gtags_repo_intended(path)
-            && !gtags_file_path(path).exists()
-        {
-            if file_count > GTAGS_GENERATE_MAX_FILES {
-                info!(
-                    "gtags: skip auto-generate for {} ({} files > {} limit)",
-                    repo_name, file_count, GTAGS_GENERATE_MAX_FILES
-                );
-            } else if crate::gtags::gtags_binary_present() {
-                if let Some(gtags) = &self.gtags_manager {
-                    gtags.ensure_database(path).await;
-                }
-            }
-        }
-        // An existing GTAGS predating the current sources drifts its line numbers,
-        // which the line-window symbol merge cannot pair — silently degrading gtags
-        // cross-validation. Refresh it (writes into the repo, so opt-in via
-        // --gtags-generate) before the augment runs, else warn.
-        if cxx_present
-            && self.gtags_repo_intended(path)
-            && gtags_file_path(path).exists()
-            && gtags_database_stale(path, &files)
-        {
-            if self.gtags_generate_for_repo(path) && crate::gtags::gtags_binary_present() {
-                if let Some(gtags) = &self.gtags_manager {
-                    gtags.update_database(path).await;
-                }
-            } else {
-                warn!(
-                    "gtags: GTAGS in {:?} is older than indexed sources; symbol \
-                     cross-validation will be degraded. Run `global -u` (or pass \
-                     --gtags-generate to refresh automatically).",
-                    path
-                );
-            }
-        }
         let lsp_for_repo = (cxx_present && self.lsp_repo_enabled(path))
             .then(|| self.lsp_manager.clone())
             .flatten();
@@ -2202,6 +2245,114 @@ impl CodeIntelEngine {
         }
 
         Ok(())
+    }
+
+    /// Files outside `--index-filter` that the in-scope files reference
+    /// directly: the definition site of a callee no in-scope file defines, and
+    /// the target of an `#include` no in-scope file provides.
+    ///
+    /// One hop only — a pulled-in file's own references are not chased, or a
+    /// single call chain would drag in the fraction of the repo the filter
+    /// exists to keep out. Candidates are accepted only if they are in
+    /// `repo_files`, the walker's own pre-filter listing.
+    async fn pull_in_referenced_files(
+        &self,
+        repo_path: &Path,
+        repo_files: &std::collections::HashSet<PathBuf>,
+        base: &[(PathBuf, String, crate::parser::ParsedFile)],
+    ) -> PulledInFiles {
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+        let mut candidates: BTreeMap<PathBuf, PullInSource> = BTreeMap::new();
+
+        // Headers. The same header is included by many files, so collect the
+        // distinct (including directory, target) pairs and resolve each once.
+        let mut includes: BTreeSet<(&Path, String)> = BTreeSet::new();
+        for (file, content, _) in base {
+            let is_cxx = file
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| is_c_source_ext(ext) || is_c_header_ext(ext));
+            let dir = match (is_cxx, file.parent()) {
+                (true, Some(dir)) => dir,
+                _ => continue,
+            };
+            for import in parse_imports_from_content(content, &file.to_string_lossy()) {
+                if matches!(
+                    import.import_type,
+                    crate::incremental::ImportType::CppInclude
+                ) {
+                    includes.insert((dir, import.import_path));
+                }
+            }
+        }
+        if !includes.is_empty() {
+            let include_dirs = compile_commands_include_dirs(
+                repo_path,
+                &self.compile_commands_candidate_paths(repo_path),
+            );
+            let mut by_name: HashMap<&std::ffi::OsStr, Vec<&PathBuf>> = HashMap::new();
+            for file in repo_files {
+                if let Some(name) = file.file_name() {
+                    by_name.entry(name).or_default().push(file);
+                }
+            }
+            for (dir, target) in includes {
+                if let Some(resolved) = resolve_include_target(
+                    &target,
+                    dir,
+                    repo_path,
+                    &include_dirs,
+                    repo_files,
+                    &by_name,
+                ) {
+                    candidates.insert(resolved, PullInSource::Include);
+                }
+            }
+        }
+
+        // Callees. gtags indexes the whole repo regardless of --index-filter,
+        // so it can name the file holding a definition the filter dropped.
+        if let Some(gtags) = &self.gtags_manager {
+            if self.gtags_repo_enabled(repo_path) {
+                let defined: HashSet<&str> = base
+                    .iter()
+                    .flat_map(|(_, _, parsed)| parsed.symbols.iter().map(|s| s.name.as_str()))
+                    .collect();
+                let mut names: Vec<String> = base
+                    .par_iter()
+                    .filter_map(|(_, content, parsed)| {
+                        parsed
+                            .tree
+                            .as_ref()
+                            .map(|tree| CallGraph::referenced_callee_names(content, tree))
+                    })
+                    .flatten()
+                    .filter(|name| !defined.contains(name.as_str()))
+                    .collect();
+                names.sort();
+                names.dedup();
+                for rel in gtags.find_definition_files(&names, repo_path).await {
+                    candidates
+                        .entry(repo_path.join(rel))
+                        .or_insert(PullInSource::Gtags);
+                }
+            }
+        }
+
+        let in_base: HashSet<&Path> = base.iter().map(|(file, _, _)| file.as_path()).collect();
+        let mut pulled = PulledInFiles::default();
+        for (candidate, source) in candidates {
+            if in_base.contains(candidate.as_path()) || !repo_files.contains(&candidate) {
+                continue;
+            }
+            match source {
+                PullInSource::Include => pulled.from_includes += 1,
+                PullInSource::Gtags => pulled.from_gtags += 1,
+            }
+            pulled.files.push(candidate);
+        }
+        pulled
     }
 
     /// Phases 5/6 (C/C++ call-graph augmentation): after the tree-sitter
@@ -4754,11 +4905,15 @@ impl CodeIntelEngine {
                     .unwrap_or(&change.path)
                     .to_string_lossy()
                     .into_owned();
+                // A file pulled in for being referenced by in-scope code sits
+                // outside the rules yet is already indexed; its presence in the
+                // file cache is what says so.
                 if !scope_matches(
                     self.repo_index_filter_rules(&repo_name),
                     &rel,
                     &change.path.to_string_lossy(),
-                ) {
+                ) && !self.file_cache.contains_key(&change.path)
+                {
                     continue;
                 }
             }
@@ -11769,47 +11924,11 @@ fn load_compile_commands_filter(
             repo_root.join(json_path)
         };
 
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let (arr, json_parent) = match read_compile_commands(&full_path) {
+            Some(loaded) => loaded,
+            None => continue,
         };
 
-        let entries: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Failed to parse compile_commands.json at {:?}: {}",
-                    full_path, e
-                );
-                continue;
-            }
-        };
-
-        let arr = match entries.as_array() {
-            Some(a) => a,
-            None => {
-                warn!(
-                    "compile_commands.json at {:?} is not a JSON array",
-                    full_path
-                );
-                continue;
-            }
-        };
-
-        // A present-but-empty compile_commands.json (e.g. `[]`) parses fine yet,
-        // under --use-compile-commands, silently filters out every C/C++ source
-        // file, leaving only headers indexed. Surface it loudly.
-        if arr.is_empty() {
-            warn!(
-                "compile_commands.json at {:?} exists but has 0 entries ({} bytes); \
-                 with --use-compile-commands all C/C++ source files will be skipped \
-                 (headers still indexed). Regenerate it or drop --use-compile-commands.",
-                full_path,
-                content.len()
-            );
-        }
-
-        let json_parent = full_path.parent().map(Path::to_path_buf);
         let count_before = result.len();
         let mut unresolved = 0usize;
         for entry in arr.iter() {
@@ -11852,6 +11971,193 @@ fn load_compile_commands_filter(
     }
 
     result
+}
+
+/// Read a compile_commands.json into its entries plus the JSON's containing
+/// directory — the fallback base for the relative paths inside it. None when
+/// the file is absent, unparsable, or not a JSON array.
+fn read_compile_commands(full_path: &Path) -> Option<(Vec<serde_json::Value>, Option<PathBuf>)> {
+    let content = std::fs::read_to_string(full_path).ok()?;
+
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to parse compile_commands.json at {:?}: {}",
+                full_path, e
+            );
+            return None;
+        }
+    };
+
+    let arr = match parsed {
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            warn!(
+                "compile_commands.json at {:?} is not a JSON array",
+                full_path
+            );
+            return None;
+        }
+    };
+
+    // A present-but-empty compile_commands.json (e.g. `[]`) parses fine yet,
+    // under --use-compile-commands, silently filters out every C/C++ source
+    // file, leaving only headers indexed. Surface it loudly.
+    if arr.is_empty() {
+        warn!(
+            "compile_commands.json at {:?} exists but has 0 entries ({} bytes); \
+             with --use-compile-commands all C/C++ source files will be skipped \
+             (headers still indexed). Regenerate it or drop --use-compile-commands.",
+            full_path,
+            content.len()
+        );
+    }
+
+    Some((arr, full_path.parent().map(Path::to_path_buf)))
+}
+
+/// Include search directories named by a repo's compile_commands.json, in the
+/// order the manifest lists them. Only directories inside the repo are kept —
+/// nothing outside it can hold a file `--index-filter` dropped.
+fn compile_commands_include_dirs(repo_root: &Path, json_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    for json_path in json_paths {
+        let (entries, json_parent) = match read_compile_commands(json_path) {
+            Some(loaded) => loaded,
+            None => continue,
+        };
+        for entry in &entries {
+            let base = entry
+                .get("directory")
+                .and_then(|d| d.as_str())
+                .map(PathBuf::from)
+                .or_else(|| json_parent.clone())
+                .unwrap_or_else(|| repo_root.to_path_buf());
+            for dir in entry_include_dirs(entry) {
+                let abs = normalize_lexically(&base.join(dir));
+                if abs.starts_with(repo_root) && !dirs.contains(&abs) {
+                    dirs.push(abs);
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
+/// The include-directory arguments of one compile_commands entry, in both the
+/// separate (`-I dir`) and joined (`-Idir`) spellings.
+fn entry_include_dirs(entry: &serde_json::Value) -> Vec<String> {
+    const INCLUDE_FLAGS: [&str; 3] = ["-I", "-isystem", "-iquote"];
+
+    let args: Vec<String> = match entry.get("arguments").and_then(|a| a.as_array()) {
+        Some(list) => list
+            .iter()
+            .filter_map(|arg| arg.as_str())
+            .map(str::to_owned)
+            .collect(),
+        None => entry
+            .get("command")
+            .and_then(|command| command.as_str())
+            .map(|command| command.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default(),
+    };
+
+    let mut dirs = Vec::new();
+    let mut flag_awaiting_dir = false;
+    for arg in args {
+        if flag_awaiting_dir {
+            dirs.push(arg);
+            flag_awaiting_dir = false;
+            continue;
+        }
+        match INCLUDE_FLAGS.iter().find(|flag| arg.starts_with(**flag)) {
+            Some(flag) if arg.len() == flag.len() => flag_awaiting_dir = true,
+            Some(flag) => dirs.push(arg[flag.len()..].to_string()),
+            None => {}
+        }
+    }
+
+    dirs
+}
+
+/// Which rule first named a pulled-in file. A file both rules name is
+/// attributed to the include resolver, which runs first, so the per-source
+/// counts sum to the total rather than double-counting the overlap.
+#[derive(Clone, Copy)]
+enum PullInSource {
+    Include,
+    Gtags,
+}
+
+/// Files `pull_in_referenced_files` accepted, with the per-source counts the
+/// log needs. Counted after the `repo_files`/`in_base` filter, so a candidate
+/// that is dropped there is not reported as pulled in.
+#[derive(Default)]
+struct PulledInFiles {
+    files: Vec<PathBuf>,
+    from_includes: usize,
+    from_gtags: usize,
+}
+
+/// Resolve an `#include` target to a file the repo walker listed: relative to
+/// the including file first (the quoted form's own rule), then to the repo
+/// root, then through each compile_commands include directory.
+///
+/// A repo whose build ships no compile_commands.json has none of those spell
+/// out `<linux/io_uring/cmd.h>`, so the last resort is the single repo file
+/// whose path ends with the target. Several matches resolve to nothing rather
+/// than to a guess.
+fn resolve_include_target(
+    target: &str,
+    source_dir: &Path,
+    repo_root: &Path,
+    include_dirs: &[PathBuf],
+    repo_files: &std::collections::HashSet<PathBuf>,
+    by_name: &HashMap<&std::ffi::OsStr, Vec<&PathBuf>>,
+) -> Option<PathBuf> {
+    let target_path = Path::new(target);
+    if target.is_empty() || target_path.is_absolute() {
+        return None;
+    }
+
+    let bases = [source_dir, repo_root]
+        .into_iter()
+        .chain(include_dirs.iter().map(PathBuf::as_path));
+    for base in bases {
+        let candidate = normalize_lexically(&base.join(target_path));
+        if repo_files.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    let suffix = format!("{}{}", std::path::MAIN_SEPARATOR, target);
+    let mut matches = by_name
+        .get(target_path.file_name()?)?
+        .iter()
+        .filter(|file| file.to_string_lossy().ends_with(&suffix));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// Resolve `.` and `..` textually, without touching the filesystem: the result
+/// is compared against the walker's listing, which is not canonicalized either.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Resolve a compile_commands.json `file` field to a canonical absolute path.

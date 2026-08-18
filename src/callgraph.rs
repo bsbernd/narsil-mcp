@@ -225,6 +225,50 @@ impl CallGraph {
         }
     }
 
+    /// Bare callee names at every call site of one parsed file, sorted and
+    /// deduplicated, before any resolution against known definitions. A scoped
+    /// index asks for these to find out which definitions its filter left out.
+    pub fn referenced_callee_names(content: &str, tree: &Tree) -> Vec<String> {
+        let source = content.as_bytes();
+        let mut cursor = tree.walk();
+        let mut names = Vec::new();
+        let mut depth: usize = 0;
+
+        loop {
+            let node = cursor.node();
+            if matches!(
+                node.kind(),
+                "call_expression" | "call" | "method_call_expression" | "invocation_expression"
+            ) {
+                if let Some((name, _, _)) = Self::callee_at_call_site(node, source) {
+                    names.push(name);
+                }
+            }
+
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+
+            if cursor.goto_next_sibling() {
+                continue;
+            }
+
+            loop {
+                if depth == 0 {
+                    names.sort();
+                    names.dedup();
+                    return names;
+                }
+                cursor.goto_parent();
+                depth -= 1;
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Merge edges from one backend into the graph. Each input pairs a resolved
     /// caller key with an outgoing `CallEdge` whose `target` is the callee's
     /// bare name (resolved here against the existing nodes). For each
@@ -865,6 +909,26 @@ impl CallGraph {
     }
 
     fn extract_call_edge(&self, node: Node, source: &[u8], path: &str) -> Option<CallEdge> {
+        let (target, call_type, scope_hint) = Self::callee_at_call_site(node, source)?;
+
+        Some(CallEdge {
+            target,
+            file_path: path.to_string(),
+            line: node.start_position().row + 1,
+            column: node.start_position().column + 1,
+            call_type,
+            scope_hint,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
+        })
+    }
+
+    /// The callee named at a call node: its bare name, the call form, and the
+    /// scope qualifier of a `Type::method` call.
+    fn callee_at_call_site(
+        node: Node,
+        source: &[u8],
+    ) -> Option<(String, CallType, Option<String>)> {
         let mut cursor = node.walk();
         cursor.goto_first_child();
 
@@ -884,7 +948,7 @@ impl CallGraph {
                 // attribute Python — all of them `receiver.method(...)`.
                 "field_expression" | "member_expression" | "attribute" => {
                     // Method call: extract the method name
-                    if let Some(method) = self.get_last_identifier(child, source) {
+                    if let Some(method) = Self::get_last_identifier(child, source) {
                         target = Some(method);
                         call_type = CallType::Method;
                     }
@@ -892,7 +956,7 @@ impl CallGraph {
                 "scoped_identifier" | "qualified_identifier" => {
                     // Static method call: Type::method - extract scope qualifier
                     scope_hint = Self::extract_scope_qualifier(child, source);
-                    if let Some(method) = self.get_last_identifier(child, source) {
+                    if let Some(method) = Self::get_last_identifier(child, source) {
                         target = Some(method);
                         call_type = CallType::StaticMethod;
                     }
@@ -905,19 +969,10 @@ impl CallGraph {
             }
         }
 
-        target.map(|name| CallEdge {
-            target: name,
-            file_path: path.to_string(),
-            line: node.start_position().row + 1,
-            column: node.start_position().column + 1,
-            call_type,
-            scope_hint,
-            confirmed_by: SourceSet::TREE_SITTER,
-            line_conflicts: Vec::new(),
-        })
+        target.map(|name| (name, call_type, scope_hint))
     }
 
-    fn get_last_identifier(&self, node: Node, source: &[u8]) -> Option<String> {
+    fn get_last_identifier(node: Node, source: &[u8]) -> Option<String> {
         let mut cursor = node.walk();
         let mut last_ident = None;
         let mut depth: usize = 0;
@@ -2088,6 +2143,37 @@ if __name__ == \"__main__\":
             .map(|edge| edge.target)
             .collect();
         assert_eq!(helper_callers, vec!["mod.py::target".to_string()]);
+    }
+
+    #[test]
+    fn referenced_callee_names_lists_callees_without_definitions() {
+        // The names a scoped index must resolve elsewhere: `blk_mq_requeue` is
+        // defined nowhere in this file, and neither is the method `submit`.
+        let source = "\
+int helper(void) { return 1; }
+
+int caller(struct q *queue) {
+    helper();
+    blk_mq_requeue(queue);
+    return queue->ops->submit(queue);
+}
+";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let names = CallGraph::referenced_callee_names(source, &tree);
+
+        assert_eq!(
+            names,
+            vec![
+                "blk_mq_requeue".to_string(),
+                "helper".to_string(),
+                "submit".to_string(),
+            ]
+        );
     }
 
     /// `TestRunner.run_one` is how the method is written in the source and in

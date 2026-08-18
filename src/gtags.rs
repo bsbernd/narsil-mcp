@@ -87,6 +87,10 @@ async fn acquire_gtags_lock(repo_path: &Path) -> Option<File> {
     }
 }
 
+/// Symbol names per batched `global -x` alternation pattern. Bounded so the
+/// pattern stays well inside the argument-length limit.
+const DEFINITION_BATCH_NAMES: usize = 256;
+
 /// Wrapper around the GNU Global `global(1)` CLI for C/C++ reference queries.
 ///
 /// gtags --lsp is not available in common distros, so we drive global(1)
@@ -298,6 +302,54 @@ impl GtagsManager {
             }
             Ok(out) => Self::parse_output(&out.stdout, repo_path),
         }
+    }
+
+    /// Files defining any of `names`, repo-relative, sorted and deduplicated.
+    ///
+    /// One `global` run per batch of names — an alternation pattern resolves a
+    /// scoped index's thousands of unmatched callees in a handful of
+    /// subprocesses instead of one each. Names that are not plain identifiers
+    /// cannot be tags and would be read as regex syntax, so they are dropped.
+    pub async fn find_definition_files(&self, names: &[String], repo_path: &Path) -> Vec<String> {
+        let identifiers: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+            .collect();
+
+        let mut files = Vec::new();
+        for batch in identifiers.chunks(DEFINITION_BATCH_NAMES) {
+            let pattern = format!("^({})$", batch.join("|"));
+            let output = tokio::process::Command::new("global")
+                .arg("-x")
+                .arg(&pattern)
+                .current_dir(repo_path)
+                .env("GTAGSROOT", repo_path)
+                .env("GTAGSDBPATH", gtags_db_dir(repo_path))
+                .output()
+                .await;
+
+            match output {
+                Err(e) => {
+                    debug!("gtags: global -x unavailable: {}", e);
+                    break;
+                }
+                Ok(out) => files.extend(
+                    Self::parse_output(&out.stdout, repo_path)
+                        .into_iter()
+                        .map(|(file, _, _)| file),
+                ),
+            }
+        }
+
+        files.sort();
+        files.dedup();
+        files
     }
 
     /// Parse `global -x -f` output into (name, line) pairs. Lines that lack a
