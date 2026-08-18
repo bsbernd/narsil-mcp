@@ -20,7 +20,7 @@ use crate::cfg;
 use crate::dfg;
 use crate::embeddings::EmbeddingEngine;
 use crate::git::GitRepo;
-use crate::gtags::GtagsManager;
+use crate::gtags::{gtags_file_path, GtagsManager};
 use crate::lsp::{LspConfig, LspManager};
 use crate::metrics::{spawn_flush_task, MemoryReport, Metrics, DEFAULT_FLUSH_INTERVAL};
 use crate::neural::{NeuralConfig, NeuralEngine};
@@ -1366,7 +1366,7 @@ impl CodeIntelEngine {
     fn gtags_repo_enabled(&self, repo_path: &Path) -> bool {
         self.gtags_manager.is_some()
             && self.gtags_repo_intended(repo_path)
-            && repo_path.join("GTAGS").exists()
+            && gtags_file_path(repo_path).exists()
     }
 
     /// Effective `--index-filter` rules for a repo: its per-repo override if it
@@ -1882,7 +1882,7 @@ impl CodeIntelEngine {
         if cxx_present
             && self.gtags_generate_for_repo(path)
             && self.gtags_repo_intended(path)
-            && !path.join("GTAGS").exists()
+            && !gtags_file_path(path).exists()
         {
             if file_count > GTAGS_GENERATE_MAX_FILES {
                 info!(
@@ -1901,7 +1901,7 @@ impl CodeIntelEngine {
         // --gtags-generate) before the augment runs, else warn.
         if cxx_present
             && self.gtags_repo_intended(path)
-            && path.join("GTAGS").exists()
+            && gtags_file_path(path).exists()
             && gtags_database_stale(path, &files)
         {
             if self.gtags_generate_for_repo(path) && crate::gtags::gtags_binary_present() {
@@ -11700,7 +11700,8 @@ fn is_c_source_ext(ext: &str) -> bool {
 /// C/C++ source. A stale database reports drifted line numbers that the
 /// line-window symbol merge cannot pair, silently dropping gtags confirmation.
 fn gtags_database_stale(repo_path: &Path, files: &[PathBuf]) -> bool {
-    let gtags_mtime = match std::fs::metadata(repo_path.join("GTAGS")).and_then(|m| m.modified()) {
+    let gtags_mtime = match std::fs::metadata(gtags_file_path(repo_path)).and_then(|m| m.modified())
+    {
         Ok(mtime) => mtime,
         Err(_) => return false,
     };

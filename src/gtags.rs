@@ -35,6 +35,30 @@ fn gtags_lock_base_path(repo_path: &Path) -> PathBuf {
     dir.join(hash)
 }
 
+/// Directory holding `repo_path`'s GTAGS/GRTAGS/GPATH, out of the repo tree.
+/// Sibling of the lock directory, same per-repo hash. Keeping gtags's own
+/// output out of the repo tree avoids polluting `git status`, and — per the
+/// 2026-08-18 investigation — sidesteps a segfault GNU Global's in-place
+/// incremental update hit against an existing in-tree database that the
+/// same content did not reproduce once the database lived elsewhere.
+fn gtags_db_dir(repo_path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let hash = crate::metrics::index_path_hash(&canonical);
+    let dir = match ProjectDirs::from("", "", "narsil-mcp") {
+        Some(dirs) => dirs.cache_dir().join("gtags-db"),
+        None => PathBuf::from("/tmp/narsil-mcp/gtags-db"),
+    };
+    dir.join(hash)
+}
+
+/// Path to `repo_path`'s GTAGS file, wherever its database currently lives.
+/// The one place callers should ask "does a database exist" or "how old is
+/// it" — never `repo_path.join("GTAGS")` directly, since the database no
+/// longer lives in the repo tree.
+pub fn gtags_file_path(repo_path: &Path) -> PathBuf {
+    gtags_db_dir(repo_path).join("GTAGS")
+}
+
 /// Acquire the exclusive write lock for `repo_path`'s GTAGS database,
 /// blocking off the async runtime (`spawn_blocking`) until any other
 /// writer — in this process or another — releases it. `gtags`/`global -u`
@@ -94,6 +118,8 @@ impl GtagsManager {
         let output = tokio::process::Command::new("global")
             .args(["-rx", symbol])
             .current_dir(repo_path)
+            .env("GTAGSROOT", repo_path)
+            .env("GTAGSDBPATH", gtags_db_dir(repo_path))
             .output()
             .await;
 
@@ -123,6 +149,8 @@ impl GtagsManager {
             .args(["-x", "-f"])
             .arg(rel)
             .current_dir(repo_path)
+            .env("GTAGSROOT", repo_path)
+            .env("GTAGSDBPATH", gtags_db_dir(repo_path))
             .output()
             .await;
 
@@ -138,20 +166,39 @@ impl GtagsManager {
     /// Ensure a GTAGS database exists for `repo_path`, building one with the
     /// `gtags` binary when absent. Returns true if a database exists afterwards.
     ///
-    /// Writes GTAGS/GRTAGS/GPATH into `repo_path` — a side effect, so callers
-    /// gate this behind an opt-in. No-op returning the current state when the
-    /// `gtags` binary is missing.
+    /// Writes into `gtags_db_dir(repo_path)`, out of the repo tree — a side
+    /// effect, so callers gate this behind an opt-in. No-op returning the
+    /// current state when the `gtags` binary is missing.
     pub async fn ensure_database(&self, repo_path: &Path) -> bool {
-        if repo_path.join("GTAGS").exists() {
+        if gtags_file_path(repo_path).exists() {
             return true;
         }
         if !gtags_binary_present() {
             return false;
         }
         let _lock = acquire_gtags_lock(repo_path).await;
-        info!("gtags: building GTAGS database in {:?}", repo_path);
+        self.build_fresh(repo_path).await
+    }
+
+    /// Build a fresh GTAGS database for `repo_path` from scratch (no `-i`),
+    /// discarding whatever is already at `gtags_db_dir`. Callers hold the
+    /// write lock across this call; it does not acquire it itself.
+    async fn build_fresh(&self, repo_path: &Path) -> bool {
+        let db_dir = gtags_db_dir(repo_path);
+        // A from-scratch build overwrites everything anyway, so a failed
+        // cleanup here only wastes disk, not correctness.
+        let _ = std::fs::remove_dir_all(&db_dir);
+        if let Err(e) = std::fs::create_dir_all(&db_dir) {
+            warn!("gtags: could not create db dir {:?}: {}", db_dir, e);
+            return false;
+        }
+        info!("gtags: building GTAGS database in {:?}", db_dir);
+        // `gtags` (the builder) does not consult GTAGSDBPATH — that is a
+        // `global`/query-side variable — so the output directory has to be
+        // its positional dbpath argument instead.
         match tokio::process::Command::new("gtags")
             .current_dir(repo_path)
+            .arg(&db_dir)
             .output()
             .await
         {
@@ -167,26 +214,34 @@ impl GtagsManager {
                         String::from_utf8_lossy(&out.stderr).trim()
                     );
                 }
-                repo_path.join("GTAGS").exists()
+                gtags_file_path(repo_path).exists()
             }
         }
     }
 
-    /// Refresh an existing GTAGS database incrementally (`global -u`). Writes
-    /// into the repo tree, so callers gate it behind opt-in. Returns true on
-    /// success; no-op returning false when the `gtags` toolchain is missing.
+    /// Refresh an existing GTAGS database incrementally (`global -u`), out of
+    /// the repo tree, so callers gate it behind opt-in. Falls back to a full
+    /// rebuild (`build_fresh`) when the incremental update fails: GNU Global
+    /// has no way to recover a database its own incremental path can't
+    /// update, so retrying the same `global -u` would just fail again the
+    /// same way — a full rebuild is the one thing that reliably produces a
+    /// working database. Returns true on success (incremental or rebuilt);
+    /// no-op returning false when the `gtags` toolchain is missing.
     pub async fn update_database(&self, repo_path: &Path) -> bool {
         if !gtags_binary_present() {
             return false;
         }
         let _lock = acquire_gtags_lock(repo_path).await;
+        let db_dir = gtags_db_dir(repo_path);
         info!(
             "gtags: refreshing GTAGS database in {:?} (global -u)",
-            repo_path
+            db_dir
         );
-        match tokio::process::Command::new("global")
+        let updated = match tokio::process::Command::new("global")
             .arg("-u")
             .current_dir(repo_path)
+            .env("GTAGSROOT", repo_path)
+            .env("GTAGSDBPATH", &db_dir)
             .output()
             .await
         {
@@ -204,7 +259,15 @@ impl GtagsManager {
                 }
                 out.status.success()
             }
+        };
+        if updated {
+            return true;
         }
+        warn!(
+            "gtags: incremental update failed for {:?}; rebuilding from scratch",
+            repo_path
+        );
+        self.build_fresh(repo_path).await
     }
 
     /// Run `global -x SYMBOL` from `repo_path` and return parsed definitions.
@@ -223,6 +286,8 @@ impl GtagsManager {
         let output = tokio::process::Command::new("global")
             .args(["-x", symbol])
             .current_dir(repo_path)
+            .env("GTAGSROOT", repo_path)
+            .env("GTAGSDBPATH", gtags_db_dir(repo_path))
             .output()
             .await;
 
@@ -365,6 +430,25 @@ mod tests {
         let stdout = b"weird   notaline   src/foo.c   text\n";
         let syms = GtagsManager::parse_file_symbols(stdout);
         assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn gtags_db_dir_is_repo_scoped_stable_and_out_of_tree() {
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+
+        let first = gtags_db_dir(repo_a.path());
+        let second = gtags_db_dir(repo_a.path());
+        assert_eq!(first, second, "same repo must hash to the same db dir");
+
+        let other = gtags_db_dir(repo_b.path());
+        assert_ne!(first, other, "different repos must not share a db dir");
+
+        assert!(
+            !first.starts_with(repo_a.path()),
+            "the db dir must not live inside the repo tree"
+        );
+        assert_eq!(gtags_file_path(repo_a.path()), first.join("GTAGS"));
     }
 
     #[test]
