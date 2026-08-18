@@ -375,8 +375,9 @@ impl IndexUpdateLeases<'_> {
 pub struct CodeIntelEngine {
     /// Base path for index storage (stored for potential future use)
     _index_path: PathBuf,
-    /// Registered repository paths
-    repo_paths: Vec<PathBuf>,
+    /// Registered repository paths. Behind a lock because `reindex` takes
+    /// `&self` yet may register a repo the server was never started with.
+    repo_paths: parking_lot::RwLock<Vec<PathBuf>>,
     /// Cached repo metadata
     repos: DashMap<String, RepoMetadata>,
     /// Symbol index: repo -> symbols
@@ -686,7 +687,7 @@ impl CodeIntelEngine {
 
         let engine = Self {
             _index_path: expanded_index,
-            repo_paths: expanded_repos.clone(),
+            repo_paths: parking_lot::RwLock::new(expanded_repos.clone()),
             repos: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::new(),
@@ -907,9 +908,10 @@ impl CodeIntelEngine {
         // persisted too, else the same rebuild repeats on every startup.
         let mut any_rebuilt = false;
 
-        let total_repos = self.repo_paths.len();
+        let repo_paths = self.registered_repo_paths();
+        let total_repos = repo_paths.len();
         let mut done_repos = 0;
-        for repo_path in &self.repo_paths {
+        for repo_path in &repo_paths {
             let repo_name = match canonical_repo_key(repo_path) {
                 Ok(k) => k,
                 Err(e) => {
@@ -1552,7 +1554,7 @@ impl CodeIntelEngine {
     }
 
     async fn index_repos(&self) -> Result<()> {
-        for repo_path in &self.repo_paths {
+        for repo_path in &self.registered_repo_paths() {
             if repo_path.exists() {
                 info!("Indexing repository: {:?}", repo_path);
                 if let Err(e) = self.index_repo(repo_path).await {
@@ -2661,10 +2663,28 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Snapshot of the registered repository paths. A snapshot rather than a
+    /// borrow: callers iterate across `.await` points, and holding the lock
+    /// there would block a concurrent registration for the whole pass.
+    fn registered_repo_paths(&self) -> Vec<PathBuf> {
+        self.repo_paths.read().clone()
+    }
+
+    /// Register `path` as a repository the engine answers for. Returns false if
+    /// it was already registered.
+    fn register_repo_path(&self, path: PathBuf) -> bool {
+        let mut paths = self.repo_paths.write();
+        if paths.contains(&path) {
+            return false;
+        }
+        paths.push(path);
+        true
+    }
+
     /// Canonical keys of every configured repo — what a query naming no repo
     /// reads, since those tools search all of them.
     pub fn all_repo_keys(&self) -> Vec<String> {
-        self.repo_paths
+        self.registered_repo_paths()
             .iter()
             .filter_map(|path| canonical_repo_key(path).ok())
             .collect()
@@ -2672,10 +2692,11 @@ impl CodeIntelEngine {
 
     /// Canonical keys of the repos a watch batch touches, deduplicated.
     pub fn repos_for_changes(&self, changes: &[crate::persist::FileChange]) -> Vec<String> {
+        let repo_paths = self.registered_repo_paths();
         let mut keys: Vec<String> = changes
             .iter()
             .filter_map(|change| {
-                self.repo_paths
+                repo_paths
                     .iter()
                     .find(|repo| path_is_within_repo(&change.path, repo))
             })
@@ -2704,7 +2725,16 @@ impl CodeIntelEngine {
     pub async fn reindex(&self, repo: Option<&str>) -> Result<String> {
         match repo {
             Some(name) => {
-                let repo_key = self.resolve_repo(name)?;
+                let (repo_key, newly_registered) = match self.resolve_repo(name) {
+                    Ok(key) => (key, false),
+                    // reindex is the documented first move for a repo a query
+                    // found nothing in, so a valid repo the server was never
+                    // started with has to register here rather than error.
+                    Err(unknown) => match self.register_unknown_repo(name) {
+                        Some(key) => (key, true),
+                        None => return Err(unknown),
+                    },
+                };
                 let path = PathBuf::from(&repo_key);
                 // Held across the clears below: without it a query lands
                 // between "symbols removed" and "symbols rebuilt" and is
@@ -2726,13 +2756,36 @@ impl CodeIntelEngine {
                 self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
                 self.index_repo(&path).await?;
                 self.refresh_memory_snapshot();
-                Ok(format!("Re-indexed repository: {}", repo_key))
+                if newly_registered {
+                    Ok(format!("Registered and indexed repository: {}", repo_key))
+                } else {
+                    Ok(format!("Re-indexed repository: {}", repo_key))
+                }
             }
             None => {
                 self.reindex_all().await?;
                 Ok("Re-indexed all repositories".to_string())
             }
         }
+    }
+
+    /// Register a repo `resolve_repo` did not know, when `name` names a
+    /// readable directory that looks like a repository — the same check
+    /// `validate_repo` reports on. Returns its canonical key, or None when the
+    /// path is not one the engine should adopt, leaving the caller's original
+    /// "not found" error intact.
+    fn register_unknown_repo(&self, name: &str) -> Option<String> {
+        let canonical = PathBuf::from(name).canonicalize().ok()?;
+        crate::repo::validate_repo_path(&canonical).ok()?;
+        if !crate::repo::is_repository(&canonical) {
+            return None;
+        }
+
+        let repo_key = canonical_repo_key(&canonical).ok()?;
+        if self.register_repo_path(canonical) {
+            info!("reindex: registered new repository {}", repo_key);
+        }
+        Some(repo_key)
     }
 
     /// Returns true if any directory from `target` up to (but excluding)
@@ -2825,7 +2878,7 @@ impl CodeIntelEngine {
         // only populated once that repo's (potentially slow) index_repo() call
         // finishes. Without this, a request landing during startup gets a
         // misleading "repo not found" for a repo that IS configured.
-        for repo_path in &self.repo_paths {
+        for repo_path in &self.registered_repo_paths() {
             let stored_canonical = match repo_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -2845,7 +2898,7 @@ impl CodeIntelEngine {
             .repos
             .iter()
             .map(|entry| entry.value().path.clone())
-            .chain(self.repo_paths.iter().cloned())
+            .chain(self.registered_repo_paths())
             .filter_map(|path| path.canonicalize().ok())
             .collect();
         paths.sort();
@@ -4319,7 +4372,7 @@ impl CodeIntelEngine {
         };
 
         let mut saved_count = 0;
-        for repo_path in &self.repo_paths {
+        for repo_path in &self.registered_repo_paths() {
             let repo_name = match canonical_repo_key(repo_path) {
                 Ok(k) => k,
                 Err(e) => {
@@ -4427,12 +4480,12 @@ impl CodeIntelEngine {
         match &self.options.compile_commands_path {
             Some(explicit) if explicit.is_absolute() => paths.push(explicit.clone()),
             Some(explicit) => {
-                for repo in &self.repo_paths {
+                for repo in &self.registered_repo_paths() {
                     paths.push(repo.join(explicit));
                 }
             }
             None => {
-                for repo in &self.repo_paths {
+                for repo in &self.registered_repo_paths() {
                     paths.push(repo.join("compile_commands.json"));
                     paths.push(repo.join("build/compile_commands.json"));
                 }
@@ -4448,9 +4501,10 @@ impl CodeIntelEngine {
     #[cfg(feature = "native")]
     fn compile_commands_watch_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
+        let repo_paths = self.registered_repo_paths();
         for cc_path in self.compile_commands_watch_paths() {
             if let Some(dir) = cc_path.parent() {
-                let already_watched = self.repo_paths.iter().any(|r| dir.starts_with(r));
+                let already_watched = repo_paths.iter().any(|r| dir.starts_with(r));
                 if dir.exists() && !already_watched && !dirs.contains(&dir.to_path_buf()) {
                     dirs.push(dir.to_path_buf());
                 }
@@ -4470,7 +4524,7 @@ impl CodeIntelEngine {
 
         match crate::persist::FileWatcher::new() {
             Ok(mut watcher) => {
-                for repo_path in &self.repo_paths {
+                for repo_path in &self.registered_repo_paths() {
                     if repo_path.exists() {
                         if let Err(e) = watcher.watch(repo_path) {
                             warn!("Failed to watch {:?}: {}", repo_path, e);
@@ -4507,7 +4561,7 @@ impl CodeIntelEngine {
 
         match crate::persist::AsyncFileWatcher::new() {
             Ok((mut watcher, rx)) => {
-                for repo_path in &self.repo_paths {
+                for repo_path in &self.registered_repo_paths() {
                     if repo_path.exists() {
                         if let Err(e) = watcher.watch(repo_path) {
                             warn!("Failed to watch {:?}: {}", repo_path, e);
@@ -4533,7 +4587,7 @@ impl CodeIntelEngine {
     /// falling back to tree containment.
     fn repo_for_compile_commands(&self, cdb_path: &Path) -> Option<PathBuf> {
         let canon = cdb_path.canonicalize().ok();
-        for repo in &self.repo_paths {
+        for repo in &self.registered_repo_paths() {
             for candidate in self.compile_commands_candidate_paths(repo) {
                 if candidate == cdb_path
                     || (canon.is_some() && candidate.canonicalize().ok() == canon)
@@ -4821,6 +4875,7 @@ impl CodeIntelEngine {
         // source paths: their GTAGS db drifts on every edit, so refresh it once
         // per repo after the loop (not per file), and only when actually stale.
         let mut gtags_dirty: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let registered_repos = self.registered_repo_paths();
 
         for change in changes {
             // compile_commands.json regenerated → clangd holds stale flags. Restart
@@ -4845,7 +4900,7 @@ impl CodeIntelEngine {
                         // restart every repo's C/C++ servers so none keeps stale
                         // flags. A repo with no running server is a no-op.
                         None => {
-                            for repo in &self.repo_paths {
+                            for repo in &self.registered_repo_paths() {
                                 for lang in ["c", "cpp"] {
                                     lsp.restart_server(repo, lang).await;
                                 }
@@ -4869,8 +4924,7 @@ impl CodeIntelEngine {
             // paths even when the user supplied a symlinked path (for example
             // `/private/var/...` vs `/var/...` on macOS), so compare both raw
             // and canonical forms.
-            let repo_path = self
-                .repo_paths
+            let repo_path = registered_repos
                 .iter()
                 .find(|p| path_is_within_repo(&change.path, p));
 
@@ -6013,6 +6067,7 @@ impl CodeIntelEngine {
             .collect();
 
         let mut output = String::new();
+        let repo_paths = self.registered_repo_paths();
         output.push_str(&format!("# Semantic Search: `{}`\n\n", query));
         if let Some(r) = repo_name {
             output.push_str(&format!("Repository: {}\n", r));
@@ -6033,7 +6088,7 @@ impl CodeIntelEngine {
             // snippet is empty for the persistent index (content is None there);
             // regenerate from file_cache — O(num_repos) lookup per top-N result
             let snippet = if result.snippet.is_empty() {
-                self.repo_paths
+                repo_paths
                     .iter()
                     .find_map(|rp| {
                         self.file_cache
