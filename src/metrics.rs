@@ -410,7 +410,9 @@ fn lock_file_for(stats_path: &Path) -> PathBuf {
     stats_path.with_extension("lock")
 }
 
-fn acquire_exclusive_lock(stats_path: &Path) -> Result<File> {
+/// `pub(crate)`: also used by `gtags` to serialize database writes — the
+/// open+flock sequence here is generic over any path, not stats-specific.
+pub(crate) fn acquire_exclusive_lock(stats_path: &Path) -> Result<File> {
     let lock_path = lock_file_for(stats_path);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create stats directory for lock")?;

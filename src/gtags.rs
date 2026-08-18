@@ -1,3 +1,5 @@
+use directories::ProjectDirs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -16,6 +18,49 @@ pub fn gtags_available() -> bool {
 /// this binary is present.
 pub fn gtags_binary_present() -> bool {
     crate::validation::binary_on_path("gtags")
+}
+
+/// Base path (no extension) for the exclusive write lock guarding
+/// `repo_path`'s GTAGS database. Lives in narsil's cache dir, not the repo
+/// tree, keyed by the same canonical-path hash the per-repo stats file
+/// already uses (`metrics::index_path_hash`) so it never collides across
+/// repos and is stable across runs.
+fn gtags_lock_base_path(repo_path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let hash = crate::metrics::index_path_hash(&canonical);
+    let dir = match ProjectDirs::from("", "", "narsil-mcp") {
+        Some(dirs) => dirs.cache_dir().join("gtags-locks"),
+        None => PathBuf::from("/tmp/narsil-mcp/gtags-locks"),
+    };
+    dir.join(hash)
+}
+
+/// Acquire the exclusive write lock for `repo_path`'s GTAGS database,
+/// blocking off the async runtime (`spawn_blocking`) until any other
+/// writer — in this process or another — releases it. `gtags`/`global -u`
+/// write GTAGS/GRTAGS/GPATH in place and are not safe against a concurrent
+/// writer; the caller holds the returned guard across the subprocess call.
+/// Dropping it releases the lock, which also happens automatically if the
+/// holder crashes (the kernel releases an flock on fd close).
+///
+/// Returns `None` if the lock could not be acquired — e.g. the cache
+/// directory is not writable — in which case the caller proceeds without
+/// it rather than failing gtags entirely.
+async fn acquire_gtags_lock(repo_path: &Path) -> Option<File> {
+    let lock_path = gtags_lock_base_path(repo_path);
+    match tokio::task::spawn_blocking(move || crate::metrics::acquire_exclusive_lock(&lock_path))
+        .await
+    {
+        Ok(Ok(file)) => Some(file),
+        Ok(Err(e)) => {
+            warn!("gtags: could not acquire write lock: {}", e);
+            None
+        }
+        Err(e) => {
+            warn!("gtags: lock task panicked: {}", e);
+            None
+        }
+    }
 }
 
 /// Wrapper around the GNU Global `global(1)` CLI for C/C++ reference queries.
@@ -103,6 +148,7 @@ impl GtagsManager {
         if !gtags_binary_present() {
             return false;
         }
+        let _lock = acquire_gtags_lock(repo_path).await;
         info!("gtags: building GTAGS database in {:?}", repo_path);
         match tokio::process::Command::new("gtags")
             .current_dir(repo_path)
@@ -133,6 +179,7 @@ impl GtagsManager {
         if !gtags_binary_present() {
             return false;
         }
+        let _lock = acquire_gtags_lock(repo_path).await;
         info!(
             "gtags: refreshing GTAGS database in {:?} (global -u)",
             repo_path
@@ -261,6 +308,8 @@ impl GtagsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_output_absolute_path() {
@@ -316,5 +365,51 @@ mod tests {
         let stdout = b"weird   notaline   src/foo.c   text\n";
         let syms = GtagsManager::parse_file_symbols(stdout);
         assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn gtags_lock_base_path_is_repo_scoped_and_stable() {
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+
+        let first = gtags_lock_base_path(repo_a.path());
+        let second = gtags_lock_base_path(repo_a.path());
+        assert_eq!(first, second, "same repo must hash to the same lock path");
+
+        let other = gtags_lock_base_path(repo_b.path());
+        assert_ne!(first, other, "different repos must not share a lock path");
+    }
+
+    #[tokio::test]
+    async fn acquire_gtags_lock_serializes_concurrent_writers() {
+        let repo = TempDir::new().unwrap();
+        let repo_path = repo.path().to_path_buf();
+
+        let first = acquire_gtags_lock(&repo_path)
+            .await
+            .expect("first acquisition must succeed uncontended");
+
+        let contender_path = repo_path.clone();
+        let mut contender = tokio::spawn(async move { acquire_gtags_lock(&contender_path).await });
+
+        // The second acquisition must not complete while the first lock is
+        // still held — proves mutual exclusion, not just that the call
+        // returns something.
+        let still_blocked = tokio::time::timeout(Duration::from_millis(200), &mut contender).await;
+        assert!(
+            still_blocked.is_err(),
+            "second writer must block while the first holds the lock"
+        );
+
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_secs(5), contender)
+            .await
+            .expect("second acquisition must complete once the first lock is released")
+            .expect("task must not panic");
+        assert!(
+            second.is_some(),
+            "second acquisition must eventually succeed"
+        );
     }
 }
