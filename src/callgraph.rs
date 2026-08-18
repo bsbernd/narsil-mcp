@@ -188,6 +188,43 @@ impl CallGraph {
         Ok(())
     }
 
+    /// Remove the definitions and call edges contributed by one file.
+    pub fn remove_file(&self, file_path: &str) {
+        let function_names = self
+            .file_functions
+            .remove(file_path)
+            .map(|(_, names)| names)
+            .unwrap_or_default();
+        let removed_names: HashSet<_> = function_names.iter().cloned().collect();
+        let removed_bare_names: HashSet<String> = function_names
+            .iter()
+            .filter_map(|name| name.rsplit("::").next())
+            .map(str::to_owned)
+            .collect();
+
+        for function_name in function_names {
+            self.nodes.remove(&function_name);
+            if let Some(bare_name) = function_name.rsplit("::").next() {
+                if let Some(mut names) = self.name_index.get_mut(bare_name) {
+                    names.retain(|name| name != &function_name);
+                    if names.is_empty() {
+                        drop(names);
+                        self.name_index.remove(bare_name);
+                    }
+                }
+            }
+        }
+
+        for mut node in self.nodes.iter_mut() {
+            node.calls.retain(|edge| {
+                edge.file_path != file_path
+                    && !removed_names.contains(&edge.target)
+                    && !removed_bare_names.contains(edge.target.as_str())
+            });
+            node.called_by.retain(|edge| edge.file_path != file_path);
+        }
+    }
+
     /// Merge edges from one backend into the graph. Each input pairs a resolved
     /// caller key with an outgoing `CallEdge` whose `target` is the callee's
     /// bare name (resolved here against the existing nodes). For each
@@ -1373,6 +1410,11 @@ impl CallGraph {
         "build",
         "index",
         "index_mut",
+        "len",
+        "is_empty",
+        "get",
+        "insert",
+        "contains",
     ];
 
     /// Check if a function name is a generic trait method that should be filtered
