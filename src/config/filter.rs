@@ -138,10 +138,17 @@ impl ToolFilter {
     /// does: the operator has already said how much they want.
     pub fn get_enabled_tools(&self) -> Vec<&'static str> {
         let mut enabled_tools = Vec::new();
+        let disabled_by_preset = self.preset.get_disabled_tools();
+        let enabled_by_preset = self.preset.get_enabled_tools();
 
         // Iterate through all tools in the metadata registry
         for (tool_name, metadata) in TOOL_METADATA.iter() {
-            if self.is_tool_enabled(tool_name, metadata) {
+            if self.is_tool_enabled_with_preset_sets(
+                tool_name,
+                metadata,
+                &disabled_by_preset,
+                &enabled_by_preset,
+            ) {
                 enabled_tools.push(*tool_name);
             }
         }
@@ -154,8 +161,27 @@ impl ToolFilter {
         self.apply_performance_budget(enabled_tools)
     }
 
-    /// Check if a specific tool should be enabled
+    /// Check if a specific tool should be enabled. Only the tests check a
+    /// single tool; `get_enabled_tools` hoists the preset sets out of its loop.
+    #[cfg(test)]
     fn is_tool_enabled(&self, tool_name: &str, metadata: &ToolMetadata) -> bool {
+        let disabled_by_preset = self.preset.get_disabled_tools();
+        let enabled_by_preset = self.preset.get_enabled_tools();
+        self.is_tool_enabled_with_preset_sets(
+            tool_name,
+            metadata,
+            &disabled_by_preset,
+            &enabled_by_preset,
+        )
+    }
+
+    fn is_tool_enabled_with_preset_sets(
+        &self,
+        tool_name: &str,
+        metadata: &ToolMetadata,
+        disabled_by_preset: &HashSet<&'static str>,
+        enabled_by_preset: &HashSet<&'static str>,
+    ) -> bool {
         // 1. Check tool-level override first (highest priority)
         if let Some(override_config) = self.config.tools.overrides.get(tool_name) {
             if !override_config.enabled {
@@ -165,13 +191,11 @@ impl ToolFilter {
         }
 
         // 2. Check if preset explicitly disables this tool
-        let disabled_by_preset = self.preset.get_disabled_tools();
         if disabled_by_preset.contains(tool_name) {
             return false; // Disabled by preset
         }
 
         // 3. Check if preset has an enabled whitelist
-        let enabled_by_preset = self.preset.get_enabled_tools();
         if !enabled_by_preset.is_empty() {
             // Preset has a whitelist (not Full preset)
             if !enabled_by_preset.contains(tool_name) {

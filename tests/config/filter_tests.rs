@@ -275,6 +275,8 @@ fn test_filtering_performance() {
 
     let filter = ToolFilter::new(config, &options, None);
 
+    let _ = filter.get_enabled_tools();
+
     let start = Instant::now();
     let _ = filter.get_enabled_tools();
     let elapsed = start.elapsed();
