@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::callgraph::CallEdge;
-use crate::symbols::Symbol;
+use crate::symbols::{Symbol, SymbolKind};
 
 /// A persisted call-graph augmentation edge: the resolved caller key paired with
 /// the outgoing edge that a non-tree-sitter backend confirmed. Stored on the
@@ -238,6 +238,53 @@ fn now_secs() -> u64 {
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 /// redb table: the single key "repo" -> postcard(RepoMeta).
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// redb table: `"<symbol name>\0<repo-relative file>"` -> postcard(SymbolKind).
+/// A symbol name cannot contain NUL, so all definitions of one name form a
+/// contiguous key range a prefix scan can read.
+const DEFS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("definitions");
+/// redb table: repo-relative file -> postcard(Vec<String>) of the names it
+/// defines. Read only to retract a file's rows when it changes or goes away.
+const DEF_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("definition_files");
+/// [`META_TABLE`] key holding the definition map's own header.
+const DEFINITION_META_KEY: &str = "definitions";
+
+/// What the definition map stores. Distinct from [`INDEX_LOGIC_VERSION`], which
+/// covers symbol extraction for the index proper: this tracks the map's own
+/// content rules, so narrowing or widening the kinds it keeps rebuilds the map
+/// without invalidating every repo's symbols. Bump it whenever an unchanged
+/// source file would now contribute different rows.
+const DEFINITION_MAP_VERSION: u32 = 1;
+/// Rows buffered before the definition map commits a write transaction. Keeps
+/// a whole-repo build's memory flat without paying a transaction per file.
+const DEFINITION_FLUSH_ROWS: usize = 50_000;
+
+fn definition_key(name: &str, file: &str) -> String {
+    format!("{name}\0{file}")
+}
+
+/// One row per distinct name in a file: the key is (name, file), so two
+/// symbols sharing a name in one file collapse into a single row carrying
+/// whichever kind was parsed first.
+///
+/// Functions and methods only. The map exists to answer the callee half of the
+/// `--index-filter` pull-in, and a macro or type a scoped file uses arrives with
+/// the header that defines it, which the include half already pulls in — so
+/// storing those kinds would multiply the map without pulling in anything the
+/// include rule does not.
+fn distinct_definitions(symbols: &[Symbol]) -> Vec<(String, SymbolKind)> {
+    let mut seen: BTreeMap<&str, &SymbolKind> = BTreeMap::new();
+    for symbol in symbols {
+        if symbol.name.is_empty()
+            || !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+        {
+            continue;
+        }
+        seen.entry(symbol.name.as_str()).or_insert(&symbol.kind);
+    }
+    seen.into_iter()
+        .map(|(name, kind)| (name.to_string(), kind.clone()))
+        .collect()
+}
 
 /// Repo-level header stored alongside the per-file records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +304,39 @@ struct RepoMeta {
     /// [`INDEX_LOGIC_VERSION`] these records were produced under; a mismatch with
     /// the running binary forces a rebuild even when head/cdb are unchanged.
     logic_version: u32,
+}
+
+/// Header of a repo's definition map: what it was built from, so one built
+/// against a different tree or a different indexer is rejected rather than
+/// answered from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DefinitionMeta {
+    head_hash: Option<String>,
+    logic_version: u32,
+    /// [`DEFINITION_MAP_VERSION`] these rows were produced under. A header
+    /// written before this field existed fails to decode, which reads as "no
+    /// map" and rebuilds — the same way the index handles a layout change.
+    map_version: u32,
+    files: u64,
+    definitions: u64,
+    built_at: u64,
+}
+
+/// Size of a repo's definition map as built. Incremental per-file updates do
+/// not adjust these, so they describe the build, not the current row count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DefinitionStats {
+    pub files: u64,
+    pub definitions: u64,
+}
+
+/// One definition the map holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionHit {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// Repo-relative path of the defining file.
+    pub file: String,
 }
 
 /// Index storage manager.
@@ -597,6 +677,159 @@ impl IndexStore {
         Ok(())
     }
 
+    /// The definition map's header, whatever it was built from. `None` when the
+    /// repo has no map — which is also what a build that died before committing
+    /// leaves behind, since the header is written last.
+    fn definition_meta(&self, repo_root: &Path) -> Option<DefinitionMeta> {
+        if !self.db_path(repo_root).exists() {
+            return None;
+        }
+        let db = self.db(repo_root).ok()?;
+        let read_txn = db.begin_read().ok()?;
+        let meta_table = read_txn.open_table(META_TABLE).ok()?;
+        let guard = meta_table.get(DEFINITION_META_KEY).ok()??;
+        postcard::from_bytes(guard.value()).ok()
+    }
+
+    /// Size of the repo's definition map, or `None` when it is absent or was
+    /// built from a different HEAD or by a different indexer.
+    pub fn definition_stats(
+        &self,
+        repo_root: &Path,
+        head_hash: Option<&str>,
+    ) -> Option<DefinitionStats> {
+        let meta = self.definition_meta(repo_root)?;
+        if meta.map_version != DEFINITION_MAP_VERSION
+            || meta.logic_version != INDEX_LOGIC_VERSION
+            || meta.head_hash.as_deref() != head_hash
+        {
+            return None;
+        }
+        Some(DefinitionStats {
+            files: meta.files,
+            definitions: meta.definitions,
+        })
+    }
+
+    /// Start replacing a repo's definition map.
+    ///
+    /// Drops the previous map and its header first, so from here until
+    /// [`DefinitionWriter::commit`] the repo reads as having no map at all — a
+    /// build that is cancelled or dies is never queried as though complete.
+    pub fn begin_definitions(&self, repo_root: &Path) -> Result<DefinitionWriter> {
+        let db = self.db(repo_root)?;
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.delete_table(DEFS_TABLE);
+            let _ = write_txn.delete_table(DEF_FILES_TABLE);
+            let mut meta_table = write_txn.open_table(META_TABLE)?;
+            meta_table.remove(DEFINITION_META_KEY)?;
+        }
+        write_txn.commit()?;
+        Ok(DefinitionWriter {
+            db,
+            rows: Vec::new(),
+            file_names: Vec::new(),
+            stats: DefinitionStats::default(),
+        })
+    }
+
+    /// Every definition of any of `names`, from the whole repo rather than only
+    /// the files the index kept. Paths are repo-relative, as gtags reports them.
+    pub fn definitions_of(&self, repo_root: &Path, names: &[String]) -> Result<Vec<DefinitionHit>> {
+        let mut hits = Vec::new();
+        if !self.db_path(repo_root).exists() {
+            return Ok(hits);
+        }
+        let db = self.db(repo_root)?;
+        let read_txn = db.begin_read()?;
+        let Ok(table) = read_txn.open_table(DEFS_TABLE) else {
+            return Ok(hits);
+        };
+        for name in names {
+            if name.is_empty() {
+                continue;
+            }
+            // NUL sorts below every other byte, so the range from "name\0" up
+            // to "name\u{1}" covers this name's rows and no longer name's.
+            let start = definition_key(name, "");
+            let end = format!("{name}\u{1}");
+            for entry in table.range::<&str>(start.as_str()..end.as_str())? {
+                let (key, value) = entry?;
+                let Some((_, file)) = key.value().split_once('\0') else {
+                    continue;
+                };
+                let Ok(kind) = postcard::from_bytes::<SymbolKind>(value.value()) else {
+                    continue;
+                };
+                hits.push(DefinitionHit {
+                    name: name.clone(),
+                    kind,
+                    file: file.to_string(),
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Replace one file's rows in the definition map, so an edited file's
+    /// definitions do not stay as they were when the map was built. A no-op on
+    /// a repo with no map: an incremental update must not conjure a partial one.
+    pub fn update_file_definitions(
+        &self,
+        repo_root: &Path,
+        file: &str,
+        symbols: &[Symbol],
+    ) -> Result<()> {
+        self.replace_file_definitions(repo_root, file, symbols)
+    }
+
+    /// Drop a deleted file's rows from the definition map.
+    pub fn remove_file_definitions(&self, repo_root: &Path, file: &str) -> Result<()> {
+        self.replace_file_definitions(repo_root, file, &[])
+    }
+
+    fn replace_file_definitions(
+        &self,
+        repo_root: &Path,
+        file: &str,
+        symbols: &[Symbol],
+    ) -> Result<()> {
+        if self.definition_meta(repo_root).is_none() {
+            return Ok(());
+        }
+        let definitions = distinct_definitions(symbols);
+        let db = self.db(repo_root)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut defs = write_txn.open_table(DEFS_TABLE)?;
+            let mut files = write_txn.open_table(DEF_FILES_TABLE)?;
+
+            let previous: Vec<String> = match files.get(file)? {
+                Some(guard) => postcard::from_bytes(guard.value()).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            for name in &previous {
+                defs.remove(definition_key(name, file).as_str())?;
+            }
+
+            let names: Vec<&String> = definitions.iter().map(|(name, _)| name).collect();
+            for (name, kind) in &definitions {
+                defs.insert(
+                    definition_key(name, file).as_str(),
+                    postcard::to_stdvec(kind)?.as_slice(),
+                )?;
+            }
+            if names.is_empty() {
+                files.remove(file)?;
+            } else {
+                files.insert(file, postcard::to_stdvec(&names)?.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// List all cached repositories
     pub fn list_cached(&self) -> Result<Vec<PathBuf>> {
         let mut repos = Vec::new();
@@ -613,6 +846,83 @@ impl IndexStore {
         }
 
         Ok(repos)
+    }
+}
+
+/// Builds a repo's definition map in bounded batches.
+///
+/// The map only becomes readable when [`DefinitionWriter::commit`] writes its
+/// header, so an abandoned build leaves the repo with no map rather than with
+/// half of one.
+pub struct DefinitionWriter {
+    db: Arc<Database>,
+    rows: Vec<(String, SymbolKind, String)>,
+    file_names: Vec<(String, Vec<String>)>,
+    stats: DefinitionStats,
+}
+
+impl DefinitionWriter {
+    /// Record what one file defines. Buffered; written once the batch fills.
+    pub fn add_file(&mut self, file: &str, symbols: &[Symbol]) -> Result<()> {
+        let definitions = distinct_definitions(symbols);
+        let names: Vec<String> = definitions.iter().map(|(name, _)| name.clone()).collect();
+        for (name, kind) in definitions {
+            self.rows.push((name, kind, file.to_string()));
+        }
+        self.stats.files += 1;
+        self.stats.definitions += names.len() as u64;
+        self.file_names.push((file.to_string(), names));
+
+        if self.rows.len() >= DEFINITION_FLUSH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() && self.file_names.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut defs = write_txn.open_table(DEFS_TABLE)?;
+            for (name, kind, file) in self.rows.drain(..) {
+                defs.insert(
+                    definition_key(&name, &file).as_str(),
+                    postcard::to_stdvec(&kind)?.as_slice(),
+                )?;
+            }
+            let mut files = write_txn.open_table(DEF_FILES_TABLE)?;
+            for (file, names) in self.file_names.drain(..) {
+                if names.is_empty() {
+                    continue;
+                }
+                files.insert(file.as_str(), postcard::to_stdvec(&names)?.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Publish the map. `head_hash` is the repo fingerprint it was built from;
+    /// a later lookup against a different one rejects it as stale.
+    pub fn commit(mut self, head_hash: Option<&str>) -> Result<DefinitionStats> {
+        self.flush()?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta_table = write_txn.open_table(META_TABLE)?;
+            let meta = DefinitionMeta {
+                head_hash: head_hash.map(str::to_string),
+                logic_version: INDEX_LOGIC_VERSION,
+                map_version: DEFINITION_MAP_VERSION,
+                files: self.stats.files,
+                definitions: self.stats.definitions,
+                built_at: now_secs(),
+            };
+            meta_table.insert(DEFINITION_META_KEY, postcard::to_stdvec(&meta)?.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(self.stats)
     }
 }
 
@@ -1338,6 +1648,231 @@ mod tests {
             .edge
             .confirmed_by
             .contains(crate::symbols::SourceSet::CCLS));
+    }
+
+    fn symbol(name: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind,
+            file_path: String::new(),
+            start_line: 1,
+            end_line: 1,
+            signature: None,
+            qualified_name: None,
+            doc_comment: None,
+            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
+        }
+    }
+
+    fn files_defining(store: &IndexStore, root: &Path, name: &str) -> Vec<String> {
+        let mut files: Vec<String> = store
+            .definitions_of(root, &[name.to_string()])
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.file)
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn definition_map_answers_which_file_defines_a_name() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // No map yet: no stats, and a lookup answers nothing rather than failing.
+        assert_eq!(store.definition_stats(&root, None), None);
+        assert!(files_defining(&store, &root, "handle").is_empty());
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file(
+                "src/net.c",
+                &[
+                    symbol("handle", SymbolKind::Function),
+                    symbol("MAX_CONN", SymbolKind::Macro),
+                    symbol("conn", SymbolKind::Struct),
+                ],
+            )
+            .unwrap();
+        writer
+            .add_file("src/util.c", &[symbol("handle", SymbolKind::Method)])
+            .unwrap();
+        let stats = writer.commit(Some("head1")).unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.definitions, 2);
+
+        assert_eq!(
+            files_defining(&store, &root, "handle"),
+            vec!["src/net.c".to_string(), "src/util.c".to_string()]
+        );
+        // The kind round-trips, so a caller can tell a method from a function.
+        let hits = store
+            .definitions_of(&root, &["handle".to_string()])
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.kind == SymbolKind::Method));
+
+        // Kinds the include half already covers are not stored: they would
+        // multiply the map without pulling anything in.
+        assert!(files_defining(&store, &root, "MAX_CONN").is_empty());
+        assert!(files_defining(&store, &root, "conn").is_empty());
+    }
+
+    /// The (name, file) key is one string, so a shorter name must not pick up
+    /// the rows of a longer one that starts with it.
+    #[test]
+    fn definition_lookup_does_not_leak_across_name_prefixes() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file("a.c", &[symbol("read", SymbolKind::Function)])
+            .unwrap();
+        writer
+            .add_file("b.c", &[symbol("read_buffer", SymbolKind::Function)])
+            .unwrap();
+        writer.commit(None).unwrap();
+
+        assert_eq!(files_defining(&store, &root, "read"), vec!["a.c"]);
+        assert_eq!(files_defining(&store, &root, "read_buffer"), vec!["b.c"]);
+    }
+
+    /// A map built against one HEAD must not answer for another, and a rebuild
+    /// must not leave the previous build's rows behind.
+    #[test]
+    fn definition_map_is_rejected_when_stale_and_cleared_on_rebuild() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file("old.c", &[symbol("gone", SymbolKind::Function)])
+            .unwrap();
+        writer.commit(Some("head1")).unwrap();
+
+        assert!(store.definition_stats(&root, Some("head1")).is_some());
+        assert_eq!(store.definition_stats(&root, Some("head2")), None);
+        assert_eq!(store.definition_stats(&root, None), None);
+
+        // A rebuild drops the map until it commits, then answers only for the
+        // new content.
+        let mut writer = store.begin_definitions(&root).unwrap();
+        assert_eq!(store.definition_stats(&root, Some("head1")), None);
+        writer
+            .add_file("new.c", &[symbol("fresh", SymbolKind::Function)])
+            .unwrap();
+        writer.commit(Some("head2")).unwrap();
+
+        assert!(files_defining(&store, &root, "gone").is_empty());
+        assert_eq!(files_defining(&store, &root, "fresh"), vec!["new.c"]);
+    }
+
+    /// A map whose rows were produced under different content rules must be
+    /// rebuilt, not answered from — otherwise narrowing what the map stores
+    /// leaves every already-built map holding the old set forever.
+    #[test]
+    fn definition_map_from_another_content_version_is_rejected() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file("a.c", &[symbol("handle", SymbolKind::Function)])
+            .unwrap();
+        writer.commit(None).unwrap();
+        assert!(store.definition_stats(&root, None).is_some());
+
+        // Rewrite the header as an older binary's content rules would have.
+        let db = store.db(&root).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta_table = write_txn.open_table(META_TABLE).unwrap();
+            let mut meta: DefinitionMeta = {
+                let guard = meta_table.get(DEFINITION_META_KEY).unwrap().unwrap();
+                postcard::from_bytes(guard.value()).unwrap()
+            };
+            meta.map_version += 1;
+            meta_table
+                .insert(
+                    DEFINITION_META_KEY,
+                    postcard::to_stdvec(&meta).unwrap().as_slice(),
+                )
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        assert_eq!(store.definition_stats(&root, None), None);
+    }
+
+    #[test]
+    fn editing_a_file_retracts_the_definitions_it_no_longer_has() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file(
+                "a.c",
+                &[
+                    symbol("kept", SymbolKind::Function),
+                    symbol("dropped", SymbolKind::Function),
+                ],
+            )
+            .unwrap();
+        writer.commit(None).unwrap();
+
+        store
+            .update_file_definitions(
+                &root,
+                "a.c",
+                &[
+                    symbol("kept", SymbolKind::Function),
+                    symbol("added", SymbolKind::Function),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(files_defining(&store, &root, "kept"), vec!["a.c"]);
+        assert_eq!(files_defining(&store, &root, "added"), vec!["a.c"]);
+        assert!(files_defining(&store, &root, "dropped").is_empty());
+
+        store.remove_file_definitions(&root, "a.c").unwrap();
+        assert!(files_defining(&store, &root, "kept").is_empty());
+    }
+
+    /// A repo with no definition map must not gain a partial one through the
+    /// watch path — a map without a header would be invisible to every reader.
+    #[test]
+    fn per_file_update_is_a_noop_without_a_map() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        // Give the repo a normal index, but no definition map.
+        store
+            .apply_file_changes(&root, &[meta(root.join("a.rs"), "h1")], &[])
+            .unwrap();
+
+        store
+            .update_file_definitions(&root, "a.rs", &[symbol("thing", SymbolKind::Function)])
+            .unwrap();
+
+        assert_eq!(store.definition_stats(&root, None), None);
+        assert!(files_defining(&store, &root, "thing").is_empty());
     }
 
     #[test]
