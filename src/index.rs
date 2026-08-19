@@ -2347,9 +2347,9 @@ impl CodeIntelEngine {
             crate::persist::ChangeType::Deleted => store.remove_file_definitions(repo_path, &rel),
             _ => match std::fs::read_to_string(file)
                 .ok()
-                .and_then(|content| self.parser.parse_file(file, &content).ok())
+                .and_then(|content| self.parser.definition_names(file, &content).ok())
             {
-                Some(parsed) => store.update_file_definitions(repo_path, &rel, &parsed.symbols),
+                Some(definitions) => store.update_file_definitions(repo_path, &rel, &definitions),
                 None => Ok(()),
             },
         };
@@ -8587,13 +8587,13 @@ async fn build_definition_map(
                     .par_iter()
                     .filter_map(|file| {
                         let content = std::fs::read_to_string(file).ok()?;
-                        let parsed = parser.parse_file(file, &content).ok()?;
+                        let definitions = parser.definition_names(file, &content).ok()?;
                         let relative = file
                             .strip_prefix(&root)
                             .unwrap_or(file)
                             .to_string_lossy()
                             .to_string();
-                        Some((relative, parsed.symbols))
+                        Some((relative, definitions))
                     })
                     .collect::<Vec<_>>()
             })
@@ -8607,8 +8607,8 @@ async fn build_definition_map(
                 return;
             }
         };
-        for (relative, symbols) in parsed {
-            if let Err(e) = writer.add_file(&relative, &symbols) {
+        for (relative, definitions) in parsed {
+            if let Err(e) = writer.add_file(&relative, &definitions) {
                 warn!("definition map: write failed for {}: {}", repo_name, e);
                 return;
             }

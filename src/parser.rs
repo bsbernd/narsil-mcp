@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use streaming_iterator::StreamingIterator;
@@ -537,6 +538,61 @@ impl LanguageParser {
         })
     }
 
+    /// Names and kinds a file defines, without the extras [`Self::parse_file`]
+    /// produces.
+    ///
+    /// The definition map wants a list of names. Building a `Symbol` per match
+    /// with its signature string, and walking the tree a second time for
+    /// `SYSCALL_DEFINE`, is work it discards — and a whole-repo pass pays it on
+    /// every file. The parser and query cursor are per-thread, so such a pass
+    /// does not construct one of each per file either.
+    ///
+    /// Consequently `SYSCALL_DEFINEn` entry points are not reported here; they
+    /// remain in the index proper, which still goes through `parse_file`.
+    pub fn definition_names(
+        &self,
+        path: &Path,
+        content: &str,
+    ) -> Result<Vec<(String, SymbolKind)>> {
+        let lazy_config = self
+            .get_config(path)
+            .ok_or_else(|| anyhow!("Unsupported file type: {:?}", path))?;
+        let Some(query) = lazy_config.get_query() else {
+            return Ok(Vec::new()); // Query compilation failed, warned once already
+        };
+
+        thread_local! {
+            static SCRATCH: RefCell<(Parser, QueryCursor)> =
+                RefCell::new((Parser::new(), QueryCursor::new()));
+        }
+
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let (parser, cursor) = &mut *scratch;
+            parser.set_language(&lazy_config.config.language)?;
+            let tree = parser
+                .parse(content, None)
+                .ok_or_else(|| anyhow!("Failed to parse file"))?;
+
+            let source_bytes = content.as_bytes();
+            let mut names = Vec::new();
+            let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
+            while let Some(match_) = matches.next() {
+                for capture in match_.captures {
+                    let capture_name = query.capture_names()[capture.index as usize];
+                    if !capture_name.ends_with(".name") {
+                        continue;
+                    }
+                    let text = capture.node.utf8_text(source_bytes).unwrap_or("");
+                    if !text.is_empty() {
+                        names.push((text.to_string(), parse_symbol_kind(capture_name)));
+                    }
+                }
+            }
+            Ok(names)
+        })
+    }
+
     /// Parse a file and return just the tree (for call graph analysis)
     pub fn parse_to_tree(&self, path: &Path, content: &str) -> Result<Tree> {
         let lazy_config = self
@@ -790,6 +846,64 @@ static int helper(void) { return MAX_USERS; }
             .symbols
             .iter()
             .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
+    }
+
+    /// The names-only path feeds the definition map while the index proper
+    /// goes through parse_file. If the two disagreed about which names a file
+    /// defines, the pull-in would look for things the index cannot show.
+    #[test]
+    fn definition_names_agrees_with_parse_file() {
+        let parser = LanguageParser::new().unwrap();
+        let cases = [
+            (
+                "widget.c",
+                "#define MAX_X 1\nstatic int helper(void) { return MAX_X; }\n\
+                 struct thing { int x; };\ntypedef int myint;\n",
+            ),
+            (
+                "lib.rs",
+                "pub fn caller() -> i32 { 1 }\npub struct Thing;\npub trait Doer {}\n",
+            ),
+            (
+                "app.go",
+                "func Caller() int { return 1 }\nfunc (t *Thing) Method() {}\n",
+            ),
+        ];
+
+        for (file, content) in cases {
+            let parsed = parser.parse_file(Path::new(file), content).unwrap();
+            let mut expected: Vec<(String, SymbolKind)> = parsed
+                .symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.kind.clone()))
+                .collect();
+            let mut actual = parser.definition_names(Path::new(file), content).unwrap();
+            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            actual.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                actual, expected,
+                "names-only extraction diverged for {file}"
+            );
+        }
+    }
+
+    /// The one intentional divergence: `SYSCALL_DEFINEn` entry points are found
+    /// by a second whole-tree walk that the names-only path skips deliberately.
+    #[test]
+    fn definition_names_omits_syscall_entry_points() {
+        let parser = LanguageParser::new().unwrap();
+        let content = "SYSCALL_DEFINE1(io_uring_setup, unsigned, entries)\n{\n\treturn 0;\n}\n";
+
+        let parsed = parser.parse_file(Path::new("io_uring.c"), content).unwrap();
+        assert!(parsed.symbols.iter().any(|s| s.name == "io_uring_setup"));
+
+        let names = parser
+            .definition_names(Path::new("io_uring.c"), content)
+            .unwrap();
+        assert!(
+            !names.iter().any(|(name, _)| name == "io_uring_setup"),
+            "names-only extraction should skip the syscall walk, got {names:?}"
+        );
     }
 
     #[test]

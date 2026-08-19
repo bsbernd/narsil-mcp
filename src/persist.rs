@@ -253,7 +253,10 @@ const DEFINITION_META_KEY: &str = "definitions";
 /// content rules, so narrowing or widening the kinds it keeps rebuilds the map
 /// without invalidating every repo's symbols. Bump it whenever an unchanged
 /// source file would now contribute different rows.
-const DEFINITION_MAP_VERSION: u32 = 1;
+///
+/// v2: names come from the parser's names-only extraction, which does not
+/// report `SYSCALL_DEFINEn` entry points.
+const DEFINITION_MAP_VERSION: u32 = 2;
 /// Rows buffered before the definition map commits a write transaction. Keeps
 /// a whole-repo build's memory flat without paying a transaction per file.
 const DEFINITION_FLUSH_ROWS: usize = 50_000;
@@ -271,15 +274,13 @@ fn definition_key(name: &str, file: &str) -> String {
 /// the header that defines it, which the include half already pulls in — so
 /// storing those kinds would multiply the map without pulling in anything the
 /// include rule does not.
-fn distinct_definitions(symbols: &[Symbol]) -> Vec<(String, SymbolKind)> {
+fn distinct_definitions(definitions: &[(String, SymbolKind)]) -> Vec<(String, SymbolKind)> {
     let mut seen: BTreeMap<&str, &SymbolKind> = BTreeMap::new();
-    for symbol in symbols {
-        if symbol.name.is_empty()
-            || !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
-        {
+    for (name, kind) in definitions {
+        if name.is_empty() || !matches!(kind, SymbolKind::Function | SymbolKind::Method) {
             continue;
         }
-        seen.entry(symbol.name.as_str()).or_insert(&symbol.kind);
+        seen.entry(name.as_str()).or_insert(kind);
     }
     seen.into_iter()
         .map(|(name, kind)| (name.to_string(), kind.clone()))
@@ -798,9 +799,9 @@ impl IndexStore {
         &self,
         repo_root: &Path,
         file: &str,
-        symbols: &[Symbol],
+        definitions: &[(String, SymbolKind)],
     ) -> Result<()> {
-        self.replace_file_definitions(repo_root, file, symbols)
+        self.replace_file_definitions(repo_root, file, definitions)
     }
 
     /// Drop a deleted file's rows from the definition map.
@@ -812,12 +813,12 @@ impl IndexStore {
         &self,
         repo_root: &Path,
         file: &str,
-        symbols: &[Symbol],
+        definitions: &[(String, SymbolKind)],
     ) -> Result<()> {
         if self.definition_meta(repo_root).is_none() {
             return Ok(());
         }
-        let definitions = distinct_definitions(symbols);
+        let definitions = distinct_definitions(definitions);
         let db = self.db(repo_root)?;
         let write_txn = db.begin_write()?;
         {
@@ -882,8 +883,8 @@ pub struct DefinitionWriter {
 
 impl DefinitionWriter {
     /// Record what one file defines. Buffered; written once the batch fills.
-    pub fn add_file(&mut self, file: &str, symbols: &[Symbol]) -> Result<()> {
-        let definitions = distinct_definitions(symbols);
+    pub fn add_file(&mut self, file: &str, definitions: &[(String, SymbolKind)]) -> Result<()> {
+        let definitions = distinct_definitions(definitions);
         let names: Vec<String> = definitions.iter().map(|(name, _)| name.clone()).collect();
         for (name, kind) in definitions {
             self.rows.push((name, kind, file.to_string()));
@@ -1669,19 +1670,8 @@ mod tests {
             .contains(crate::symbols::SourceSet::CCLS));
     }
 
-    fn symbol(name: &str, kind: SymbolKind) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            kind,
-            file_path: String::new(),
-            start_line: 1,
-            end_line: 1,
-            signature: None,
-            qualified_name: None,
-            doc_comment: None,
-            confirmed_by: crate::symbols::SourceSet::TREE_SITTER,
-            line_conflicts: Vec::new(),
-        }
+    fn symbol(name: &str, kind: SymbolKind) -> (String, SymbolKind) {
+        (name.to_string(), kind)
     }
 
     fn files_defining(store: &IndexStore, root: &Path, name: &str) -> Vec<String> {
