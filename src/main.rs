@@ -645,10 +645,24 @@ async fn main() -> Result<()> {
         }
         // Rewrite the status with post-indexing symbol counts. update_status
         // overwrites in place so the main-scope guard still owns removal.
-        let updated = refresh_pid_status.with_repo_counts(init_engine.repo_status_snapshot());
-        if let Err(e) = pid_status::update_status(&updated) {
-            warn!("pid status: could not refresh counts: {}", e);
-        }
+        let write_counts = |stage: &str| {
+            let updated = refresh_pid_status
+                .clone()
+                .with_repo_counts(init_engine.repo_status_snapshot());
+            if let Err(e) = pid_status::update_status(&updated) {
+                warn!(
+                    "pid status: could not refresh counts after {}: {}",
+                    stage, e
+                );
+            }
+        };
+        // Written before the catch-up: that waits on a whole-repo definition map
+        // build, which would otherwise hold the counts back for a minute.
+        write_counts("indexing");
+        // A scoped repo's definition map lands after the index that started it,
+        // so give the pull-in the pass it could not have on the way through.
+        init_engine.catch_up_on_definition_maps().await;
+        write_counts("the definition-map catch-up");
     });
 
     // Start watch mode in background if enabled.

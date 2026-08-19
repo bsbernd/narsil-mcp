@@ -2328,6 +2328,63 @@ impl CodeIntelEngine {
         self.definition_builds.insert(repo_name.to_string(), handle);
     }
 
+    /// Wait for the background definition-map builds, then index each repo
+    /// whose map has just landed one more time.
+    ///
+    /// A map commits after the pull-in that wants it has already run, so
+    /// without this pass a repo indexed for the first time pulls in nothing
+    /// until something else triggers a reindex — precisely while someone is
+    /// first exploring it. The second pass costs one more index of an
+    /// already-warm repo, and the build it would start is skipped because the
+    /// map it just wrote is current.
+    pub async fn catch_up_on_definition_maps(&self) {
+        let pending: Vec<String> = self
+            .definition_builds
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for repo_name in pending {
+            let Some((_, handle)) = self.definition_builds.remove(&repo_name) else {
+                continue;
+            };
+            // An aborted or panicked build committed no map, so there is
+            // nothing new for a second pass to find.
+            if handle.await.is_err() {
+                continue;
+            }
+
+            let repo_path = self
+                .registered_repo_paths()
+                .into_iter()
+                .find(|path| canonical_repo_key(path).is_ok_and(|key| key == repo_name));
+            let Some(repo_path) = repo_path else {
+                continue;
+            };
+            if self
+                .index_store
+                .as_ref()
+                .and_then(|store| {
+                    store.definition_stats(&repo_path, self.git_head_hash(&repo_path).as_deref())
+                })
+                .is_none()
+            {
+                continue;
+            }
+
+            info!(
+                "--index-filter: definition map ready for {}; re-running the pull-in",
+                repo_name
+            );
+            if let Err(e) = self.index_repo(&repo_path).await {
+                warn!(
+                    "definition map: catch-up index of {} failed: {}",
+                    repo_name, e
+                );
+            }
+        }
+    }
+
     /// Keep a repo's definition map in step with one changed file.
     ///
     /// A no-op for a repo with no map, so an unfiltered repo pays nothing, and

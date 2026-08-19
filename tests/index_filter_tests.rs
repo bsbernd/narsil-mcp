@@ -187,6 +187,26 @@ async fn rust_callee_definitions_are_pulled_in_once_the_map_is_built() {
     assert!(!unrelated.contains("lib/unrelated.rs"), "{}", unrelated);
 }
 
+/// The catch-up pass is what makes the first index of a repo benefit from its
+/// own definition map: without it the map lands after the pull-in has run, and
+/// nothing is pulled in until something else triggers a reindex.
+#[tokio::test]
+async fn the_first_index_pulls_in_definitions_after_the_catch_up_pass() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_scoped_rust_repo(repo.path()).unwrap();
+    let engine = scoped_engine(repo.path(), index_dir.path()).await;
+
+    engine.catch_up_on_definition_maps().await;
+
+    let callee = symbols_matching(&engine, repo.path(), "out_of_scope_helper").await;
+    assert!(
+        callee.contains("lib/helper.rs"),
+        "the catch-up pass should pull the callee's definition in: {}",
+        callee
+    );
+}
+
 /// A file outside the filter that nothing in scope references stays out — the
 /// pull-in is one hop from in-scope code, not a blanket exemption.
 #[tokio::test]
