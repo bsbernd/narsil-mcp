@@ -58,6 +58,37 @@ fn write_scoped_rust_repo(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Give the fixture a real git HEAD.
+///
+/// Without one, `fingerprint_matches` bails out on its "no HEAD and no
+/// compile_commands" guard and every index is treated as a full rebuild — which
+/// hides whether a repo loaded from cache picks up symbols for files the
+/// pull-in has only just named.
+fn git_init_and_commit(root: &Path) {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git should be runnable");
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    run(&["init", "-q"]);
+    run(&["add", "-A"]);
+    run(&[
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=narsil test",
+        "commit",
+        "-q",
+        "-m",
+        "fixture",
+    ]);
+}
+
 async fn scoped_engine(repo: &Path, index_dir: &Path) -> CodeIntelEngine {
     let options = EngineOptions {
         call_graph_enabled: true,
@@ -153,6 +184,7 @@ async fn rust_callee_definitions_are_pulled_in_once_the_map_is_built() {
     let repo = tempfile::TempDir::new().unwrap();
     let index_dir = tempfile::TempDir::new().unwrap();
     write_scoped_rust_repo(repo.path()).unwrap();
+    git_init_and_commit(repo.path());
     let engine = scoped_engine(repo.path(), index_dir.path()).await;
 
     // The filter applies as usual: the scoped file is indexed.
@@ -195,6 +227,9 @@ async fn the_first_index_pulls_in_definitions_after_the_catch_up_pass() {
     let repo = tempfile::TempDir::new().unwrap();
     let index_dir = tempfile::TempDir::new().unwrap();
     write_scoped_rust_repo(repo.path()).unwrap();
+    // With a real fingerprint the catch-up index loads from cache, which is the
+    // path that used to leave newly pulled-in files without symbols.
+    git_init_and_commit(repo.path());
     let engine = scoped_engine(repo.path(), index_dir.path()).await;
 
     engine.catch_up_on_definition_maps().await;

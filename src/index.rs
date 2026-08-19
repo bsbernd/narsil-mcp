@@ -1907,6 +1907,22 @@ impl CodeIntelEngine {
         // Collect parsed trees for call graph construction
         let mut trees_for_callgraph: Vec<(String, String, tree_sitter::Tree)> = Vec::new();
 
+        // A cached repo's symbols only cover the files that produced them, and
+        // the pull-in can name more than it did last time — a definition map
+        // that landed after the previous index widens it without moving git
+        // HEAD or compile_commands.json, so the fingerprint still matches.
+        // Those files would otherwise be parsed into the search index and the
+        // call graph while staying invisible to find_symbols.
+        let cached_symbol_files: std::collections::HashSet<String> = if symbols_cached {
+            self.symbols
+                .get(&repo_name)
+                .map(|symbols| symbols.iter().map(|s| s.file_path.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut late_symbols: Vec<Symbol> = Vec::new();
+
         for (file_path, content, parsed) in parsed_results {
             file_count += 1;
             let lines = content.lines().count();
@@ -1963,6 +1979,15 @@ impl CodeIntelEngine {
                         self.index_symbol_embeddings(&repo_name, &symbol, &mut neural_docs);
                         symbols_vec.push(symbol);
                     }
+                }
+            } else if !cached_symbol_files.contains(&relative_path) {
+                // Pulled in since the cached symbols were written. Tree-sitter
+                // only, and no embeddings: a cached repo did not build its
+                // vocabulary this run, so feeding a handful of files into it
+                // would skew the IDF values the rest of the index was built on.
+                for mut symbol in parsed.symbols {
+                    symbol.file_path = relative_path.clone();
+                    late_symbols.push(symbol);
                 }
             }
 
@@ -2123,6 +2148,27 @@ impl CodeIntelEngine {
             // Must happen after the per-file loop so all document frequencies are
             // accumulated before the single O(V log V) sort.
             self.embedding_engine.finalize();
+        }
+
+        // Fold in the newly pulled-in files' symbols before the count is
+        // reported, so the log describes what the index actually holds.
+        if !late_symbols.is_empty() {
+            let added = late_symbols.len();
+            let mut late_files: Vec<&str> = late_symbols
+                .iter()
+                .map(|symbol| symbol.file_path.as_str())
+                .collect();
+            late_files.sort_unstable();
+            late_files.dedup();
+            let late_file_count = late_files.len();
+            if let Some(mut symbols) = self.symbols.get_mut(&repo_name) {
+                symbols.extend(late_symbols);
+            }
+            info!(
+                "--index-filter: {} symbol(s) from {} newly pulled-in file(s) added to the \
+                 cached index for {}",
+                added, late_file_count, repo_name
+            );
         }
 
         let symbol_count = if symbols_cached {
