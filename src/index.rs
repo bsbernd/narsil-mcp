@@ -136,6 +136,14 @@ pub enum BackendIntent {
 /// auto-generation is skipped above this size.
 const GTAGS_GENERATE_MAX_FILES: usize = 50_000;
 
+/// Files parsed per definition-map batch. Bounds the build's memory, and gives
+/// an abort a point between batches at which it can take effect.
+const DEFINITION_BUILD_CHUNK_FILES: usize = 512;
+
+/// Files between definition-map progress lines. The build has no size cap, so
+/// it has to stay visible in the log — otherwise a stall looks like silence.
+const DEFINITION_BUILD_PROGRESS_FILES: usize = 10_000;
+
 /// Options for configuring the CodeIntelEngine
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -401,7 +409,10 @@ pub struct CodeIntelEngine {
     /// Index store for persistence (when persist is enabled)
     /// Performance metrics
     pub metrics: Arc<Metrics>,
-    index_store: Option<IndexStore>,
+    /// Shared, because the background definition-map build writes through the
+    /// same handle: redb locks a database file exclusively, so a second
+    /// `IndexStore` over the same repo could not open it.
+    index_store: Option<Arc<IndexStore>>,
     /// LSP manager for enhanced code analysis (when lsp is enabled)
     lsp_manager: Option<Arc<LspManager>>,
     /// GNU Global manager for C/C++ reference queries (when gtags is enabled)
@@ -426,6 +437,9 @@ pub struct CodeIntelEngine {
     /// Background task that periodically flushes lifetime metrics to disk.
     /// Aborted on shutdown after a final synchronous flush.
     metrics_flush_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// In-flight definition-map builds, keyed by repo. Held so a reindex or a
+    /// shutdown can abort a build that is still walking the tree.
+    definition_builds: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Per-repo cached `.gitignore` matcher, so the watch path rejects the same
     /// paths the index-time WalkBuilder would (built lazily on first use).
     gitignore_matchers: DashMap<PathBuf, Arc<ignore::gitignore::Gitignore>>,
@@ -486,7 +500,7 @@ impl CodeIntelEngine {
             match IndexStore::new(expanded_index.clone()) {
                 Ok(store) => {
                     info!("Index persistence enabled, storing in {:?}", expanded_index);
-                    Some(store)
+                    Some(Arc::new(store))
                 }
                 Err(e) => {
                     warn!("Failed to initialize index store: {}", e);
@@ -712,6 +726,7 @@ impl CodeIntelEngine {
             #[cfg(feature = "graph")]
             knowledge_graph,
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
+            definition_builds: DashMap::new(),
             gitignore_matchers: DashMap::new(),
             compile_commands_filtered_files: DashMap::new(),
             gtags_last_refresh: DashMap::new(),
@@ -884,6 +899,13 @@ impl CodeIntelEngine {
         if let Err(e) = self.metrics.flush() {
             warn!("Final metrics flush failed: {}", e);
         }
+        // A definition-map build has nothing worth saving half-done — its map
+        // only exists once it commits — so drop it rather than wait out a
+        // whole-repo parse.
+        self.definition_builds.retain(|_, handle| {
+            handle.abort();
+            false
+        });
     }
 
     /// Complete the deferred initialization by indexing all repositories
@@ -2246,7 +2268,93 @@ impl CodeIntelEngine {
             }
         }
 
+        // What lets a filtered index name the file defining a symbol the filter
+        // dropped. Started here, after the index is published, so the repo is
+        // already answering queries while the map fills.
+        if repo_index_filtered {
+            let mut repo_files: Vec<PathBuf> = all_files.into_iter().collect();
+            repo_files.sort();
+            self.spawn_definition_build(path, &repo_name, repo_files)
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Start (or restart) the background build of a repo's definition map.
+    ///
+    /// Runs behind the index: the repo already answers queries, and the map
+    /// stays invisible until the build commits it. A build already running for
+    /// this repo is aborted and awaited first, so its writes cannot land on top
+    /// of the new one.
+    async fn spawn_definition_build(&self, repo_path: &Path, repo_name: &str, files: Vec<PathBuf>) {
+        let Some(store) = self.index_store.clone() else {
+            return;
+        };
+        if let Some((_, previous)) = self.definition_builds.remove(repo_name) {
+            previous.abort();
+            let _ = previous.await;
+        }
+
+        let head_hash = self.git_head_hash(repo_path);
+        if store
+            .definition_stats(repo_path, head_hash.as_deref())
+            .is_some()
+        {
+            debug!(
+                "definition map for {} is current; not rebuilding",
+                repo_name
+            );
+            return;
+        }
+
+        let handle = tokio::spawn(build_definition_map(
+            store,
+            Arc::clone(&self.parser),
+            repo_path.to_path_buf(),
+            repo_name.to_string(),
+            files,
+            head_hash,
+        ));
+        self.definition_builds.insert(repo_name.to_string(), handle);
+    }
+
+    /// Keep a repo's definition map in step with one changed file.
+    ///
+    /// A no-op for a repo with no map, so an unfiltered repo pays nothing, and
+    /// so does a repo whose build has not committed yet. That leaves a window
+    /// where an edit to a file the build already passed is not reflected until
+    /// the next index; both ways that can go wrong — a row naming a file that
+    /// no longer defines the symbol, or a missing row — cost at most one
+    /// wrongly-indexed or one un-indexed file, never a wrong answer.
+    fn update_definition_map(
+        &self,
+        repo_path: &Path,
+        file: &Path,
+        change: &crate::persist::ChangeType,
+    ) {
+        let Some(store) = &self.index_store else {
+            return;
+        };
+        let rel = file
+            .strip_prefix(repo_path)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .to_string();
+
+        let updated = match change {
+            crate::persist::ChangeType::Deleted => store.remove_file_definitions(repo_path, &rel),
+            _ => match std::fs::read_to_string(file)
+                .ok()
+                .and_then(|content| self.parser.parse_file(file, &content).ok())
+            {
+                Some(parsed) => store.update_file_definitions(repo_path, &rel, &parsed.symbols),
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = updated {
+            warn!("definition map: update failed for {:?}: {}", file, e);
+        }
     }
 
     /// Files outside `--index-filter` that the in-scope files reference
@@ -4948,6 +5056,10 @@ impl CodeIntelEngine {
                     continue;
                 }
             };
+
+            // The definition map covers the whole repo, so it is updated before
+            // the --index-filter check below, which drops out-of-scope files.
+            self.update_definition_map(repo_path, &change.path, &change.change_type);
 
             // --index-filter: in a repo whose base index is restricted, never
             // (re)index a file outside the scope. Repos not restricted are
@@ -12136,6 +12248,125 @@ fn entry_include_dirs(entry: &serde_json::Value) -> Vec<String> {
     }
 
     dirs
+}
+
+/// Threads a background definition-map build may use: half the machine, so the
+/// build finishes in reasonable time while the other half stays free for the
+/// queries the repo is meanwhile serving.
+fn definition_build_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).max(1))
+        .unwrap_or(1)
+}
+
+/// Parse every file of a repo and record what each one defines.
+///
+/// Runs as its own task so the repo stays serviceable throughout. Cancellation
+/// takes effect between batches; because the map is published only by the final
+/// commit, an aborted build leaves the repo with no map rather than half of one.
+async fn build_definition_map(
+    store: Arc<crate::persist::IndexStore>,
+    parser: Arc<LanguageParser>,
+    repo_path: PathBuf,
+    repo_name: String,
+    mut files: Vec<PathBuf>,
+    head_hash: Option<String>,
+) {
+    let started = std::time::Instant::now();
+    let mut writer = match store.begin_definitions(&repo_path) {
+        Ok(writer) => writer,
+        Err(e) => {
+            warn!(
+                "definition map: cannot start build for {}: {}",
+                repo_name, e
+            );
+            return;
+        }
+    };
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .num_threads(definition_build_threads())
+        .build()
+    {
+        Ok(pool) => Arc::new(pool),
+        Err(e) => {
+            warn!("definition map: no thread pool for {}: {}", repo_name, e);
+            return;
+        }
+    };
+
+    // Sorted so progress reporting walks the tree in a predictable order.
+    files.sort();
+    let total = files.len();
+    info!(
+        "definition map: building for {} from {} file(s)",
+        repo_name, total
+    );
+
+    let mut done = 0usize;
+    let mut next_report = DEFINITION_BUILD_PROGRESS_FILES;
+    for chunk in files.chunks(DEFINITION_BUILD_CHUNK_FILES) {
+        let batch: Vec<PathBuf> = chunk.to_vec();
+        let batch_len = batch.len();
+        let parser = Arc::clone(&parser);
+        let pool = Arc::clone(&pool);
+        let root = repo_path.clone();
+
+        // Parsing is CPU work: it belongs on the bounded pool via a blocking
+        // thread, not on the runtime's workers. This await is also the point at
+        // which an abort stops the build.
+        let parsed = tokio::task::spawn_blocking(move || {
+            pool.install(|| {
+                batch
+                    .par_iter()
+                    .filter_map(|file| {
+                        let content = std::fs::read_to_string(file).ok()?;
+                        let parsed = parser.parse_file(file, &content).ok()?;
+                        let relative = file
+                            .strip_prefix(&root)
+                            .unwrap_or(file)
+                            .to_string_lossy()
+                            .to_string();
+                        Some((relative, parsed.symbols))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await;
+
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("definition map: build for {} stopped: {}", repo_name, e);
+                return;
+            }
+        };
+        for (relative, symbols) in parsed {
+            if let Err(e) = writer.add_file(&relative, &symbols) {
+                warn!("definition map: write failed for {}: {}", repo_name, e);
+                return;
+            }
+        }
+
+        done += batch_len;
+        if done >= next_report {
+            info!(
+                "definition map: {}/{} file(s) for {}",
+                done, total, repo_name
+            );
+            next_report += DEFINITION_BUILD_PROGRESS_FILES;
+        }
+    }
+
+    match writer.commit(head_hash.as_deref()) {
+        Ok(stats) => info!(
+            "definition map: {} definition(s) from {} file(s) in {:?} for {}",
+            stats.definitions,
+            stats.files,
+            started.elapsed(),
+            repo_name
+        ),
+        Err(e) => warn!("definition map: commit failed for {}: {}", repo_name, e),
+    }
 }
 
 /// Which rule first named a pulled-in file. A file both rules name is
