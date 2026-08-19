@@ -36,12 +36,37 @@ fn write_scoped_repo(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The same shape in Rust, where neither pull-in rule that predates the
+/// definition map applies: there is no `#include` to resolve and gtags does not
+/// index Rust.
+fn write_scoped_rust_repo(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::create_dir_all(root.join("lib"))?;
+
+    std::fs::write(
+        root.join("src/caller.rs"),
+        "pub fn caller_fn() -> i32 {\n    out_of_scope_helper() + 1\n}\n",
+    )?;
+    std::fs::write(
+        root.join("lib/helper.rs"),
+        "pub fn out_of_scope_helper() -> i32 {\n    7\n}\n",
+    )?;
+    std::fs::write(
+        root.join("lib/unrelated.rs"),
+        "pub fn nobody_calls_this() -> i32 {\n    1\n}\n",
+    )?;
+    Ok(())
+}
+
 async fn scoped_engine(repo: &Path, index_dir: &Path) -> CodeIntelEngine {
     let options = EngineOptions {
         call_graph_enabled: true,
         index_filter: vec!["src".to_string()],
         gtags_enabled: true,
         gtags_generate: true,
+        // The definition map lives in the persisted store, so the callee
+        // pull-in only has a non-gtags source when persistence is on.
+        persist_enabled: true,
         ..Default::default()
     };
     let engine =
@@ -118,6 +143,48 @@ async fn edits_to_a_pulled_in_file_are_picked_up() {
 
     let added = symbols_matching(&engine, repo.path(), "api_added_later").await;
     assert!(added.contains("inc/api.h"), "{}", added);
+}
+
+/// The definition map is what makes the callee pull-in work where gtags cannot
+/// reach. It is built behind the index, so the first index cannot use it; a
+/// second index pass, once the map has committed, pulls the definition in.
+#[tokio::test]
+async fn rust_callee_definitions_are_pulled_in_once_the_map_is_built() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_scoped_rust_repo(repo.path()).unwrap();
+    let engine = scoped_engine(repo.path(), index_dir.path()).await;
+
+    // The filter applies as usual: the scoped file is indexed.
+    let scoped = symbols_matching(&engine, repo.path(), "caller_fn").await;
+    assert!(scoped.contains("src/caller.rs"), "{}", scoped);
+
+    // Wait for the background build's effect rather than for a duration: each
+    // pass re-runs the pull-in, which succeeds on the first one that sees a
+    // committed map.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut callee = String::new();
+    while std::time::Instant::now() < deadline {
+        engine
+            .reindex(Some(repo.path().to_str().unwrap()))
+            .await
+            .expect("reindex");
+        callee = symbols_matching(&engine, repo.path(), "out_of_scope_helper").await;
+        if callee.contains("lib/helper.rs") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        callee.contains("lib/helper.rs"),
+        "callee definition should be pulled in via the definition map: {}",
+        callee
+    );
+
+    // One hop from in-scope code, not a blanket exemption: an out-of-scope file
+    // nothing references stays out even with the whole repo in the map.
+    let unrelated = symbols_matching(&engine, repo.path(), "nobody_calls_this").await;
+    assert!(!unrelated.contains("lib/unrelated.rs"), "{}", unrelated);
 }
 
 /// A file outside the filter that nothing in scope references stays out — the

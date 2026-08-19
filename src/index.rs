@@ -1877,11 +1877,12 @@ impl CodeIntelEngine {
                 let extra = parse_files(&pulled_in.files);
                 info!(
                     "--index-filter: pulled in {} file(s) referenced by in-scope code in {} \
-                     ({} via #include, {} via gtags)",
+                     ({} via #include, {} via gtags, {} via definition map)",
                     pulled_in.files.len(),
                     repo_name,
                     pulled_in.from_includes,
-                    pulled_in.from_gtags
+                    pulled_in.from_gtags,
+                    pulled_in.from_store
                 );
                 files.extend(pulled_in.files);
                 parsed_results.extend(extra);
@@ -2289,6 +2290,14 @@ impl CodeIntelEngine {
     /// of the new one.
     async fn spawn_definition_build(&self, repo_path: &Path, repo_name: &str, files: Vec<PathBuf>) {
         let Some(store) = self.index_store.clone() else {
+            // The map lives in the persisted store, so without --persist the
+            // callee pull-in has only gtags to go on. Say so rather than
+            // silently doing nothing.
+            info!(
+                "--index-filter: {} has no persisted store, so callee definitions \
+                 can only come from gtags (enable --persist for the definition map)",
+                repo_name
+            );
             return;
         };
         if let Some((_, previous)) = self.definition_builds.remove(repo_name) {
@@ -2421,31 +2430,45 @@ impl CodeIntelEngine {
             }
         }
 
-        // Callees. gtags indexes the whole repo regardless of --index-filter,
-        // so it can name the file holding a definition the filter dropped.
-        if let Some(gtags) = &self.gtags_manager {
-            if self.gtags_repo_enabled(repo_path) {
-                let defined: HashSet<&str> = base
-                    .iter()
-                    .flat_map(|(_, _, parsed)| parsed.symbols.iter().map(|s| s.name.as_str()))
-                    .collect();
-                let mut names: Vec<String> = base
-                    .par_iter()
-                    .filter_map(|(_, content, parsed)| {
-                        parsed
-                            .tree
-                            .as_ref()
-                            .map(|tree| CallGraph::referenced_callee_names(content, tree))
-                    })
-                    .flatten()
-                    .filter(|name| !defined.contains(name.as_str()))
-                    .collect();
-                names.sort();
-                names.dedup();
-                for rel in gtags.find_definition_files(&names, repo_path).await {
-                    candidates
-                        .entry(repo_path.join(rel))
-                        .or_insert(PullInSource::Gtags);
+        // Callees no in-scope file defines. gtags and the definition map answer
+        // the same question about them, so resolve the names once.
+        let unresolved = unresolved_callee_names(base);
+
+        // gtags indexes the whole repo regardless of --index-filter, so it can
+        // name the file holding a definition the filter dropped.
+        if !unresolved.is_empty() {
+            if let Some(gtags) = &self.gtags_manager {
+                if self.gtags_repo_enabled(repo_path) {
+                    for rel in gtags.find_definition_files(&unresolved, repo_path).await {
+                        candidates
+                            .entry(repo_path.join(rel))
+                            .or_insert(PullInSource::Gtags);
+                    }
+                }
+            }
+        }
+
+        // The definition map answers for every language narsil parses and needs
+        // no external tool, so for a repo gtags does not index it is the only
+        // source. Consulted last, so a file gtags already named keeps its
+        // attribution and the reported counts still sum to the total.
+        if !unresolved.is_empty() {
+            if let Some(store) = &self.index_store {
+                let head_hash = self.git_head_hash(repo_path);
+                if store
+                    .definition_stats(repo_path, head_hash.as_deref())
+                    .is_some()
+                {
+                    match store.definitions_of(repo_path, &unresolved) {
+                        Ok(hits) => {
+                            for hit in hits {
+                                candidates
+                                    .entry(repo_path.join(hit.file))
+                                    .or_insert(PullInSource::Store);
+                            }
+                        }
+                        Err(e) => warn!("definition map: lookup failed for {:?}: {}", repo_path, e),
+                    }
                 }
             }
         }
@@ -2459,6 +2482,7 @@ impl CodeIntelEngine {
             match source {
                 PullInSource::Include => pulled.from_includes += 1,
                 PullInSource::Gtags => pulled.from_gtags += 1,
+                PullInSource::Store => pulled.from_store += 1,
             }
             pulled.files.push(candidate);
         }
@@ -12376,6 +12400,7 @@ async fn build_definition_map(
 enum PullInSource {
     Include,
     Gtags,
+    Store,
 }
 
 /// Files `pull_in_referenced_files` accepted, with the per-source counts the
@@ -12386,6 +12411,30 @@ struct PulledInFiles {
     files: Vec<PathBuf>,
     from_includes: usize,
     from_gtags: usize,
+    from_store: usize,
+}
+
+/// Names the in-scope files reference but none of them defines — what both
+/// gtags and the definition map are asked to locate.
+fn unresolved_callee_names(base: &[(PathBuf, String, crate::parser::ParsedFile)]) -> Vec<String> {
+    let defined: std::collections::HashSet<&str> = base
+        .iter()
+        .flat_map(|(_, _, parsed)| parsed.symbols.iter().map(|s| s.name.as_str()))
+        .collect();
+    let mut names: Vec<String> = base
+        .par_iter()
+        .filter_map(|(_, content, parsed)| {
+            parsed
+                .tree
+                .as_ref()
+                .map(|tree| CallGraph::referenced_callee_names(content, tree))
+        })
+        .flatten()
+        .filter(|name| !defined.contains(name.as_str()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Resolve an `#include` target to a file the repo walker listed: relative to
