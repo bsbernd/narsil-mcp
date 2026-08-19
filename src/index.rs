@@ -449,8 +449,10 @@ pub struct CodeIntelEngine {
     /// Aborted on shutdown after a final synchronous flush.
     metrics_flush_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// In-flight definition-map builds, keyed by repo. Held so a reindex or a
-    /// shutdown can abort a build that is still walking the tree.
-    definition_builds: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// shutdown can abort a build that is still walking the tree. The handle
+    /// yields whether the map changed, which decides if a catch-up pass is
+    /// worth running.
+    definition_builds: DashMap<String, tokio::task::JoinHandle<bool>>,
     /// Per-repo cached `.gitignore` matcher, so the watch path rejects the same
     /// paths the index-time WalkBuilder would (built lazily on first use).
     gitignore_matchers: DashMap<PathBuf, Arc<ignore::gitignore::Gitignore>>,
@@ -2235,25 +2237,12 @@ impl CodeIntelEngine {
             let _ = previous.await;
         }
 
-        let head_hash = self.git_head_hash(repo_path);
-        if store
-            .definition_stats(repo_path, head_hash.as_deref())
-            .is_some()
-        {
-            debug!(
-                "definition map for {} is current; not rebuilding",
-                repo_name
-            );
-            return;
-        }
-
         let handle = tokio::spawn(build_definition_map(
             store,
             Arc::clone(&self.parser),
             repo_path.to_path_buf(),
             repo_name.to_string(),
             files,
-            head_hash,
         ));
         self.definition_builds.insert(repo_name.to_string(), handle);
     }
@@ -2278,9 +2267,9 @@ impl CodeIntelEngine {
             let Some((_, handle)) = self.definition_builds.remove(&repo_name) else {
                 continue;
             };
-            // An aborted or panicked build committed no map, so there is
-            // nothing new for a second pass to find.
-            if handle.await.is_err() {
+            // A build that was aborted, panicked, or found nothing to change
+            // leaves the pull-in exactly as it already ran it.
+            if !matches!(handle.await, Ok(true)) {
                 continue;
             }
 
@@ -2291,16 +2280,6 @@ impl CodeIntelEngine {
             let Some(repo_path) = repo_path else {
                 continue;
             };
-            if self
-                .index_store
-                .as_ref()
-                .and_then(|store| {
-                    store.definition_stats(&repo_path, self.git_head_hash(&repo_path).as_deref())
-                })
-                .is_none()
-            {
-                continue;
-            }
 
             info!(
                 "--index-filter: definition map ready for {}; re-running the pull-in",
@@ -2446,11 +2425,7 @@ impl CodeIntelEngine {
         // attribution and the reported counts still sum to the total.
         if !unresolved.is_empty() {
             if let Some(store) = &self.index_store {
-                let head_hash = self.git_head_hash(repo_path);
-                if store
-                    .definition_stats(repo_path, head_hash.as_deref())
-                    .is_some()
-                {
+                if store.definition_stats(repo_path).is_some() {
                     match store.definitions_of(repo_path, &unresolved) {
                         Ok(hits) => {
                             for hit in hits {
@@ -8537,19 +8512,85 @@ async fn build_definition_map(
     repo_path: PathBuf,
     repo_name: String,
     mut files: Vec<PathBuf>,
-    head_hash: Option<String>,
-) {
+) -> bool {
     let started = std::time::Instant::now();
-    let mut writer = match store.begin_definitions(&repo_path) {
+
+    // An existing map under the current rules is refreshed file by file; only
+    // absent or rule-mismatched maps are rebuilt whole.
+    let refreshing = store.definition_stats(&repo_path).is_some();
+    let stamps = if refreshing {
+        match store.definition_file_stamps(&repo_path) {
+            Ok(stamps) => stamps,
+            Err(e) => {
+                warn!(
+                    "definition map: cannot read stamps for {}: {}",
+                    repo_name, e
+                );
+                return false;
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Stat every file the walker listed: unchanged ones need no read, no parse
+    // and no write. Whatever the map still holds but the walk did not list has
+    // gone from the tree and must come out.
+    let mut removed: Vec<String> = Vec::new();
+    if refreshing {
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(files.len());
+        files.retain(|file| {
+            let relative = file
+                .strip_prefix(&repo_path)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .to_string();
+            let current = crate::persist::file_stamp(file);
+            let unchanged = matches!((current, stamps.get(&relative)), (Some(now), Some(before)) if now == *before);
+            seen.insert(relative);
+            !unchanged
+        });
+        removed.extend(
+            stamps
+                .keys()
+                .filter(|relative| !seen.contains(*relative))
+                .cloned(),
+        );
+
+        if files.is_empty() && removed.is_empty() {
+            debug!("definition map for {} is up to date", repo_name);
+            return false;
+        }
+        info!(
+            "definition map: refreshing {} changed and {} removed file(s) for {}",
+            files.len(),
+            removed.len(),
+            repo_name
+        );
+    }
+
+    let mut writer = match if refreshing {
+        store.open_definitions(&repo_path)
+    } else {
+        store.begin_definitions(&repo_path)
+    } {
         Ok(writer) => writer,
         Err(e) => {
             warn!(
                 "definition map: cannot start build for {}: {}",
                 repo_name, e
             );
-            return;
+            return false;
         }
     };
+
+    for relative in &removed {
+        if let Err(e) = writer.remove_file(relative) {
+            warn!("definition map: retract failed for {}: {}", repo_name, e);
+            return false;
+        }
+    }
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(definition_build_threads())
         .build()
@@ -8557,17 +8598,19 @@ async fn build_definition_map(
         Ok(pool) => Arc::new(pool),
         Err(e) => {
             warn!("definition map: no thread pool for {}: {}", repo_name, e);
-            return;
+            return false;
         }
     };
 
     // Sorted so progress reporting walks the tree in a predictable order.
     files.sort();
     let total = files.len();
-    info!(
-        "definition map: building for {} from {} file(s)",
-        repo_name, total
-    );
+    if !refreshing {
+        info!(
+            "definition map: building for {} from {} file(s)",
+            repo_name, total
+        );
+    }
 
     let mut done = 0usize;
     let mut next_report = DEFINITION_BUILD_PROGRESS_FILES;
@@ -8586,6 +8629,7 @@ async fn build_definition_map(
                 batch
                     .par_iter()
                     .filter_map(|file| {
+                        let stamp = crate::persist::file_stamp(file)?;
                         let content = std::fs::read_to_string(file).ok()?;
                         let definitions = parser.definition_names(file, &content).ok()?;
                         let relative = file
@@ -8593,7 +8637,7 @@ async fn build_definition_map(
                             .unwrap_or(file)
                             .to_string_lossy()
                             .to_string();
-                        Some((relative, definitions))
+                        Some((relative, definitions, stamp))
                     })
                     .collect::<Vec<_>>()
             })
@@ -8604,18 +8648,23 @@ async fn build_definition_map(
             Ok(parsed) => parsed,
             Err(e) => {
                 warn!("definition map: build for {} stopped: {}", repo_name, e);
-                return;
+                return false;
             }
         };
-        for (relative, definitions) in parsed {
-            if let Err(e) = writer.add_file(&relative, &definitions) {
+        for (relative, definitions, stamp) in parsed {
+            let written = if refreshing {
+                writer.replace_file(&relative, &definitions, stamp)
+            } else {
+                writer.add_file(&relative, &definitions, stamp)
+            };
+            if let Err(e) = written {
                 warn!("definition map: write failed for {}: {}", repo_name, e);
-                return;
+                return false;
             }
         }
 
         done += batch_len;
-        if done >= next_report {
+        if !refreshing && done >= next_report {
             info!(
                 "definition map: {}/{} file(s) for {}",
                 done, total, repo_name
@@ -8624,15 +8673,24 @@ async fn build_definition_map(
         }
     }
 
-    match writer.commit(head_hash.as_deref()) {
-        Ok(stats) => info!(
-            "definition map: {} definition(s) from {} file(s) in {:?} for {}",
-            stats.definitions,
-            stats.files,
-            started.elapsed(),
-            repo_name
-        ),
-        Err(e) => warn!("definition map: commit failed for {}: {}", repo_name, e),
+    match writer.commit() {
+        Ok(stats) => {
+            info!(
+                "definition map: {} definition(s) from {} file(s) in {:?} for {} \
+                 ({} file(s) {})",
+                stats.definitions,
+                stats.files,
+                started.elapsed(),
+                repo_name,
+                total,
+                if refreshing { "refreshed" } else { "parsed" }
+            );
+            true
+        }
+        Err(e) => {
+            warn!("definition map: commit failed for {}: {}", repo_name, e);
+            false
+        }
     }
 }
 

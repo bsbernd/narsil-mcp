@@ -245,6 +245,10 @@ const DEFS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("definitio
 /// redb table: repo-relative file -> postcard(Vec<String>) of the names it
 /// defines. Read only to retract a file's rows when it changes or goes away.
 const DEF_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("definition_files");
+/// redb table: repo-relative file -> postcard([`FileStamp`]). Separate from
+/// `DEF_FILES_TABLE` so a refresh can scan every file's stamp without
+/// deserializing every file's name list.
+const DEF_STAMPS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("definition_stamps");
 /// [`META_TABLE`] key holding the definition map's own header.
 const DEFINITION_META_KEY: &str = "definitions";
 
@@ -254,15 +258,40 @@ const DEFINITION_META_KEY: &str = "definitions";
 /// without invalidating every repo's symbols. Bump it whenever an unchanged
 /// source file would now contribute different rows.
 ///
+/// v3: every file carries a [`FileStamp`], so staleness is decided per file.
 /// v2: names come from the parser's names-only extraction, which does not
 /// report `SYSCALL_DEFINEn` entry points.
-const DEFINITION_MAP_VERSION: u32 = 2;
+const DEFINITION_MAP_VERSION: u32 = 3;
 /// Rows buffered before the definition map commits a write transaction. Keeps
 /// a whole-repo build's memory flat without paying a transaction per file.
 const DEFINITION_FLUSH_ROWS: usize = 50_000;
 
 fn definition_key(name: &str, file: &str) -> String {
     format!("{name}\0{file}")
+}
+
+/// What a file looked like when the map last read it. Comparing this against a
+/// stat is what lets a refresh skip an unchanged file without opening it — the
+/// same size-and-mtime test [`PersistedIndex::needs_reindex`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub size: u64,
+    pub mtime: u64,
+}
+
+/// Stamp a file on disk, or `None` when it cannot be stat'd (gone, or
+/// unreadable — either way a refresh must not treat it as unchanged).
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        size: metadata.len(),
+        mtime: metadata
+            .modified()
+            .ok()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    })
 }
 
 /// One row per distinct name in a file: the key is (name, file), so two
@@ -312,7 +341,6 @@ struct RepoMeta {
 /// answered from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DefinitionMeta {
-    head_hash: Option<String>,
     logic_version: u32,
     /// [`DEFINITION_MAP_VERSION`] these rows were produced under. A header
     /// written before this field existed fails to decode, which reads as "no
@@ -712,23 +740,41 @@ impl IndexStore {
     }
 
     /// Size of the repo's definition map, or `None` when it is absent or was
-    /// built from a different HEAD or by a different indexer.
-    pub fn definition_stats(
-        &self,
-        repo_root: &Path,
-        head_hash: Option<&str>,
-    ) -> Option<DefinitionStats> {
+    /// built under different content rules and so must be rebuilt whole.
+    ///
+    /// Deliberately says nothing about git HEAD: staleness is decided per file
+    /// by [`FileStamp`], which also catches edits made while nothing was
+    /// running. A moved HEAD makes some files stale, not the whole map.
+    pub fn definition_stats(&self, repo_root: &Path) -> Option<DefinitionStats> {
         let meta = self.definition_meta(repo_root)?;
-        if meta.map_version != DEFINITION_MAP_VERSION
-            || meta.logic_version != INDEX_LOGIC_VERSION
-            || meta.head_hash.as_deref() != head_hash
-        {
+        if meta.map_version != DEFINITION_MAP_VERSION || meta.logic_version != INDEX_LOGIC_VERSION {
             return None;
         }
         Some(DefinitionStats {
             files: meta.files,
             definitions: meta.definitions,
         })
+    }
+
+    /// Every file the map has already read, with the stamp it was read at.
+    /// A refresh compares these against the tree to find what to re-parse.
+    pub fn definition_file_stamps(&self, repo_root: &Path) -> Result<HashMap<String, FileStamp>> {
+        let mut stamps = HashMap::new();
+        if !self.db_path(repo_root).exists() {
+            return Ok(stamps);
+        }
+        let db = self.db(repo_root)?;
+        let read_txn = db.begin_read()?;
+        let Ok(table) = read_txn.open_table(DEF_STAMPS_TABLE) else {
+            return Ok(stamps);
+        };
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if let Ok(stamp) = postcard::from_bytes::<FileStamp>(value.value()) {
+                stamps.insert(key.value().to_string(), stamp);
+            }
+        }
+        Ok(stamps)
     }
 
     /// Start replacing a repo's definition map.
@@ -742,15 +788,29 @@ impl IndexStore {
         {
             let _ = write_txn.delete_table(DEFS_TABLE);
             let _ = write_txn.delete_table(DEF_FILES_TABLE);
+            let _ = write_txn.delete_table(DEF_STAMPS_TABLE);
             let mut meta_table = write_txn.open_table(META_TABLE)?;
             meta_table.remove(DEFINITION_META_KEY)?;
         }
         write_txn.commit()?;
         Ok(DefinitionWriter {
             db,
-            rows: Vec::new(),
-            file_names: Vec::new(),
+            pending: Vec::new(),
+            buffered_rows: 0,
             stats: DefinitionStats::default(),
+        })
+    }
+
+    /// Open an existing map for a refresh: no clearing, and the running totals
+    /// start from what the map already holds, so the header stays honest after
+    /// files are replaced or dropped.
+    pub fn open_definitions(&self, repo_root: &Path) -> Result<DefinitionWriter> {
+        let stats = self.definition_stats(repo_root).unwrap_or_default();
+        Ok(DefinitionWriter {
+            db: self.db(repo_root)?,
+            pending: Vec::new(),
+            buffered_rows: 0,
+            stats,
         })
     }
 
@@ -818,35 +878,14 @@ impl IndexStore {
         if self.definition_meta(repo_root).is_none() {
             return Ok(());
         }
-        let definitions = distinct_definitions(definitions);
-        let db = self.db(repo_root)?;
-        let write_txn = db.begin_write()?;
-        {
-            let mut defs = write_txn.open_table(DEFS_TABLE)?;
-            let mut files = write_txn.open_table(DEF_FILES_TABLE)?;
-
-            let previous: Vec<String> = match files.get(file)? {
-                Some(guard) => postcard::from_bytes(guard.value()).unwrap_or_default(),
-                None => Vec::new(),
-            };
-            for name in &previous {
-                defs.remove(definition_key(name, file).as_str())?;
-            }
-
-            let names: Vec<&String> = definitions.iter().map(|(name, _)| name).collect();
-            for (name, kind) in &definitions {
-                defs.insert(
-                    definition_key(name, file).as_str(),
-                    postcard::to_stdvec(kind)?.as_slice(),
-                )?;
-            }
-            if names.is_empty() {
-                files.remove(file)?;
-            } else {
-                files.insert(file, postcard::to_stdvec(&names)?.as_slice())?;
-            }
+        let mut writer = self.open_definitions(repo_root)?;
+        match file_stamp(&repo_root.join(file)) {
+            // The stamp has to move with the rows, or the next refresh would
+            // parse this file again to rediscover what was just written.
+            Some(stamp) => writer.replace_file(file, definitions, stamp)?,
+            None => writer.remove_file(file)?,
         }
-        write_txn.commit()?;
+        writer.commit()?;
         Ok(())
     }
 
@@ -876,63 +915,135 @@ impl IndexStore {
 /// half of one.
 pub struct DefinitionWriter {
     db: Arc<Database>,
-    rows: Vec<(String, SymbolKind, String)>,
-    file_names: Vec<(String, Vec<String>)>,
+    pending: Vec<PendingFile>,
+    buffered_rows: usize,
     stats: DefinitionStats,
 }
 
-impl DefinitionWriter {
-    /// Record what one file defines. Buffered; written once the batch fills.
-    pub fn add_file(&mut self, file: &str, definitions: &[(String, SymbolKind)]) -> Result<()> {
-        let definitions = distinct_definitions(definitions);
-        let names: Vec<String> = definitions.iter().map(|(name, _)| name.clone()).collect();
-        for (name, kind) in definitions {
-            self.rows.push((name, kind, file.to_string()));
-        }
-        self.stats.files += 1;
-        self.stats.definitions += names.len() as u64;
-        self.file_names.push((file.to_string(), names));
+/// One file's worth of buffered work. `retract` means the file already has rows
+/// in the map that must come out first — a refresh replacing or dropping it.
+struct PendingFile {
+    file: String,
+    definitions: Vec<(String, SymbolKind)>,
+    stamp: Option<FileStamp>,
+    retract: bool,
+}
 
-        if self.rows.len() >= DEFINITION_FLUSH_ROWS {
+impl DefinitionWriter {
+    /// Record what one file defines, for a map being built from nothing.
+    pub fn add_file(
+        &mut self,
+        file: &str,
+        definitions: &[(String, SymbolKind)],
+        stamp: FileStamp,
+    ) -> Result<()> {
+        self.push(file, definitions, Some(stamp), false)
+    }
+
+    /// Record what one file defines now, retracting whatever it defined before.
+    pub fn replace_file(
+        &mut self,
+        file: &str,
+        definitions: &[(String, SymbolKind)],
+        stamp: FileStamp,
+    ) -> Result<()> {
+        self.push(file, definitions, Some(stamp), true)
+    }
+
+    /// Drop a file that is no longer in the tree.
+    pub fn remove_file(&mut self, file: &str) -> Result<()> {
+        self.push(file, &[], None, true)
+    }
+
+    fn push(
+        &mut self,
+        file: &str,
+        definitions: &[(String, SymbolKind)],
+        stamp: Option<FileStamp>,
+        retract: bool,
+    ) -> Result<()> {
+        let definitions = distinct_definitions(definitions);
+        self.buffered_rows += definitions.len().max(1);
+        self.pending.push(PendingFile {
+            file: file.to_string(),
+            definitions,
+            stamp,
+            retract,
+        });
+        if self.buffered_rows >= DEFINITION_FLUSH_ROWS {
             self.flush()?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.rows.is_empty() && self.file_names.is_empty() {
+        if self.pending.is_empty() {
             return Ok(());
         }
         let write_txn = self.db.begin_write()?;
         {
             let mut defs = write_txn.open_table(DEFS_TABLE)?;
-            for (name, kind, file) in self.rows.drain(..) {
-                defs.insert(
-                    definition_key(&name, &file).as_str(),
-                    postcard::to_stdvec(&kind)?.as_slice(),
-                )?;
-            }
             let mut files = write_txn.open_table(DEF_FILES_TABLE)?;
-            for (file, names) in self.file_names.drain(..) {
-                if names.is_empty() {
+            let mut stamps = write_txn.open_table(DEF_STAMPS_TABLE)?;
+
+            for entry in self.pending.drain(..) {
+                if entry.retract {
+                    let previous: Vec<String> = match files.get(entry.file.as_str())? {
+                        Some(guard) => postcard::from_bytes(guard.value()).unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    for name in &previous {
+                        defs.remove(definition_key(name, &entry.file).as_str())?;
+                    }
+                    if !previous.is_empty() {
+                        self.stats.files = self.stats.files.saturating_sub(1);
+                        self.stats.definitions =
+                            self.stats.definitions.saturating_sub(previous.len() as u64);
+                    }
+                }
+
+                // A file that defines nothing still gets a stamp, or every
+                // refresh would re-parse it to find the same nothing.
+                match entry.stamp {
+                    Some(stamp) => {
+                        stamps
+                            .insert(entry.file.as_str(), postcard::to_stdvec(&stamp)?.as_slice())?;
+                    }
+                    None => {
+                        stamps.remove(entry.file.as_str())?;
+                    }
+                }
+
+                if entry.definitions.is_empty() {
+                    files.remove(entry.file.as_str())?;
                     continue;
                 }
-                files.insert(file.as_str(), postcard::to_stdvec(&names)?.as_slice())?;
+                let names: Vec<&String> = entry.definitions.iter().map(|(name, _)| name).collect();
+                for (name, kind) in &entry.definitions {
+                    defs.insert(
+                        definition_key(name, &entry.file).as_str(),
+                        postcard::to_stdvec(kind)?.as_slice(),
+                    )?;
+                }
+                files.insert(entry.file.as_str(), postcard::to_stdvec(&names)?.as_slice())?;
+                self.stats.files += 1;
+                self.stats.definitions += entry.definitions.len() as u64;
             }
         }
         write_txn.commit()?;
+        self.buffered_rows = 0;
         Ok(())
     }
 
-    /// Publish the map. `head_hash` is the repo fingerprint it was built from;
-    /// a later lookup against a different one rejects it as stale.
-    pub fn commit(mut self, head_hash: Option<&str>) -> Result<DefinitionStats> {
+    /// Publish the map. Written last, so a build or refresh that is cancelled
+    /// partway leaves the previous header — or none — rather than a claim the
+    /// rows do not support.
+    pub fn commit(mut self) -> Result<DefinitionStats> {
         self.flush()?;
         let write_txn = self.db.begin_write()?;
         {
             let mut meta_table = write_txn.open_table(META_TABLE)?;
             let meta = DefinitionMeta {
-                head_hash: head_hash.map(str::to_string),
                 logic_version: INDEX_LOGIC_VERSION,
                 map_version: DEFINITION_MAP_VERSION,
                 files: self.stats.files,
@@ -1674,6 +1785,16 @@ mod tests {
         (name.to_string(), kind)
     }
 
+    /// Write a real file, since a stamp has to come from one on disk.
+    fn write_and_stamp(root: &Path, relative: &str, body: &str) -> FileStamp {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        file_stamp(&path).unwrap()
+    }
+
     fn files_defining(store: &IndexStore, root: &Path, name: &str) -> Vec<String> {
         let mut files: Vec<String> = store
             .definitions_of(root, &[name.to_string()])
@@ -1693,8 +1814,11 @@ mod tests {
         let root = repo.path().to_path_buf();
 
         // No map yet: no stats, and a lookup answers nothing rather than failing.
-        assert_eq!(store.definition_stats(&root, None), None);
+        assert_eq!(store.definition_stats(&root), None);
         assert!(files_defining(&store, &root, "handle").is_empty());
+
+        let net = write_and_stamp(&root, "src/net.c", "int handle(void) { return 0; }\n");
+        let util = write_and_stamp(&root, "src/util.c", "int handle(void) { return 1; }\n");
 
         let mut writer = store.begin_definitions(&root).unwrap();
         writer
@@ -1705,12 +1829,13 @@ mod tests {
                     symbol("MAX_CONN", SymbolKind::Macro),
                     symbol("conn", SymbolKind::Struct),
                 ],
+                net,
             )
             .unwrap();
         writer
-            .add_file("src/util.c", &[symbol("handle", SymbolKind::Method)])
+            .add_file("src/util.c", &[symbol("handle", SymbolKind::Method)], util)
             .unwrap();
-        let stats = writer.commit(Some("head1")).unwrap();
+        let stats = writer.commit().unwrap();
         assert_eq!(stats.files, 2);
         assert_eq!(stats.definitions, 2);
 
@@ -1729,6 +1854,95 @@ mod tests {
         // multiply the map without pulling anything in.
         assert!(files_defining(&store, &root, "MAX_CONN").is_empty());
         assert!(files_defining(&store, &root, "conn").is_empty());
+
+        // Every file read carries a stamp, which is what a refresh compares
+        // against the tree to decide what to re-parse.
+        let stamps = store.definition_file_stamps(&root).unwrap();
+        assert_eq!(stamps.get("src/net.c"), Some(&net));
+        assert_eq!(stamps.get("src/util.c"), Some(&util));
+    }
+
+    /// A refresh must re-parse only what moved: an unchanged file keeps the
+    /// stamp it was read at, a changed one has its rows replaced, and a file
+    /// that left the tree has its rows retracted.
+    #[test]
+    fn a_refresh_replaces_changed_files_and_drops_removed_ones() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let steady = write_and_stamp(&root, "steady.c", "int steady_fn(void) { return 0; }\n");
+        let churn = write_and_stamp(&root, "churn.c", "int old_fn(void) { return 0; }\n");
+        let doomed = write_and_stamp(&root, "doomed.c", "int doomed_fn(void) { return 0; }\n");
+
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer
+            .add_file(
+                "steady.c",
+                &[symbol("steady_fn", SymbolKind::Function)],
+                steady,
+            )
+            .unwrap();
+        writer
+            .add_file("churn.c", &[symbol("old_fn", SymbolKind::Function)], churn)
+            .unwrap();
+        writer
+            .add_file(
+                "doomed.c",
+                &[symbol("doomed_fn", SymbolKind::Function)],
+                doomed,
+            )
+            .unwrap();
+        let stats = writer.commit().unwrap();
+        assert_eq!(stats.files, 3);
+        assert_eq!(stats.definitions, 3);
+
+        // Refresh: churn.c now defines something else, doomed.c is gone,
+        // steady.c is not touched at all.
+        let churn = write_and_stamp(&root, "churn.c", "int new_fn(void) { return 1; }\nint x;\n");
+        let mut writer = store.open_definitions(&root).unwrap();
+        writer
+            .replace_file("churn.c", &[symbol("new_fn", SymbolKind::Function)], churn)
+            .unwrap();
+        writer.remove_file("doomed.c").unwrap();
+        let stats = writer.commit().unwrap();
+
+        assert_eq!(files_defining(&store, &root, "steady_fn"), vec!["steady.c"]);
+        assert_eq!(files_defining(&store, &root, "new_fn"), vec!["churn.c"]);
+        assert!(files_defining(&store, &root, "old_fn").is_empty());
+        assert!(files_defining(&store, &root, "doomed_fn").is_empty());
+
+        // The header still describes the whole map, not just this refresh.
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.definitions, 2);
+
+        let stamps = store.definition_file_stamps(&root).unwrap();
+        assert_eq!(stamps.get("steady.c"), Some(&steady));
+        assert_eq!(stamps.get("churn.c"), Some(&churn));
+        assert_eq!(stamps.get("doomed.c"), None);
+    }
+
+    /// A file that defines nothing still has to be stamped, or every refresh
+    /// would parse it again to rediscover that it defines nothing.
+    #[test]
+    fn a_file_with_no_definitions_is_still_stamped() {
+        let dir = tempdir().unwrap();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let empty = write_and_stamp(&root, "types.h", "struct only_a_type { int x; };\n");
+        let mut writer = store.begin_definitions(&root).unwrap();
+        writer.add_file("types.h", &[], empty).unwrap();
+        let stats = writer.commit().unwrap();
+
+        assert_eq!(stats.files, 0, "it contributes no definitions");
+        assert_eq!(
+            store.definition_file_stamps(&root).unwrap().get("types.h"),
+            Some(&empty),
+            "but it must not be read again on the next refresh"
+        );
     }
 
     /// The (name, file) key is one string, so a shorter name must not pick up
@@ -1740,49 +1954,57 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = repo.path().to_path_buf();
 
+        let a = write_and_stamp(&root, "a.c", "int read(void) { return 0; }\n");
+        let b = write_and_stamp(&root, "b.c", "int read_buffer(void) { return 0; }\n");
+
         let mut writer = store.begin_definitions(&root).unwrap();
         writer
-            .add_file("a.c", &[symbol("read", SymbolKind::Function)])
+            .add_file("a.c", &[symbol("read", SymbolKind::Function)], a)
             .unwrap();
         writer
-            .add_file("b.c", &[symbol("read_buffer", SymbolKind::Function)])
+            .add_file("b.c", &[symbol("read_buffer", SymbolKind::Function)], b)
             .unwrap();
-        writer.commit(None).unwrap();
+        writer.commit().unwrap();
 
         assert_eq!(files_defining(&store, &root, "read"), vec!["a.c"]);
         assert_eq!(files_defining(&store, &root, "read_buffer"), vec!["b.c"]);
     }
 
-    /// A map built against one HEAD must not answer for another, and a rebuild
-    /// must not leave the previous build's rows behind.
+    /// A rebuild starts from nothing: the map is unreadable until it commits,
+    /// and the previous build's rows and stamps do not survive it.
     #[test]
-    fn definition_map_is_rejected_when_stale_and_cleared_on_rebuild() {
+    fn a_rebuild_clears_the_previous_map() {
         let dir = tempdir().unwrap();
         let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
         let repo = tempdir().unwrap();
         let root = repo.path().to_path_buf();
 
+        let old = write_and_stamp(&root, "old.c", "int gone(void) { return 0; }\n");
         let mut writer = store.begin_definitions(&root).unwrap();
         writer
-            .add_file("old.c", &[symbol("gone", SymbolKind::Function)])
+            .add_file("old.c", &[symbol("gone", SymbolKind::Function)], old)
             .unwrap();
-        writer.commit(Some("head1")).unwrap();
+        writer.commit().unwrap();
+        assert!(store.definition_stats(&root).is_some());
 
-        assert!(store.definition_stats(&root, Some("head1")).is_some());
-        assert_eq!(store.definition_stats(&root, Some("head2")), None);
-        assert_eq!(store.definition_stats(&root, None), None);
-
-        // A rebuild drops the map until it commits, then answers only for the
-        // new content.
+        let new = write_and_stamp(&root, "new.c", "int fresh(void) { return 0; }\n");
         let mut writer = store.begin_definitions(&root).unwrap();
-        assert_eq!(store.definition_stats(&root, Some("head1")), None);
+        assert_eq!(
+            store.definition_stats(&root),
+            None,
+            "a rebuild in flight must not be answered from"
+        );
         writer
-            .add_file("new.c", &[symbol("fresh", SymbolKind::Function)])
+            .add_file("new.c", &[symbol("fresh", SymbolKind::Function)], new)
             .unwrap();
-        writer.commit(Some("head2")).unwrap();
+        writer.commit().unwrap();
 
         assert!(files_defining(&store, &root, "gone").is_empty());
         assert_eq!(files_defining(&store, &root, "fresh"), vec!["new.c"]);
+        assert_eq!(
+            store.definition_file_stamps(&root).unwrap().get("old.c"),
+            None
+        );
     }
 
     /// A map whose rows were produced under different content rules must be
@@ -1795,12 +2017,13 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = repo.path().to_path_buf();
 
+        let a = write_and_stamp(&root, "a.c", "int handle(void) { return 0; }\n");
         let mut writer = store.begin_definitions(&root).unwrap();
         writer
-            .add_file("a.c", &[symbol("handle", SymbolKind::Function)])
+            .add_file("a.c", &[symbol("handle", SymbolKind::Function)], a)
             .unwrap();
-        writer.commit(None).unwrap();
-        assert!(store.definition_stats(&root, None).is_some());
+        writer.commit().unwrap();
+        assert!(store.definition_stats(&root).is_some());
 
         // Rewrite the header as an older binary's content rules would have.
         let db = store.db(&root).unwrap();
@@ -1821,7 +2044,7 @@ mod tests {
         }
         write_txn.commit().unwrap();
 
-        assert_eq!(store.definition_stats(&root, None), None);
+        assert_eq!(store.definition_stats(&root), None);
     }
 
     #[test]
@@ -1831,6 +2054,11 @@ mod tests {
         let repo = tempdir().unwrap();
         let root = repo.path().to_path_buf();
 
+        let a = write_and_stamp(
+            &root,
+            "a.c",
+            "int kept(void) { return 0; }\nint dropped(void);\n",
+        );
         let mut writer = store.begin_definitions(&root).unwrap();
         writer
             .add_file(
@@ -1839,9 +2067,10 @@ mod tests {
                     symbol("kept", SymbolKind::Function),
                     symbol("dropped", SymbolKind::Function),
                 ],
+                a,
             )
             .unwrap();
-        writer.commit(None).unwrap();
+        writer.commit().unwrap();
 
         store
             .update_file_definitions(
@@ -1880,7 +2109,7 @@ mod tests {
             .update_file_definitions(&root, "a.rs", &[symbol("thing", SymbolKind::Function)])
             .unwrap();
 
-        assert_eq!(store.definition_stats(&root, None), None);
+        assert_eq!(store.definition_stats(&root), None);
         assert!(files_defining(&store, &root, "thing").is_empty());
     }
 
