@@ -166,6 +166,8 @@ impl LanguageParser {
                     (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
                     (type_definition declarator: (type_identifier) @type.name) @type.def
+                    (preproc_def name: (identifier) @macro.name) @macro.def
+                    (preproc_function_def name: (identifier) @macro.name) @macro.def
                 "#,
             },
             // C++
@@ -192,6 +194,8 @@ impl LanguageParser {
                     (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
                     (namespace_definition name: (namespace_identifier) @namespace.name) @namespace.def
+                    (preproc_def name: (identifier) @macro.name) @macro.def
+                    (preproc_function_def name: (identifier) @macro.name) @macro.def
                 "#,
             },
             // Java
@@ -664,6 +668,7 @@ fn parse_symbol_kind(capture_name: &str) -> SymbolKind {
         "const" | "static" => SymbolKind::Constant,
         "mod" | "module" | "namespace" => SymbolKind::Module,
         "impl" => SymbolKind::Implementation,
+        "macro" => SymbolKind::Macro,
         "var" | "arrow" => SymbolKind::Variable,
         _ => SymbolKind::Unknown,
     }
@@ -723,6 +728,44 @@ static int helper(void) { return 0; }
         );
         // The ordinary function is still found by the query path.
         assert!(names.contains(&"helper"));
+    }
+
+    /// Both `#define` forms must surface as Macro symbols: an object-like
+    /// define is a `preproc_def`, a function-like one a `preproc_function_def`,
+    /// and neither is a `function_definition` the rest of the query would see.
+    #[test]
+    fn test_parse_c_macros() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+#define MAX_USERS 128
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#include <stdio.h>
+
+static int helper(void) { return MAX_USERS; }
+"#;
+        let parsed = parser.parse_file(Path::new("widget.c"), content).unwrap();
+
+        let macros: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Macro)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            macros.contains(&"MAX_USERS"),
+            "object-like define missing, got {macros:?}"
+        );
+        assert!(
+            macros.contains(&"container_of"),
+            "function-like define missing, got {macros:?}"
+        );
+
+        // An #include names no symbol, and the ordinary function is unaffected.
+        assert_eq!(macros.len(), 2, "unexpected macro symbols: {macros:?}");
+        assert!(parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
     }
 
     #[test]
