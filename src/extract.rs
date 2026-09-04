@@ -162,34 +162,25 @@ fn merge_ranges(mut ranges: Vec<(usize, usize, Vec<usize>)>) -> Vec<(usize, usiz
 fn expand_to_scope(lines: &[&str], start: usize, end: usize) -> (usize, usize) {
     let mut new_start = start;
     let mut new_end = end;
-
-    // Track brace/bracket balance
-    let mut brace_count = 0;
     let mut in_scope = false;
 
-    // Scan backwards to find scope start
-    for i in (0..=start).rev() {
-        let line = lines[i];
-
-        // Look for scope-starting keywords
-        if is_scope_start(line) {
-            new_start = i;
-            in_scope = true;
-
-            break;
+    // Scan backwards for a scope that reaches past `end`. One that closes
+    // earlier is a sibling the scan walked over, not the enclosing scope.
+    for candidate in (0..=start).rev() {
+        if !is_scope_start(lines[candidate]) {
+            continue;
         }
-    }
 
-    // If we found a scope start, scan forward to find the end
-    if in_scope {
-        for (i, line) in lines.iter().enumerate().skip(new_start) {
-            brace_count += line.chars().filter(|&c| c == '{').count() as i32;
-            brace_count -= line.chars().filter(|&c| c == '}').count() as i32;
+        let scope_end = match brace_scope_end(lines, candidate) {
+            Some(brace_end) => brace_end,
+            None => expand_by_indentation(lines, candidate, end).1,
+        };
 
-            if brace_count <= 0 {
-                new_end = i + 1;
-                break;
-            }
+        if scope_end >= end {
+            new_start = candidate;
+            new_end = scope_end;
+            in_scope = true;
+            break;
         }
     }
 
@@ -201,6 +192,31 @@ fn expand_to_scope(lines: &[&str], start: usize, end: usize) -> (usize, usize) {
     }
 
     (new_start, new_end.min(lines.len()))
+}
+
+/// End of the brace scope opened at `scope_start`, exclusive. `None` when no
+/// brace ever opens — an indentation-based scope, or a line that only looked
+/// like a scope start.
+fn brace_scope_end(lines: &[&str], scope_start: usize) -> Option<usize> {
+    let mut brace_count: i32 = 0;
+    let mut opened = false;
+
+    for (i, line) in lines.iter().enumerate().skip(scope_start) {
+        brace_count += line.chars().filter(|&c| c == '{').count() as i32;
+        brace_count -= line.chars().filter(|&c| c == '}').count() as i32;
+
+        if brace_count > 0 {
+            opened = true;
+        } else if opened {
+            return Some(i + 1);
+        }
+    }
+
+    if opened {
+        Some(lines.len())
+    } else {
+        None
+    }
 }
 
 /// Check if a line starts a scope (function, class, etc.)
@@ -227,7 +243,14 @@ fn is_scope_start(line: &str) -> bool {
         "namespace ",
     ];
 
-    patterns.iter().any(|p| trimmed.starts_with(p))
+    if !patterns.iter().any(|p| trimmed.starts_with(p)) {
+        return false;
+    }
+
+    // A keyword alone names a type as easily as it opens a scope:
+    // `struct my_holder items[2];` is a local variable, not a definition.
+    // The body has to start somewhere — a brace here, or a `:` for Python.
+    trimmed.contains('{') || trimmed.ends_with(':')
 }
 
 /// Expand scope based on indentation (for Python, YAML, etc.)
@@ -391,7 +414,13 @@ fn main() {
 
     #[test]
     fn scope_expansion_starts_brace_scan_at_scope_start() {
-        let source = ["fn main() {", "    if true {", "        work();", "    }", "}"];
+        let source = [
+            "fn main() {",
+            "    if true {",
+            "        work();",
+            "    }",
+            "}",
+        ];
 
         assert_eq!(expand_to_scope(&source, 2, 3), (0, 5));
     }
@@ -425,6 +454,38 @@ fn main() {
         );
         assert!(excerpts[0].start_line <= requested);
         assert!(requested <= excerpts[0].end_line);
+    }
+
+    #[test]
+    fn local_declaration_is_not_a_scope_start() {
+        assert!(!is_scope_start("\tstruct my_holder items[2];"));
+        assert!(!is_scope_start(
+            "\tstruct my_queue *queue = get_queue(dev, id);"
+        ));
+        assert!(!is_scope_start("\tenum my_flags flags;"));
+
+        assert!(is_scope_start("struct my_session {"));
+        assert!(is_scope_start("fn main() {"));
+        assert!(is_scope_start("def handler(self):"));
+    }
+
+    /// A scope that closes before the requested range is a sibling: the scan
+    /// has to keep going back for the one that encloses it.
+    #[test]
+    fn scope_expansion_skips_a_sibling_scope() {
+        let source = [
+            "impl Engine {",
+            "    fn first() {",
+            "        work();",
+            "    }",
+            "",
+            "    fn second() {",
+            "        target();",
+            "    }",
+            "}",
+        ];
+
+        assert_eq!(expand_to_scope(&source, 6, 7), (5, 8));
     }
 
     #[test]
