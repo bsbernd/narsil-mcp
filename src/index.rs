@@ -4031,6 +4031,31 @@ impl CodeIntelEngine {
             }
         }
 
+        // A term on consecutive lines yields one excerpt per line, each with the
+        // same context lines around it — the same region of the file, several
+        // times over. Keep the best-scoring excerpt of each region.
+        results.sort_by(|a, b| {
+            a.1.file_path
+                .cmp(&b.1.file_path)
+                .then(a.1.start_line.cmp(&b.1.start_line))
+        });
+        let mut regions: Vec<(String, CodeExcerpt)> = Vec::new();
+        for (repo_name, excerpt) in results {
+            match regions.last_mut() {
+                Some((prev_repo, prev))
+                    if *prev_repo == repo_name
+                        && prev.file_path == excerpt.file_path
+                        && excerpt.start_line <= prev.end_line =>
+                {
+                    if excerpt.relevance_score > prev.relevance_score {
+                        *prev = excerpt;
+                    }
+                }
+                _ => regions.push((repo_name, excerpt)),
+            }
+        }
+        let mut results = regions;
+
         // Sort by relevance and take top results
         results.sort_by(|a, b| {
             b.1.relevance_score
@@ -14200,6 +14225,40 @@ similarity index 90%
         assert_eq!(
             engine.resolve_repo("").unwrap(),
             canonical_repo_key(&repo).unwrap()
+        );
+    }
+
+    /// Regression: a term on two consecutive lines came back as two results,
+    /// one per line, each carrying the same context lines around it.
+    #[tokio::test]
+    async fn search_code_returns_a_region_once() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_file(
+            &repo.join("optparse.c"),
+            "static void usage(void)\n\
+             {\n\
+             \tprintf(\" --verbose\\t print more\\n\"\n\
+             \t       \" --verbose=all  print everything\\n\");\n\
+             \texit(1);\n\
+             }\n",
+        );
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.reindex_all().await.unwrap();
+
+        let out = engine
+            .search_code(Some(repo.to_str().unwrap()), "--verbose", None, 10, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.matches("`optparse.c`").count(),
+            1,
+            "consecutive matches are one region: {out}"
         );
     }
 
