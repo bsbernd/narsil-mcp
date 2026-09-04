@@ -6597,12 +6597,40 @@ impl CodeIntelEngine {
         file: &str,
         line: usize,
     ) -> Option<&'a Symbol> {
-        symbols.iter().find(|sym| {
-            matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
-                && sym.file_path == file
-                && sym.start_line <= line
-                && line <= sym.end_line
-        })
+        // Tightest range wins. A prototype recorded with an overlong range
+        // otherwise claims lines that belong to the function below it.
+        symbols
+            .iter()
+            .filter(|sym| {
+                matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                    && sym.file_path == file
+                    && sym.start_line <= line
+                    && line <= sym.end_line
+            })
+            .min_by_key(|sym| sym.end_line.saturating_sub(sym.start_line))
+    }
+
+    /// Whether an LSP reference at `file:line` is a call rather than the
+    /// definition or a declaration of `function`.
+    ///
+    /// `textDocument/references` reports both, and ccls additionally reports a
+    /// reference under a header that includes the translation unit, keeping the
+    /// line number of the file the reference really came from — so the named
+    /// line does not contain the function at all.
+    fn reference_is_a_call(
+        symbols: &[Symbol],
+        function: &str,
+        file: &str,
+        line: usize,
+        source_line: &str,
+    ) -> bool {
+        if !source_line.contains(function) {
+            return false;
+        }
+
+        !symbols
+            .iter()
+            .any(|sym| sym.name == function && sym.file_path == file && sym.start_line == line)
     }
 
     /// Get callers of a function.
@@ -6715,8 +6743,15 @@ impl CodeIntelEngine {
                                         .copied()
                                         .unwrap_or(SourceSet::CLANGD);
 
-                                    for (rel_path, ref_line, _content) in &lsp_refs {
+                                    for (rel_path, ref_line, content) in &lsp_refs {
                                         let key = (rel_path.clone(), *ref_line);
+                                        if !ast_keys.contains(&key)
+                                            && !Self::reference_is_a_call(
+                                                &sym_slice, function, rel_path, *ref_line, content,
+                                            )
+                                        {
+                                            continue;
+                                        }
                                         if ast_keys.contains(&key) {
                                             // Both sources agree — record the LSP confirmer.
                                             for edge in callers.iter_mut() {
@@ -14379,6 +14414,84 @@ similarity index 90%
             confirmed_by: source,
             line_conflicts: Vec::new(),
         }
+    }
+
+    /// A C function symbol: a definition in a `.c` file, or the prototype for
+    /// it in a header.
+    fn cxx_symbol(name: &str, file: &str, start_line: usize, end_line: usize) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            file_path: file.to_string(),
+            start_line,
+            end_line,
+            signature: None,
+            qualified_name: None,
+            doc_comment: None,
+            confirmed_by: SourceSet::CCLS,
+            line_conflicts: Vec::new(),
+        }
+    }
+
+    /// Regression: a caller list held the queried function itself, at its own
+    /// definition line, and two entries naming a header at the line numbers of
+    /// the `.c` file that includes it.
+    #[test]
+    fn only_a_call_site_counts_as_a_caller() {
+        let symbols = vec![
+            cxx_symbol("spawn_helper", "src/helper.c", 101, 140),
+            cxx_symbol("obtain_fd", "src/helper.c", 660, 710),
+            cxx_symbol("spawn_helper", "src/helper_i.h", 246, 246),
+        ];
+
+        // A real call site.
+        assert!(CodeIntelEngine::reference_is_a_call(
+            &symbols,
+            "spawn_helper",
+            "src/helper.c",
+            695,
+            "res = spawn_helper(&fd, argv);"
+        ));
+
+        // The definition line of the function itself.
+        assert!(!CodeIntelEngine::reference_is_a_call(
+            &symbols,
+            "spawn_helper",
+            "src/helper.c",
+            101,
+            "static int spawn_helper(int *fd, char **argv)"
+        ));
+
+        // A prototype in a header.
+        assert!(!CodeIntelEngine::reference_is_a_call(
+            &symbols,
+            "spawn_helper",
+            "src/helper_i.h",
+            246,
+            "int spawn_helper(int *fd, char **argv);"
+        ));
+
+        // ccls reporting the header path with the .c file's line number: the
+        // named line does not mention the function at all.
+        assert!(!CodeIntelEngine::reference_is_a_call(
+            &symbols,
+            "spawn_helper",
+            "src/helper_linux.h",
+            695,
+            "#define HELPER_LINUX_H"
+        ));
+    }
+
+    #[test]
+    fn enclosing_function_prefers_the_tightest_range() {
+        let symbols = vec![
+            cxx_symbol("session_stop", "include/api.h", 2420, 6000),
+            cxx_symbol("session_start", "include/api.h", 5300, 5320),
+        ];
+
+        let found = CodeIntelEngine::enclosing_function_at(&symbols, "include/api.h", 5310)
+            .expect("a symbol covers the line");
+        assert_eq!(found.name, "session_start");
     }
 
     #[test]
