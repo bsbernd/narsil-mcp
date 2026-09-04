@@ -520,7 +520,9 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Get list of modified files (working tree)
+    /// Get list of modified files (working tree). An unmerged path carries its
+    /// `git status --porcelain` code, since its content is a conflict rather
+    /// than a version of the file.
     pub fn modified_files(&self) -> Result<Vec<String>> {
         let output = Command::new("git")
             .args(["status", "--porcelain"])
@@ -532,7 +534,15 @@ impl GitRepo {
             .lines()
             .filter_map(|line| {
                 if line.len() > 3 {
-                    Some(line[3..].to_string())
+                    // An unmerged path has no one content to read; a caller
+                    // told only that the file changed cannot know that.
+                    let status = &line[..2];
+                    let path = &line[3..];
+                    Some(if is_unmerged_status(status) {
+                        format!("{} (unmerged, {})", path, status)
+                    } else {
+                        path.to_string()
+                    })
                 } else {
                     None
                 }
@@ -758,10 +768,26 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// The `git status --porcelain` two-letter codes for an unresolved merge:
+/// either side unmerged (`U`), both added, or both deleted.
+fn is_unmerged_status(status: &str) -> bool {
+    matches!(status, "DD" | "AA") || status.contains('U')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unmerged_status_codes_are_recognised() {
+        for unmerged in ["UU", "AA", "DD", "AU", "UA", "DU", "UD"] {
+            assert!(is_unmerged_status(unmerged), "{unmerged}");
+        }
+        for resolved in [" M", "M ", "??", "A ", "R ", "MM"] {
+            assert!(!is_unmerged_status(resolved), "{resolved}");
+        }
+    }
 
     /// Run a git command in `dir`, asserting success. gpg signing is disabled
     /// and identity is set via env so the test does not depend on global config.
