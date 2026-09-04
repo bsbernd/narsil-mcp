@@ -4123,6 +4123,24 @@ impl CodeIntelEngine {
         let start = start_line.unwrap_or(1).saturating_sub(1);
         let end = end_line.unwrap_or(lines.len()).min(lines.len());
 
+        // Both bounds index into `lines` below, so a range the file cannot
+        // satisfy has to be refused here; slicing it panics.
+        if let (Some(first), Some(last)) = (start_line, end_line) {
+            if first > last {
+                return Err(anyhow!(
+                    "start_line {first} is after end_line {last} in {path}"
+                ));
+            }
+        }
+        if start > 0 && start >= lines.len() {
+            return Err(anyhow!(
+                "start_line {} is past the end of {} ({} lines)",
+                start + 1,
+                path,
+                lines.len()
+            ));
+        }
+
         // Format under the response budget first: the header has to name the
         // range that survives, not the one that was asked for. Leave room for
         // the header, the fences and the continuation note.
@@ -14427,6 +14445,48 @@ similarity index 90%
             "body runs past the line the header names"
         );
         assert!(out.contains(&format!("start_line={}", last_line + 1)));
+    }
+
+    /// Regression: both bounds index into the line vector, so a range the file
+    /// cannot satisfy used to abort the whole tool call with a slice panic.
+    #[tokio::test]
+    async fn get_file_refuses_a_range_the_file_cannot_satisfy() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_file(&repo.join("short.c"), "one\ntwo\nthree\n");
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let repo = repo.to_str().unwrap();
+
+        let past_eof = engine
+            .get_file(repo, "short.c", Some(99000), Some(99010))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            past_eof.contains("past the end") && past_eof.contains("3 lines"),
+            "error must name the file length: {past_eof}"
+        );
+
+        let reversed = engine
+            .get_file(repo, "short.c", Some(3), Some(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reversed.contains("start_line 3 is after end_line 1"),
+            "error must name both bounds: {reversed}"
+        );
+
+        // The bounds a short file does satisfy still answer.
+        let clamped = engine
+            .get_file(repo, "short.c", Some(2), Some(99))
+            .await
+            .unwrap();
+        assert!(clamped.contains("Lines 2-3 of 3"), "{clamped}");
     }
 
     /// The lease is what a query consults to decide between answering and
