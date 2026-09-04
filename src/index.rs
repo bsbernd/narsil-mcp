@@ -4094,24 +4094,52 @@ impl CodeIntelEngine {
         let start = start_line.unwrap_or(1).saturating_sub(1);
         let end = end_line.unwrap_or(lines.len()).min(lines.len());
 
+        // Format under the response budget first: the header has to name the
+        // range that survives, not the one that was asked for. Leave room for
+        // the header, the fences and the continuation note.
+        let budget = response_budget::MAX_RESPONSE_BYTES.saturating_sub(1024);
+        let mut body = String::new();
+        let mut last_line = start;
+        for (i, line) in lines[start..end].iter().enumerate() {
+            let numbered = format!("{:4} │ {}\n", start + i + 1, line);
+            if body.len() + numbered.len() > budget {
+                break;
+            }
+            body.push_str(&numbered);
+            last_line = start + i + 1;
+        }
+        // One line longer than the whole budget still gets returned: an empty
+        // body under a "Lines 1-0" header would be the same lie in reverse.
+        if body.is_empty() && start < end {
+            body.push_str(&format!("{:4} │ {}\n", start + 1, lines[start]));
+            last_line = start + 1;
+        }
+
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", path));
         output.push_str(&format!(
             "Lines {}-{} of {}\n\n",
             start + 1,
-            end,
+            last_line,
             lines.len()
         ));
 
         output.push_str("```");
         output.push_str(get_language_id(path));
         output.push('\n');
-
-        for (i, line) in lines[start..end].iter().enumerate() {
-            output.push_str(&format!("{:4} │ {}\n", start + i + 1, line));
-        }
-
+        output.push_str(&body);
         output.push_str("```\n");
+
+        if last_line < end {
+            output.push_str(&format!(
+                "\n*Stopped at the {} KB response budget, {} lines short of the \
+                 requested line {}. Continue with `start_line={}`.*\n",
+                response_budget::MAX_RESPONSE_BYTES / 1024,
+                end - last_line,
+                end,
+                last_line + 1
+            ));
+        }
 
         Ok(output)
     }
@@ -14102,6 +14130,49 @@ similarity index 90%
             engine.resolve_repo("").unwrap(),
             canonical_repo_key(&repo).unwrap()
         );
+    }
+
+    /// Regression: a request for lines 1-5000 of a large file was answered
+    /// with a `Lines 1-5000` header over a body that stopped at line 1346 —
+    /// the budget was applied after the header had been written.
+    #[tokio::test]
+    async fn get_file_header_names_the_range_it_returns() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let long_file = (1..=5000)
+            .map(|n| format!("\tsome_call_number_{}(argument, argument, argument);", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&repo.join("big.c"), &long_file);
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let out = engine
+            .get_file(repo.to_str().unwrap(), "big.c", Some(1), Some(5000))
+            .await
+            .unwrap();
+
+        let header = out.lines().find(|l| l.starts_with("Lines ")).unwrap();
+        let last_line: usize = header
+            .trim_start_matches("Lines 1-")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        assert!(last_line < 5000, "budget must bite for this file: {header}");
+        assert!(
+            out.contains(&format!("some_call_number_{}(", last_line)),
+            "header names line {last_line}, which the body does not contain"
+        );
+        assert!(
+            !out.contains(&format!("some_call_number_{}(", last_line + 1)),
+            "body runs past the line the header names"
+        );
+        assert!(out.contains(&format!("start_line={}", last_line + 1)));
     }
 
     /// The lease is what a query consults to decide between answering and
