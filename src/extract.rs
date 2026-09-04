@@ -97,8 +97,21 @@ pub fn extract_excerpts(
             };
 
             // Limit to max lines
-            let (clamped_start, clamped_end) =
+            let (mut clamped_start, mut clamped_end) =
                 clamp_range(final_start, final_end, &matches, config.max_lines);
+
+            // Scope expansion is a heuristic and can settle on a scope that
+            // ends before the requested line. Losing the scope is a worse
+            // answer; losing the requested line is no answer at all.
+            let keeps_matches = matches
+                .iter()
+                .all(|&line| clamped_start < line && line <= clamped_end);
+            if !keeps_matches {
+                let (window_start, window_end) =
+                    clamp_range(start, end, &matches, config.max_lines);
+                clamped_start = window_start;
+                clamped_end = window_end;
+            }
 
             let content = format_excerpt(
                 &lines[clamped_start..clamped_end],
@@ -381,6 +394,37 @@ fn main() {
         let source = ["fn main() {", "    if true {", "        work();", "    }", "}"];
 
         assert_eq!(expand_to_scope(&source, 2, 3), (0, 5));
+    }
+
+    /// Regression: a request for one line was answered with a different line
+    /// two hundred lines above it — a local variable declaration that the
+    /// scope heuristic took for a scope start.
+    #[test]
+    fn excerpt_keeps_the_requested_line_when_scope_expansion_misfires() {
+        let mut source = String::from("struct my_holder items[2];\n");
+        for filler in 0..40 {
+            source.push_str(&format!("\tcall_{}();\n", filler));
+        }
+        source.push_str("\tthe_requested_line();\n");
+
+        let requested = source.lines().count();
+        let config = ExcerptConfig {
+            context_before: 20,
+            context_after: 30,
+            max_lines: 100,
+            ..Default::default()
+        };
+
+        let excerpts = extract_excerpts(&source, &[requested], &config);
+        assert_eq!(excerpts.len(), 1);
+        assert!(
+            excerpts[0].content.contains("the_requested_line"),
+            "requested line {} missing from excerpt: {}",
+            requested,
+            excerpts[0].content
+        );
+        assert!(excerpts[0].start_line <= requested);
+        assert!(requested <= excerpts[0].end_line);
     }
 
     #[test]
