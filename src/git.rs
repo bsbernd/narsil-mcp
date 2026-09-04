@@ -489,6 +489,8 @@ impl GitRepo {
         let mut args = vec![
             "log".to_string(),
             "--format=%H|%h|%an|%ae|%at|%s".to_string(),
+            // parse_log_output sums these into the per-commit change counts.
+            "--numstat".to_string(),
             format!("-{}", max_commits),
             format!("-S{}", function_name),
             "--".to_string(),
@@ -997,6 +999,9 @@ mod tests {
         let history = repo.symbol_history(&paths, "shared", 10).unwrap();
         assert_eq!(history.len(), 1, "history was: {:?}", history);
         assert_eq!(history[0].subject, "add shared");
+        // Regression: every commit came back as "+0 -0 across 0 file(s)".
+        assert!(history[0].files_changed > 0, "{:?}", history[0]);
+        assert!(history[0].insertions > 0, "{:?}", history[0]);
     }
 
     #[test]
