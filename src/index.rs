@@ -7978,10 +7978,48 @@ impl CodeIntelEngine {
         if exclude_tests {
             results.retain(|r| !is_test_file(&r.file_path));
         }
-        results.truncate(max_results);
 
         // Format results
         let repo_paths = self.registered_repo_paths();
+
+        // An identifier is indexed as its parts as well as whole, so a file
+        // using the common parts matches a query for a name it never mentions.
+        // A result has to carry a term as the caller typed it.
+        let typed: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .filter(|term| term.len() >= 2)
+            .collect();
+        let carries_typed_term = |result: &crate::hybrid_search::HybridResult| -> bool {
+            if result
+                .matched_terms
+                .iter()
+                .any(|term| typed.iter().any(|t| term.eq_ignore_ascii_case(t)))
+            {
+                return true;
+            }
+            repo_paths
+                .iter()
+                .find_map(|rp| self.file_cache.get(&rp.join(&result.file_path)))
+                .is_some_and(|entry| {
+                    let content = entry.value().to_lowercase();
+                    typed.iter().any(|term| content.contains(term.as_str()))
+                })
+        };
+
+        let exact: Vec<_> = results
+            .iter()
+            .filter(|r| carries_typed_term(r))
+            .cloned()
+            .collect();
+        // Nothing carried the terms as typed: the partial matches are all there
+        // is, so return them rather than an empty answer, and say which it is.
+        let partial_only = exact.is_empty() && !results.is_empty();
+        if !exact.is_empty() {
+            results = exact;
+        }
+        results.truncate(max_results);
+
         let mut output = String::new();
         output.push_str(&format!("# Hybrid Search Results for: `{}`\n\n", query));
         output.push_str(&format!("**Mode**: {}\n", mode));
@@ -7989,6 +8027,12 @@ impl CodeIntelEngine {
             output.push_str(&format!("**Repository**: {}\n", r));
         }
         output.push_str(&format!("**Results**: {}\n\n", results.len()));
+        if partial_only {
+            output.push_str(
+                "*No result contains the query terms as written; these match parts of \
+                 them only.*\n\n",
+            );
+        }
 
         for (i, result) in results.iter().enumerate() {
             // A file document covers the whole file and carries no content of
@@ -14200,6 +14244,78 @@ similarity index 90%
         assert_eq!(
             engine.resolve_repo("").unwrap(),
             canonical_repo_key(&repo).unwrap()
+        );
+    }
+
+    /// Regression: a search naming two identifiers answered with one file that
+    /// had them and four that had neither — the tokenizer indexes an
+    /// identifier's parts, so a file using the common parts matched.
+    #[tokio::test]
+    async fn hybrid_search_keeps_only_results_carrying_a_typed_term() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_file(
+            &repo.join("target.c"),
+            "void widget_stop_engine(struct widget *w)\n{\n\tw->running = 0;\n}\n",
+        );
+        // Uses every part of the name, and never the name.
+        let noise = "\tstop(engine);\n\twidget(engine);\n\tstop(widget);\n".repeat(40);
+        write_file(&repo.join("noise.c"), &noise);
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.reindex_all().await.unwrap();
+
+        let out = engine
+            .hybrid_search(
+                "widget_stop_engine",
+                Some(repo.to_str().unwrap()),
+                5,
+                "hybrid",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.contains("target.c"), "the file with the name: {out}");
+        assert!(
+            !out.contains("noise.c"),
+            "a file with only the name's parts must not place: {out}"
+        );
+    }
+
+    /// When nothing carries the name, the partial matches are the whole answer:
+    /// returning them beats an empty result, as long as the answer says so.
+    #[tokio::test]
+    async fn hybrid_search_falls_back_to_partial_matches() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let noise = "\tstop(engine);\n\twidget(engine);\n\tstop(widget);\n".repeat(40);
+        write_file(&repo.join("noise.c"), &noise);
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.reindex_all().await.unwrap();
+
+        let out = engine
+            .hybrid_search(
+                "widget_stop_engine",
+                Some(repo.to_str().unwrap()),
+                5,
+                "hybrid",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.contains("noise.c"), "partial matches are kept: {out}");
+        assert!(
+            out.contains("match parts of them only"),
+            "the answer has to say they are partial: {out}"
         );
     }
 
