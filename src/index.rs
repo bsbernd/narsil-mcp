@@ -6318,12 +6318,25 @@ impl CodeIntelEngine {
         };
         let repo_name = repo_key.as_deref();
 
+        // A file that has been re-indexed is in the search index once per
+        // generation, so the same location comes back several times. Drop the
+        // repeats before the cap — results are score-ordered, so the first copy
+        // of a location is its best-scoring one.
+        let mut seen_locations = std::collections::HashSet::new();
         let results: Vec<_> = self
             .search_index
-            .search(query, max_results * 2) // Get more results to filter
+            .search(query, max_results * 8) // Enough to survive filtering and dedup
             .into_iter()
             .filter(|r| repo_name.is_none_or(|rn| r.document.repo == rn))
             .filter(|r| !exclude_tests || !is_test_file(&r.document.file_path))
+            .filter(|r| {
+                seen_locations.insert((
+                    r.document.repo.clone(),
+                    r.document.file_path.clone(),
+                    r.document.start_line,
+                    r.document.end_line,
+                ))
+            })
             .take(max_results)
             .collect();
 
@@ -6348,10 +6361,19 @@ impl CodeIntelEngine {
                 result.document.file_path,
                 result.score
             ));
-            output.push_str(&format!(
-                "Lines {}-{}\n\n",
-                result.document.start_line, result.document.end_line
-            ));
+            // A whole-file document's range is the file, not the excerpt; the
+            // snippet below carries the lines that actually matched.
+            if result.document.doc_type == crate::search::DocType::File {
+                output.push_str(&format!(
+                    "Whole file, {} lines; matched lines below\n\n",
+                    result.document.end_line
+                ));
+            } else {
+                output.push_str(&format!(
+                    "Lines {}-{}\n\n",
+                    result.document.start_line, result.document.end_line
+                ));
+            }
             // snippet is empty for the persistent index (content is None there);
             // regenerate from file_cache — O(num_repos) lookup per top-N result
             let snippet = if result.snippet.is_empty() {
@@ -14178,6 +14200,39 @@ similarity index 90%
         assert_eq!(
             engine.resolve_repo("").unwrap(),
             canonical_repo_key(&repo).unwrap()
+        );
+    }
+
+    /// Regression: six results were the same location, one per index
+    /// generation the file had been through.
+    #[tokio::test]
+    async fn semantic_search_returns_a_location_once() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_file(&repo.join("sample.c"), "int validate_tag(void);\n");
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        // Re-index a file without removing what the last generation left.
+        for _ in 0..6 {
+            engine
+                .search_index
+                .index_file(&repo_key, "sample.c", "int validate_tag(void);\n");
+        }
+
+        let out = engine
+            .semantic_search(Some(&repo_key), "validate tag", 6, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.matches("sample.c (score").count(),
+            1,
+            "one location, one result: {out}"
         );
     }
 
