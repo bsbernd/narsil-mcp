@@ -12161,7 +12161,7 @@ const COMPILE_COMMANDS_MIN_CXX_SOURCES: usize = 5;
 const COMPILE_COMMANDS_DEFAULT_MIN_COVERAGE_PCT: usize = 25;
 
 fn is_c_source_ext(ext: &str) -> bool {
-    matches!(ext, "c" | "cpp" | "cc" | "cxx" | "S" | "s")
+    matches!(ext, "c" | "cpp" | "cc" | "cxx" | "c++" | "C" | "S" | "s")
 }
 
 /// True when `repo_path`'s GTAGS database is older than the newest indexed
@@ -13737,7 +13737,8 @@ fn get_language_from_path(path: &str) -> String {
         Some("go") => "go",
         Some("java") => "java",
         Some("c") | Some("h") => "c",
-        Some("cpp") | Some("hpp") | Some("cc") | Some("cxx") => "cpp",
+        Some("cpp") | Some("hpp") | Some("cc") | Some("cxx") | Some("hxx") | Some("hh")
+        | Some("c++") | Some("h++") | Some("C") | Some("H") => "cpp",
         Some("cs") => "csharp",
         _ => "unknown",
     }

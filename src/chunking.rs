@@ -851,7 +851,7 @@ impl AstChunker {
             "java" => "java",
             "cs" => "c_sharp",
             "c" | "h" => "c",
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+            "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "hh" | "h++" | "H" => "cpp",
             _ => "unknown",
         }
         .to_string()
@@ -1214,6 +1214,8 @@ fn d() {}
         assert_eq!(chunker.detect_language("test.cs"), "c_sharp");
         assert_eq!(chunker.detect_language("test.c"), "c");
         assert_eq!(chunker.detect_language("test.cpp"), "cpp");
+        // g++ compiles .C as C++ and .c as C; the case carries the meaning.
+        assert_eq!(chunker.detect_language("test.C"), "cpp");
         assert_eq!(chunker.detect_language("test.unknown"), "unknown");
     }
 

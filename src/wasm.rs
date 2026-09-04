@@ -394,7 +394,7 @@ impl WasmCodeIntel {
     pub fn supported_extensions(&self) -> String {
         let extensions = vec![
             "rs", "py", "pyi", "js", "jsx", "mjs", "ts", "tsx", "go", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "hxx", "hh", "java", "cs",
+            "c++", "C", "hpp", "hxx", "hh", "h++", "H", "java", "cs",
         ];
 
         serde_json::to_string(&extensions).unwrap_or_else(|_| "[]".to_string())

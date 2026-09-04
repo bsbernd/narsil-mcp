@@ -174,7 +174,9 @@ impl LanguageParser {
             LanguageConfig {
                 name: "cpp".to_string(),
                 language: tree_sitter_cpp::LANGUAGE.into(),
-                extensions: vec!["cpp", "cc", "cxx", "hpp", "hxx", "hh"],
+                extensions: vec![
+                    "cpp", "cc", "cxx", "c++", "C", "hpp", "hxx", "hh", "h++", "H",
+                ],
                 symbol_query: r#"
                     (function_definition
                       declarator: [
@@ -677,6 +679,28 @@ fn parse_symbol_kind(capture_name: &str) -> SymbolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a repository whose whole program lived in one `.C` file
+    /// indexed no C++ at all — the file was rejected as an unsupported type.
+    #[test]
+    fn uppercase_c_is_parsed_as_cpp() {
+        let parser = LanguageParser::new().unwrap();
+        let content = "int connect_to_server(int port) { return port; }\n";
+
+        for path in ["widget.C", "widget.c++"] {
+            let parsed = parser.parse_file(Path::new(path), content).unwrap();
+            assert_eq!(
+                parsed.language, "cpp",
+                "{path} parsed as {:?}",
+                parsed.language
+            );
+            let names: Vec<_> = parsed.symbols.iter().map(|s| &s.name).collect();
+            assert!(
+                names.contains(&&"connect_to_server".to_string()),
+                "{path}: {names:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_rust() {
