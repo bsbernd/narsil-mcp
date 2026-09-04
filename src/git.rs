@@ -427,8 +427,15 @@ impl GitRepo {
             Self::validate_input(path, "file_path")?;
         }
 
+        // The message carries why the change was made, which no other tool
+        // returns; the diff alone sends the caller to `git show` for it.
         let show = |rev: &str| {
-            let mut args = vec!["show", "--format=", "--patch", rev];
+            let mut args = vec![
+                "show",
+                "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
+                "--patch",
+                rev,
+            ];
             if let Some(path) = file_path {
                 args.push("--");
                 args.push(path);
@@ -966,6 +973,34 @@ mod tests {
         let repo = GitRepo::new(p).unwrap();
         let diff = repo.commit_diff("my-patch", None).unwrap();
         assert!(diff.contains("a_patched"), "diff was: {}", diff);
+    }
+
+    /// Regression: the diff came back with `--format=`, so the message that
+    /// says why the commit was made never reached the caller.
+    #[test]
+    fn commit_diff_carries_the_commit_message() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.c"), "int a;").unwrap();
+        run_git(p, &["add", "a.c"]);
+        run_git(p, &["commit", "-q", "-m", "base"]);
+        std::fs::write(p.join("a.c"), "int a_patched;").unwrap();
+        run_git(
+            p,
+            &[
+                "commit",
+                "-qa",
+                "-m",
+                "pause the widget\n\nThe reason this is safe lives in the body.",
+            ],
+        );
+
+        let repo = GitRepo::new(p).unwrap();
+        let diff = repo.commit_diff("HEAD", None).unwrap();
+        assert!(diff.contains("pause the widget"), "{diff}");
+        assert!(diff.contains("The reason this is safe"), "{diff}");
+        assert!(diff.contains("a_patched"), "{diff}");
     }
 
     /// A genuinely unknown name must still fail, and say so as git does.
