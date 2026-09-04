@@ -334,15 +334,12 @@ impl LspManager {
         Ok(process)
     }
 
-    /// Parse one LSP message body. The serde_json recursion limit (128) is
-    /// disabled: clangd/ccls return deeply nested documentSymbol trees for
-    /// large files, and the input is trusted backend output, not adversarial.
+    /// Parse one LSP message body. serde_json's 128-level recursion limit stays
+    /// on: ccls answers documentSymbol on a generated vmlinux.h with a
+    /// ~150000-deep degenerate chain, and deserializing that overflows the
+    /// worker stack and aborts the process. Real sources nest ~13 deep.
     fn parse_lsp_message(buffer: &[u8]) -> Result<LspMessage> {
-        let mut de = serde_json::Deserializer::from_slice(buffer);
-        de.disable_recursion_limit();
-        let message = LspMessage::deserialize(&mut de)?;
-        de.end()?;
-        Ok(message)
+        Ok(serde_json::from_slice(buffer)?)
     }
 
     /// Handle responses from LSP server
@@ -1527,6 +1524,31 @@ fn marked_string_to_markdown(marked: &MarkedString) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A degenerate documentSymbol chain must come back as a parse error, not
+    /// blow the worker stack.
+    #[test]
+    fn test_parse_lsp_message_rejects_deep_nesting() {
+        let depth = 150_000;
+        let mut body = String::from(r#"{"jsonrpc":"2.0","id":1,"result":"#);
+        body.push_str(&"[".repeat(depth));
+        body.push_str(&"]".repeat(depth));
+        body.push('}');
+
+        assert!(LspManager::parse_lsp_message(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_parse_lsp_message_accepts_realistic_nesting() {
+        let depth = 20;
+        let mut body = String::from(r#"{"jsonrpc":"2.0","id":7,"result":"#);
+        body.push_str(&"[".repeat(depth));
+        body.push_str(&"]".repeat(depth));
+        body.push('}');
+
+        let message = LspManager::parse_lsp_message(body.as_bytes()).expect("parse");
+        assert_eq!(message.id, Some(7));
+    }
 
     #[test]
     fn test_lsp_config_default() {
