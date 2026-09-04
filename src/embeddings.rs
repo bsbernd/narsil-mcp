@@ -440,6 +440,12 @@ impl EmbeddingEngine {
     }
 
     /// Find code similar to a specific document
+    /// Whether `doc_id` was ever embedded. An unembedded symbol and one with no
+    /// resemblance to anything both search to an empty result.
+    pub fn has_document(&self, doc_id: &str) -> bool {
+        self.store.get(doc_id).is_some()
+    }
+
     pub fn find_similar_to_doc(&self, doc_id: &str, max_results: usize) -> Vec<SimilarityResult> {
         if let Some(doc) = self.store.get(doc_id) {
             self.store.find_similar(&doc.embedding, max_results)

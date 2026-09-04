@@ -6480,6 +6480,20 @@ impl CodeIntelEngine {
         // stores it under (file_path is repo-relative, so two repos can collide).
         let symbol_id = format!("{}::{}::{}", repo, symbol.file_path, symbol.name);
 
+        // A symbol whose signature the parser did not capture is never
+        // embedded, and searching for it looks exactly like a symbol nothing
+        // resembles. Say which of the two this is.
+        if !self.embedding_engine.has_document(&symbol_id) {
+            return Ok(format!(
+                "# Code Similar to Symbol: `{}`\n\n\
+                 Reference: `{}:{}` ({:?})\n\n\
+                 `{}` is not in the similarity index — no signature was captured \
+                 for it at index time, so nothing was embedded to compare against. \
+                 Use find_similar_code with a snippet from the function instead.\n",
+                symbol_name, symbol.file_path, symbol.start_line, symbol.kind, symbol_name
+            ));
+        }
+
         // Find similar code to this symbol, scoped to the same repo -- the
         // embedding store is shared across every indexed repo.
         let results: Vec<_> = self

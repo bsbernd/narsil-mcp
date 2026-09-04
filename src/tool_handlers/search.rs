@@ -118,7 +118,7 @@ impl ToolHandler for FindSimilarCodeHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo");
-        let query = args.get_str("query").unwrap_or("");
+        let query = super::require_arg(&args, "query", "find_similar_code")?;
         let max_results = args.get_u64_or("max_results", 10) as usize;
         let exclude_tests = args.get_bool("exclude_tests");
         engine
