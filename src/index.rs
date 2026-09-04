@@ -28,7 +28,7 @@ use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
 use crate::remote::RemoteRepoManager;
 use crate::response_budget;
-use crate::search::{build_file_doc, generate_snippet, ConcurrentSearchIndex, SearchDocument};
+use crate::search::{build_file_doc, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
 use crate::symbols::{SourceLine, SourceSet, Symbol, SymbolKind};
 use crate::type_inference::{TypeError, TypeInferencer};
@@ -6386,30 +6386,27 @@ impl CodeIntelEngine {
                 result.document.file_path,
                 result.score
             ));
-            // A whole-file document's range is the file, not the excerpt; the
-            // snippet below carries the lines that actually matched.
-            if result.document.doc_type == crate::search::DocType::File {
-                output.push_str(&format!(
-                    "Whole file, {} lines; matched lines below\n\n",
-                    result.document.end_line
-                ));
-            } else {
-                output.push_str(&format!(
-                    "Lines {}-{}\n\n",
-                    result.document.start_line, result.document.end_line
-                ));
-            }
+            // A whole-file document covers the file; the caller needs the lines
+            // that matched, which is the window the snippet is taken from.
             // snippet is empty for the persistent index (content is None there);
             // regenerate from file_cache — O(num_repos) lookup per top-N result
-            let snippet = if result.snippet.is_empty() {
-                repo_paths
-                    .iter()
-                    .find_map(|rp| {
-                        self.file_cache
-                            .get(&rp.join(&result.document.file_path))
-                            .map(|entry| generate_snippet(entry.value(), &result.matched_terms))
+            let regenerated = repo_paths.iter().find_map(|rp| {
+                self.file_cache
+                    .get(&rp.join(&result.document.file_path))
+                    .map(|entry| {
+                        crate::search::snippet_with_range(entry.value(), &result.matched_terms)
                     })
-                    .unwrap_or_default()
+            });
+
+            let whole_file = result.document.doc_type == crate::search::DocType::File;
+            let (start_line, end_line) = match (&regenerated, whole_file) {
+                (Some((start, end, _)), true) => (*start, *end),
+                _ => (result.document.start_line, result.document.end_line),
+            };
+            output.push_str(&format!("Lines {}-{}\n\n", start_line, end_line));
+
+            let snippet = if result.snippet.is_empty() {
+                regenerated.map(|(_, _, text)| text).unwrap_or_default()
             } else {
                 result.snippet.clone()
             };

@@ -430,6 +430,16 @@ pub struct IndexStats {
 /// Generate a snippet from raw content, highlighting matched terms.
 /// Returns a 5-line window centred on the line with the most matches.
 pub(crate) fn generate_snippet(content: &str, matched_terms: &[String]) -> String {
+    snippet_with_range(content, matched_terms).2
+}
+
+/// The same window as [`generate_snippet`], with the 1-based line range it was
+/// taken from. A whole-file document otherwise reports the file's own range,
+/// which tells the caller nothing about where the match is.
+pub(crate) fn snippet_with_range(
+    content: &str,
+    matched_terms: &[String],
+) -> (usize, usize, String) {
     let lines: Vec<&str> = content.lines().collect();
     let mut best_line_idx = 0;
     let mut best_score = 0;
@@ -449,12 +459,14 @@ pub(crate) fn generate_snippet(content: &str, matched_terms: &[String]) -> Strin
     let start = best_line_idx.saturating_sub(2);
     let end = (best_line_idx + 3).min(lines.len());
 
-    lines[start..end]
+    let text = lines[start..end]
         .iter()
         .enumerate()
         .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    (start + 1, end, text)
 }
 
 /// Code-aware tokenization
