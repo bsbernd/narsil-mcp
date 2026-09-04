@@ -25,6 +25,10 @@ pub struct HybridSearchConfig {
     pub function_boost: f64,
     /// Number of candidates to fetch from each index before fusion
     pub candidate_multiplier: usize,
+    /// Cosine similarity a TF-IDF candidate must reach to enter the fusion.
+    /// Rank fusion scores by position, so without a floor the best of a set of
+    /// near-zero similarities is fused as though it were a strong match.
+    pub min_tfidf_similarity: f32,
 }
 
 /// Chunks from one file the TF-IDF side of RRF fusion may contribute.
@@ -39,6 +43,7 @@ impl Default for HybridSearchConfig {
             exact_match_boost: 2.0,
             function_boost: 1.5,
             candidate_multiplier: 3,
+            min_tfidf_similarity: 0.05,
         }
     }
 }
@@ -91,6 +96,9 @@ pub struct HybridSearchEngine {
     tfidf_engine: Arc<EmbeddingEngine>,
     /// Configuration
     config: HybridSearchConfig,
+    /// Repository the results are restricted to. The indexes are shared across
+    /// every indexed repo, so a query naming one must filter them.
+    repo_scope: Option<String>,
 }
 
 impl HybridSearchEngine {
@@ -100,6 +108,7 @@ impl HybridSearchEngine {
             bm25_index,
             tfidf_engine,
             config: HybridSearchConfig::default(),
+            repo_scope: None,
         }
     }
 
@@ -113,6 +122,7 @@ impl HybridSearchEngine {
             bm25_index,
             tfidf_engine,
             config,
+            repo_scope: None,
         }
     }
 
@@ -123,17 +133,60 @@ impl HybridSearchEngine {
 
         // Run BM25 and TF-IDF searches in parallel using rayon::join
         let (bm25_results, tfidf_results) = rayon::join(
-            || self.bm25_index.search(query, candidate_limit),
-            || self.tfidf_engine.find_similar_code(query, candidate_limit),
+            || self.bm25_candidates(query, candidate_limit),
+            || self.tfidf_candidates(query, candidate_limit),
         );
 
         // Combine using RRF
         self.reciprocal_rank_fusion(bm25_results, tfidf_results, query, limit)
     }
 
+    /// Restrict results to one repository. The shared indexes hold every
+    /// indexed repo's documents.
+    pub fn scoped_to(mut self, repo: Option<String>) -> Self {
+        self.repo_scope = repo;
+        self
+    }
+
+    /// BM25 hits for `query`, restricted to the scoped repo. A filtered search
+    /// asks for more candidates so the caller's limit can still be filled.
+    fn bm25_candidates(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+        let fetch = if self.repo_scope.is_some() {
+            limit * self.config.candidate_multiplier
+        } else {
+            limit
+        };
+        let mut results = self.bm25_index.search(query, fetch);
+        if let Some(ref repo) = self.repo_scope {
+            results.retain(|r| r.document.repo == *repo);
+        }
+        results.truncate(limit);
+        results
+    }
+
+    /// TF-IDF hits for `query`, restricted to the scoped repo and to candidates
+    /// that clear the similarity floor.
+    fn tfidf_candidates(&self, query: &str, limit: usize) -> Vec<SimilarityResult> {
+        let fetch = if self.repo_scope.is_some() {
+            limit * self.config.candidate_multiplier
+        } else {
+            limit
+        };
+        let mut results = self.tfidf_engine.find_similar_code(query, fetch);
+        results.retain(|r| {
+            r.similarity >= self.config.min_tfidf_similarity
+                && self
+                    .repo_scope
+                    .as_ref()
+                    .is_none_or(|repo| r.document.repo == *repo)
+        });
+        results.truncate(limit);
+        results
+    }
+
     /// Perform BM25-only search
     pub fn search_bm25(&self, query: &str, limit: usize) -> Vec<HybridResult> {
-        let results = self.bm25_index.search(query, limit);
+        let results = self.bm25_candidates(query, limit);
 
         results
             .into_iter()
@@ -156,7 +209,7 @@ impl HybridSearchEngine {
 
     /// Perform TF-IDF-only search
     pub fn search_tfidf(&self, query: &str, limit: usize) -> Vec<HybridResult> {
-        let results = self.tfidf_engine.find_similar_code(query, limit);
+        let results = self.tfidf_candidates(query, limit);
 
         results
             .into_iter()
@@ -520,6 +573,10 @@ mod tests {
         };
 
         engine.index_chunk(&chunk);
+        // index_chunk only accumulates document frequencies; without this the
+        // vocabulary is empty, every vector is zero, and each "similarity" is
+        // 0.0 -- which the floor now rejects, as it should.
+        engine.tfidf_engine.finalize();
 
         let results = engine.search_tfidf("baz qux function", 10);
         assert!(!results.is_empty());
@@ -733,6 +790,53 @@ mod tests {
         assert!(result.score > 0.0);
     }
 
+    /// Regression: rank fusion scores by position, so the best of a set of
+    /// near-zero similarities was fused as though it were a strong match. On a
+    /// large corpus the TF-IDF vocabulary holds only common terms, so that is
+    /// what every query naming a rare identifier got back.
+    #[test]
+    fn tfidf_candidates_below_the_floor_are_not_fused() {
+        let engine = create_test_engine();
+
+        let chunk = CodeChunk {
+            id: "widget.rs:0:handle".to_string(),
+            content: "fn handle_widget() { let value = 1; }".to_string(),
+            file_path: "widget.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            language: "rust".to_string(),
+            symbol_context: None,
+            chunk_type: ChunkType::Function,
+            doc_comment: None,
+            imports: Vec::new(),
+        };
+        engine.index_chunk(&chunk);
+        // Deliberately left unfinalized: every vector is zero, so every
+        // similarity is 0.0 and nothing may reach the fused list.
+        assert!(engine.search_tfidf("handle widget", 10).is_empty());
+    }
+
+    /// The indexes are shared by every indexed repo, so a query naming one must
+    /// not answer with another's files.
+    #[test]
+    fn search_is_restricted_to_the_scoped_repo() {
+        let bm25_index = Arc::new(ConcurrentSearchIndex::new());
+        let tfidf_engine = Arc::new(EmbeddingEngine::new(100));
+        bm25_index.index_file("/repo/one", "alpha.rs", "fn shared_name() {}");
+        bm25_index.index_file("/repo/two", "beta.rs", "fn shared_name() {}");
+
+        let engine = HybridSearchEngine::new(bm25_index, tfidf_engine)
+            .scoped_to(Some("/repo/one".to_string()));
+
+        let results = engine.search_bm25("shared_name", 10);
+        assert!(!results.is_empty(), "the scoped repo has a match");
+        assert!(
+            results.iter().all(|r| r.file_path == "alpha.rs"),
+            "leaked another repo: {:?}",
+            results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_custom_config_engine() {
         let bm25_index = Arc::new(ConcurrentSearchIndex::new());
@@ -745,6 +849,7 @@ mod tests {
             exact_match_boost: 1.5,
             function_boost: 1.2,
             candidate_multiplier: 2,
+            min_tfidf_similarity: 0.05,
         };
 
         let engine = HybridSearchEngine::with_config(bm25_index, tfidf_engine, config);

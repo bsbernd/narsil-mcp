@@ -1328,7 +1328,11 @@ impl CodeIntelEngine {
     /// matches a file the compile_commands.json coverage filter dropped from
     /// this repo's index, so the miss reads as "not indexed", not "no
     /// symbols" or "parser failure".
-    fn compile_commands_filter_note(&self, repo: &str, file_glob: Option<&glob::Pattern>) -> String {
+    fn compile_commands_filter_note(
+        &self,
+        repo: &str,
+        file_glob: Option<&glob::Pattern>,
+    ) -> String {
         let Some(glob) = file_glob else {
             return String::new();
         };
@@ -7948,92 +7952,66 @@ impl CodeIntelEngine {
         mode: &str,
         exclude_tests: Option<bool>,
     ) -> Result<String> {
-        use crate::chunking::AstChunker;
-        use crate::embeddings::EmbeddingEngine;
         use crate::hybrid_search::create_hybrid_engine;
-        use crate::search::ConcurrentSearchIndex;
         use crate::security_rules::is_test_file;
-        use std::sync::Arc;
 
         let exclude_tests = exclude_tests.unwrap_or(false); // Default false for search
 
-        // Create search engines
-        let bm25_index = Arc::new(ConcurrentSearchIndex::new());
-        let tfidf_engine = Arc::new(EmbeddingEngine::new(self.options.embedding_dim));
-        let hybrid_engine = create_hybrid_engine(bm25_index.clone(), tfidf_engine.clone());
-        let chunker = AstChunker::new();
-
-        // Index all files from relevant repos
-        for repo_entry in self.repos.iter() {
-            let repo_name = repo_entry.key();
-            let repo_meta = repo_entry.value();
-
-            // Filter by repo if specified
-            if let Some(target_repo) = repo {
-                if repo_name != target_repo && !repo_meta.path.ends_with(target_repo) {
-                    continue;
-                }
-            }
-
-            let repo_path = &repo_meta.path;
-
-            for file_entry in self.file_cache.iter() {
-                let file_path = file_entry.key();
-                if !file_path.starts_with(repo_path) {
-                    continue;
-                }
-                // Skip test files if exclude_tests is enabled
-                if exclude_tests && is_test_file(&file_path.to_string_lossy()) {
-                    continue;
-                }
-
-                let content = file_entry.value();
-                let file_path_str = file_path.to_string_lossy().to_string();
-
-                // Chunk the file (catch panics from malformed UTF-8 boundaries)
-                let chunks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    chunker.chunk_file(content, &file_path_str)
-                })) {
-                    Ok(chunks) => chunks,
-                    Err(_) => {
-                        tracing::warn!("Skipping file due to chunking error: {}", file_path_str);
-                        continue;
-                    }
-                };
-
-                // Index each chunk
-                for chunk in chunks {
-                    hybrid_engine.index_chunk(&chunk);
-                }
-            }
-        }
-
-        // Build the vocabulary from the snippets just indexed above: index_snippet
-        // only accumulates document frequencies, embed() reads a vocabulary that
-        // is empty until finalize() rebuilds it — skipping this leaves every
-        // TF-IDF vector zero, so the fusion below would rank on store order.
-        tfidf_engine.finalize();
+        // The engine's own indexes are built at index time and updated by the
+        // watch path. Building a private pair here re-chunked and re-tokenized
+        // the whole repository on every call, and left the TF-IDF vocabulary
+        // holding only that call's most frequent terms.
+        let repo_key = match repo {
+            Some(r) if !r.is_empty() => Some(self.resolve_repo(r)?),
+            _ => None,
+        };
+        let hybrid_engine =
+            create_hybrid_engine(self.search_index.clone(), self.embedding_engine.clone())
+                .scoped_to(repo_key.clone());
 
         // Perform search based on mode
-        let results = match mode {
-            "bm25" => hybrid_engine.search_bm25(query, max_results),
-            "tfidf" => hybrid_engine.search_tfidf(query, max_results),
-            _ => hybrid_engine.search(query, max_results),
+        let mut results = match mode {
+            "bm25" => hybrid_engine.search_bm25(query, max_results * 2),
+            "tfidf" => hybrid_engine.search_tfidf(query, max_results * 2),
+            _ => hybrid_engine.search(query, max_results * 2),
         };
+        if exclude_tests {
+            results.retain(|r| !is_test_file(&r.file_path));
+        }
+        results.truncate(max_results);
 
         // Format results
+        let repo_paths = self.registered_repo_paths();
         let mut output = String::new();
         output.push_str(&format!("# Hybrid Search Results for: `{}`\n\n", query));
         output.push_str(&format!("**Mode**: {}\n", mode));
+        if let Some(ref r) = repo_key {
+            output.push_str(&format!("**Repository**: {}\n", r));
+        }
         output.push_str(&format!("**Results**: {}\n\n", results.len()));
 
         for (i, result) in results.iter().enumerate() {
+            // A file document covers the whole file and carries no content of
+            // its own; both the lines to report and the snippet to show come
+            // from the matching window in the cached source.
+            let regenerated = repo_paths.iter().find_map(|rp| {
+                self.file_cache
+                    .get(&rp.join(&result.file_path))
+                    .map(|entry| {
+                        crate::search::snippet_with_range(entry.value(), &result.matched_terms)
+                    })
+            });
+            let whole_file = result.result_type == "File";
+            let (start_line, end_line, snippet) = match regenerated {
+                Some((start, end, text)) if whole_file || result.content.is_empty() => {
+                    (start, end, text)
+                }
+                _ => (result.start_line, result.end_line, result.content.clone()),
+            };
+
             output.push_str(&format!("## {}. {}\n", i + 1, result.file_path));
             output.push_str(&format!("- **Score**: {:.4}\n", result.score));
-            output.push_str(&format!(
-                "- **Lines**: {}-{}\n",
-                result.start_line, result.end_line
-            ));
+            output.push_str(&format!("- **Lines**: {}-{}\n", start_line, end_line));
 
             if let Some(bm25) = result.bm25_rank {
                 output.push_str(&format!("- **BM25 rank**: {}\n", bm25 + 1));
@@ -8051,9 +8029,9 @@ impl CodeIntelEngine {
 
             // Show snippet
             output.push_str("\n```\n");
-            let snippet_lines: Vec<&str> = result.content.lines().take(10).collect();
+            let snippet_lines: Vec<&str> = snippet.lines().take(10).collect();
             output.push_str(&snippet_lines.join("\n"));
-            if result.content.lines().count() > 10 {
+            if snippet.lines().count() > 10 {
                 output.push_str("\n... (truncated)");
             }
             output.push_str("\n```\n\n");
@@ -14907,7 +14885,10 @@ similarity index 90%
         // drops exactly the one file left off the manifest: e.c.
         let listed_names = ["a.c", "b.c", "c.c", "d.c"];
         for name in listed_names {
-            write_file(&repo.join(name), &format!("void {}(void) {{}}\n", name.replace('.', "_")));
+            write_file(
+                &repo.join(name),
+                &format!("void {}(void) {{}}\n", name.replace('.', "_")),
+            );
         }
         write_file(&repo.join("e.c"), "void e_func(void) {}\n");
 
@@ -14959,7 +14940,10 @@ similarity index 90%
             .find_symbols(&repo_key, None, Some("*"), Some("a.c"), None, 100)
             .await
             .unwrap();
-        assert!(output.contains("a_c"), "a.c's own symbol should be found:\n{output}");
+        assert!(
+            output.contains("a_c"),
+            "a.c's own symbol should be found:\n{output}"
+        );
         assert!(
             !output.contains("compile_commands.json"),
             "a listed file must not carry the exclusion note:\n{output}"
