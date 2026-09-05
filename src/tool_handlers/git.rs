@@ -115,7 +115,11 @@ impl ToolHandler for GetCommitDiffHandler {
         // error names neither the tool nor the argument that was missing.
         let commit = super::require_arg(&args, "commit", "get_commit_diff")?;
         let path = args.get_str("path");
-        engine.get_commit_diff(repo, commit, path).await
+        let max_bytes = args.get_u64("max_bytes").map(|v| v as usize);
+        let context_lines = args.get_u64("context_lines").map(|v| v as usize);
+        engine
+            .get_commit_diff(repo, commit, path, max_bytes, context_lines)
+            .await
     }
 }
 

@@ -990,7 +990,9 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "commit": {"type": "string", "description": "Commit hash or reference (e.g., HEAD, branch name)"},
-                    "path": {"type": "string", "description": "Optional file path to filter the diff"}
+                    "path": {"type": "string", "description": "Optional file path to filter the diff"},
+                    "max_bytes": {"type": "integer", "description": "Cap the response in bytes (default 48 KB, floor 4 KB). Lower it to fit two commits in one answer; files past the cap are listed, not cut mid-hunk"},
+                    "context_lines": {"type": "integer", "description": "Diff context lines around each hunk (git -U, default 3). 0 or 1 shrinks a diff without dropping files"}
                 },
                 "required": ["repo", "commit"]
             }),

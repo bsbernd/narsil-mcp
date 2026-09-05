@@ -144,6 +144,11 @@ const DEFINITION_BUILD_CHUNK_FILES: usize = 512;
 /// it has to stay visible in the log — otherwise a stall looks like silence.
 const DEFINITION_BUILD_PROGRESS_FILES: usize = 10_000;
 
+/// Floor for get_commit_diff's `max_bytes`. The header and the footer that
+/// names the files left out already take about 2 KB, so a smaller cap would
+/// return no diff at all.
+const MIN_COMMIT_DIFF_BYTES: usize = 4 * 1024;
+
 /// Options for configuring the CodeIntelEngine
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -5688,6 +5693,8 @@ impl CodeIntelEngine {
         repo: &str,
         commit: &str,
         path: Option<&str>,
+        max_bytes: Option<usize>,
+        context_lines: Option<usize>,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         // A commit's path is a pathspec, not a file that has to exist now: the
@@ -5703,7 +5710,7 @@ impl CodeIntelEngine {
             )
         })?;
 
-        let diff = git_repo.commit_diff(commit, path)?;
+        let diff = git_repo.commit_diff(commit, path, context_lines)?;
         let files = split_diff_by_file(&diff);
 
         let mut output = String::new();
@@ -5717,9 +5724,15 @@ impl CodeIntelEngine {
         }
         output.push('\n');
 
+        // A caller putting two commits in one answer needs to ask for less than
+        // the whole budget; under MIN_COMMIT_DIFF_BYTES a diff carries nothing.
+        let cap = max_bytes
+            .unwrap_or(response_budget::MAX_RESPONSE_BYTES)
+            .clamp(MIN_COMMIT_DIFF_BYTES, response_budget::MAX_RESPONSE_BYTES);
+
         // Whole file sections only: a cut inside a hunk loses the files behind
         // it without trace. Leave room for the header above and the footer below.
-        let budget = response_budget::MAX_RESPONSE_BYTES.saturating_sub(output.len() + 2048);
+        let budget = cap.saturating_sub(output.len() + 2048);
         let mut used = 0;
         let mut shown = 0;
         let mut cut_inside = None;
@@ -5750,7 +5763,7 @@ impl CodeIntelEngine {
             output.push_str(&format!(
                 "\n*`{}` alone exceeds the {} KB budget and is cut above.*\n",
                 cut,
-                response_budget::MAX_RESPONSE_BYTES / 1024
+                cap / 1024
             ));
         }
 
@@ -14180,7 +14193,7 @@ similarity index 90%
         let repo_arg = repo.to_str().unwrap();
 
         let diff = engine
-            .get_commit_diff(repo_arg, "HEAD", None)
+            .get_commit_diff(repo_arg, "HEAD", None, None, None)
             .await
             .unwrap();
         assert!(diff.contains("**Files changed**: 3"), "diff was: {}", diff);
@@ -14193,10 +14206,18 @@ similarity index 90%
 
         // The deleted file is gone from the working tree; its diff is not.
         let deleted = engine
-            .get_commit_diff(repo_arg, "HEAD", Some("test_ctests.py"))
+            .get_commit_diff(repo_arg, "HEAD", Some("test_ctests.py"), None, None)
             .await
             .unwrap();
         assert!(deleted.contains("-import pytest"), "diff was: {}", deleted);
+
+        // A caller comparing two commits in one answer asks for less.
+        let capped = engine
+            .get_commit_diff(repo_arg, "HEAD", None, Some(6 * 1024), None)
+            .await
+            .unwrap();
+        assert!(capped.len() < diff.len(), "max_bytes did not shrink");
+        assert!(capped.contains("## Files not shown"));
     }
 
     /// The file a commit deletes is absent from the working tree, and it is
