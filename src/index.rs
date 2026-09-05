@@ -6868,6 +6868,8 @@ impl CodeIntelEngine {
                 }
             }
 
+            let callers = CallGraph::fold_duplicate_sites(callers);
+
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
             let (page, capped) = response_budget::cap(&callers, window, "get_callers");
             for caller in page {
@@ -6982,7 +6984,7 @@ impl CodeIntelEngine {
                 output.push_str(&capped.footer());
             }
         } else {
-            let callees = call_graph.get_callees(function);
+            let callees = CallGraph::fold_duplicate_sites(call_graph.get_callees(function));
             output.push_str(&format!("Found {} direct callees\n\n", callees.len()));
             let (page, capped) = response_budget::cap(&callees, window, "get_callees");
             for callee in page {

@@ -53,7 +53,7 @@ pub struct CallEdge {
     pub line_conflicts: Vec<SourceLine>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallType {
     Direct,       // foo()
     Method,       // obj.foo()
@@ -356,6 +356,42 @@ impl CallGraph {
                 line: new_line,
             });
         }
+    }
+
+    /// Collapse edges that render identically. One line can hold several calls
+    /// to the same function (`f(a) || f(b)`), and neither the caller nor the
+    /// callee listing carries a column, so those sites arrive as repeated rows
+    /// and inflate the reported total. Confirmers and line conflicts of the
+    /// folded sites are kept.
+    pub fn fold_duplicate_sites(edges: Vec<CallEdge>) -> Vec<CallEdge> {
+        let mut folded: Vec<CallEdge> = Vec::with_capacity(edges.len());
+        let mut first_at: HashMap<(String, String, usize, CallType), usize> = HashMap::new();
+
+        for edge in edges {
+            let key = (
+                edge.target.clone(),
+                edge.file_path.clone(),
+                edge.line,
+                edge.call_type.clone(),
+            );
+            match first_at.get(&key) {
+                Some(&kept_idx) => {
+                    let kept = &mut folded[kept_idx];
+                    kept.confirmed_by.insert(edge.confirmed_by);
+                    for conflict in edge.line_conflicts {
+                        if !kept.line_conflicts.contains(&conflict) {
+                            kept.line_conflicts.push(conflict);
+                        }
+                    }
+                }
+                None => {
+                    first_at.insert(key, folded.len());
+                    folded.push(edge);
+                }
+            }
+        }
+
+        folded
     }
 
     /// Create a qualified key for the DashMap: "file_path::function_name".
@@ -1911,6 +1947,35 @@ mod tests {
             called_by,
             metrics: FunctionMetrics::default(),
         }
+    }
+
+    #[test]
+    fn two_calls_on_one_line_fold_into_one_row() {
+        // `f(a) || f(b)` on line 110, `f(c) || f(d)` on line 111: four call
+        // sites, one caller, and no column in the rendered row.
+        let site = |line: usize, column: usize, confirmed_by: SourceSet| CallEdge {
+            target: "mount_util.c::add_mount".to_string(),
+            file_path: "lib/mount_util.c".to_string(),
+            line,
+            column,
+            call_type: CallType::Direct,
+            scope_hint: None,
+            confirmed_by,
+            line_conflicts: Vec::new(),
+        };
+
+        let folded = CallGraph::fold_duplicate_sites(vec![
+            site(110, 5, SourceSet::TREE_SITTER),
+            site(110, 30, SourceSet::CCLS),
+            site(111, 5, SourceSet::TREE_SITTER),
+            site(111, 30, SourceSet::TREE_SITTER),
+        ]);
+
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].line, 110);
+        assert_eq!(folded[1].line, 111);
+        assert!(folded[0].confirmed_by.contains(SourceSet::TREE_SITTER));
+        assert!(folded[0].confirmed_by.contains(SourceSet::CCLS));
     }
 
     #[test]
