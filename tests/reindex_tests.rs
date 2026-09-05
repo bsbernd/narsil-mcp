@@ -3,6 +3,7 @@
 //! with, which it has to register before it can index.
 
 use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
+use narsil_mcp::response_budget::ListWindow;
 use std::path::Path;
 
 fn write_repo(root: &Path, function: &str) -> std::io::Result<()> {
@@ -88,6 +89,48 @@ async fn reindex_rejects_a_path_that_is_not_a_repo() {
         .await
         .expect_err("a directory with no repository markers must not register");
     assert!(error.to_string().contains("not found"), "{}", error);
+}
+
+/// A branch switch removes files. find_references scans the cached contents of
+/// every indexed file, so a file the new branch does not have must be gone from
+/// that cache once the repo is reindexed.
+#[tokio::test]
+async fn reindex_forgets_a_file_the_branch_switch_removed() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_repo(repo.path(), "kept_fn").unwrap();
+    let only_on_old_branch = repo.path().join("src/gone.rs");
+    std::fs::write(
+        &only_on_old_branch,
+        "pub fn kill_suidgid() -> u32 { kept_fn() }\n",
+    )
+    .unwrap();
+
+    let engine = engine_for(repo.path(), index_dir.path()).await;
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let before = engine
+        .find_references(repo_arg, "kill_suidgid", true, None, ListWindow::new(0, 50))
+        .await
+        .expect("find_references");
+    assert!(before.contains("src/gone.rs"), "{}", before);
+
+    std::fs::remove_file(&only_on_old_branch).unwrap();
+    engine.reindex(Some(repo_arg)).await.expect("reindex");
+
+    let after = engine
+        .find_references(repo_arg, "kill_suidgid", true, None, ListWindow::new(0, 50))
+        .await
+        .expect("find_references after reindex");
+    assert!(!after.contains("src/gone.rs"), "{}", after);
+
+    // The file the branch still has is answerable, so the prune was not a
+    // wholesale cache wipe.
+    let kept = engine
+        .find_references(repo_arg, "kept_fn", true, None, ListWindow::new(0, 50))
+        .await
+        .expect("find_references for the surviving file");
+    assert!(kept.contains("src/lib.rs"), "{}", kept);
 }
 
 /// Registration mutates engine-wide state that every query reads, so a query

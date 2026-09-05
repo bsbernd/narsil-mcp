@@ -2988,6 +2988,18 @@ impl CodeIntelEngine {
                     .await;
                 self.repos.remove(&repo_key);
                 self.symbols.remove(&repo_key);
+                // Drop this repo's cached contents; index_repo only inserts, so a
+                // file the new branch does not have would keep answering
+                // find_references and every other file_cache reader. A nested
+                // registered repo lives under the same root and keeps its own.
+                let nested: Vec<PathBuf> = self
+                    .registered_repo_paths()
+                    .into_iter()
+                    .filter(|p| p != &path && p.starts_with(&path))
+                    .collect();
+                self.file_cache.retain(|cached, _| {
+                    !cached.starts_with(&path) || nested.iter().any(|n| cached.starts_with(n))
+                });
                 // Reset call graph so stale nodes from a branch switch don't linger.
                 // build_from_files only inserts/overwrites — it never removes — so
                 // functions deleted on the new branch would otherwise persist.
