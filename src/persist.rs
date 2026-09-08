@@ -389,6 +389,25 @@ impl IndexStore {
         self.db_path(repo_root)
     }
 
+    /// Close a repo's redb handle and delete its store, legacy `.idx` included.
+    ///
+    /// redb keeps the file open for as long as a handle exists, so the handle
+    /// is dropped first. A repo that never persisted has no file to remove,
+    /// which is not an error. A legacy `.idx` left behind would be migrated
+    /// back in by the next `load_or_create`, resurrecting what was dropped.
+    pub fn forget(&self, repo_root: &Path) -> Result<()> {
+        self.dbs.remove(&self.db_path(repo_root));
+        for path in [self.db_path(repo_root), self.index_path(repo_root)] {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to remove {}", path.display())));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Open-or-return the cached redb handle for a repo.
     fn db(&self, repo_root: &Path) -> Result<Arc<Database>> {
         use dashmap::mapref::entry::Entry;

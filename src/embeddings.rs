@@ -219,6 +219,16 @@ impl VectorStore {
         self.documents.push(doc);
     }
 
+    /// Drop every document belonging to `repo`. `id_to_idx` holds positions in
+    /// `documents`, so it is rebuilt rather than pruned.
+    pub fn drop_repo(&mut self, repo: &str) {
+        self.documents.retain(|doc| doc.repo != repo);
+        self.id_to_idx.clear();
+        for (idx, doc) in self.documents.iter().enumerate() {
+            self.id_to_idx.insert(doc.id.clone(), idx);
+        }
+    }
+
     /// Find similar documents to a query embedding
     pub fn find_similar(
         &self,
@@ -320,6 +330,10 @@ impl ConcurrentVectorStore {
         self.inner.write().add(doc);
     }
 
+    pub fn drop_repo(&self, repo: &str) {
+        self.inner.write().drop_repo(repo);
+    }
+
     pub fn find_similar(
         &self,
         query_embedding: &[f32],
@@ -419,6 +433,13 @@ impl EmbeddingEngine {
             end_line,
             embedding: Vec::new(),
         });
+    }
+
+    /// Drop every snippet belonging to `repo`. The provider's accumulated IDF
+    /// statistics keep the dropped repo's terms until the next `finalize`,
+    /// which only skews scores, never results.
+    pub fn drop_repo(&self, repo: &str) {
+        self.store.drop_repo(repo);
     }
 
     /// Finalize the embedding model after all documents have been indexed.

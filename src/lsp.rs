@@ -1284,6 +1284,31 @@ impl LspManager {
         let _ = self.send_notification(process, "exit", Value::Null).await;
     }
 
+    /// Stop every server rooted at `repo` and delete the ccls index it wrote.
+    ///
+    /// Called when the engine drops a repository: a server left running would
+    /// hold that tree open and answer for an index nothing else still has.
+    pub async fn forget_repo(&self, repo: &Path) {
+        let keys: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|entry| Self::parse_server_key(entry.key()).1 == repo)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            if let Some((_, process)) = self.servers.remove(&key) {
+                self.shutdown_one_server(&key, &process).await;
+            }
+        }
+
+        let cache_dir = Self::ccls_cache_dir(repo);
+        if cache_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                warn!("Failed to remove ccls cache {}: {}", cache_dir.display(), e);
+            }
+        }
+    }
+
     /// Shutdown all LSP servers
     pub async fn shutdown_all(&self) -> Result<()> {
         for entry in self.servers.iter() {

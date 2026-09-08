@@ -377,6 +377,23 @@ impl SearchIndex {
         self.avg_doc_len = 0.0;
     }
 
+    /// A fresh index holding every document except those belonging to `repo`.
+    ///
+    /// `inverted_index` stores positions into `documents`, so removing entries
+    /// in place would renumber every posting after them; re-adding the
+    /// survivors is what keeps the postings, `doc_freq` and the BM25 averages
+    /// consistent with each other.
+    pub fn without_repo(&self, repo: &str) -> SearchIndex {
+        let mut rebuilt = SearchIndex::new();
+        rebuilt.params = self.params.clone();
+        for doc in &self.documents {
+            if doc.repo != repo {
+                rebuilt.add_document(doc.clone());
+            }
+        }
+        rebuilt
+    }
+
     /// Estimated heap held by this BM25 index: the documents and their owned
     /// allocations, the inverted-index postings, the doc-freq map, and the
     /// static synonym table.
@@ -629,6 +646,18 @@ impl ConcurrentSearchIndex {
     pub fn clear(&self) {
         self.inner.write().clear();
     }
+
+    /// Drop every document belonging to `repo`, leaving the rest searchable.
+    ///
+    /// The replacement is built under the read lock and swapped in under the
+    /// write lock, so a concurrent search sees the whole old index or the whole
+    /// new one and is blocked only for the swap. Both copies are resident
+    /// while the replacement is built. The caller must keep documents from
+    /// being added in between.
+    pub fn drop_repo(&self, repo: &str) {
+        let rebuilt = self.inner.read().without_repo(repo);
+        *self.inner.write() = rebuilt;
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +706,47 @@ mod tests {
         let results = index.search("user", 10);
         assert!(!results.is_empty());
         assert!(results[0].score > 0.0);
+    }
+
+    /// The postings hold positions into the document vector, so dropping one
+    /// repo has to leave every other repo's terms scoring exactly as before.
+    #[test]
+    fn drop_repo_leaves_the_other_repos_searchable() {
+        let index = ConcurrentSearchIndex::new();
+        index.index_file(
+            "keep",
+            "user.rs",
+            "pub fn get_user_by_id(id: u32) -> User { user }",
+        );
+        index.index_file(
+            "drop",
+            "order.rs",
+            "pub fn create_order(user: &User) -> Order { order }",
+        );
+        let before = index.stats();
+
+        index.drop_repo("drop");
+
+        assert!(
+            index.search("order", 10).is_empty(),
+            "the dropped repo must stop answering"
+        );
+        let kept = index.search("user", 10);
+        assert!(!kept.is_empty(), "the kept repo must still answer");
+        assert!(
+            kept.iter().all(|hit| hit.document.repo == "keep"),
+            "only the kept repo may score: {:?}",
+            kept.iter().map(|hit| &hit.document.repo).collect::<Vec<_>>()
+        );
+
+        let after = index.stats();
+        assert_eq!(after.total_documents, before.total_documents - 1);
+        assert!(
+            after.total_terms < before.total_terms,
+            "the dropped repo's terms must leave the inverted index: {} vs {}",
+            after.total_terms,
+            before.total_terms
+        );
     }
 
     #[test]

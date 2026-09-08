@@ -2431,6 +2431,11 @@ impl CodeIntelEngine {
                 "--index-filter: definition map ready for {}; re-running the pull-in",
                 repo_name
             );
+            // Every other index_repo call holds these: a query landing mid-pass
+            // would be answered from a repo whose symbols are half rebuilt.
+            let _leases = self
+                .index_update_leases(std::slice::from_ref(&repo_name))
+                .await;
             if let Err(e) = self.index_repo(&repo_path).await {
                 warn!(
                     "definition map: catch-up index of {} failed: {}",
@@ -3023,6 +3028,86 @@ impl CodeIntelEngine {
                 Ok("Re-indexed all repositories".to_string())
             }
         }
+    }
+
+    /// Drop every trace of a repository: its symbols, search documents, call
+    /// graph, cached file contents, language servers and persisted store. The
+    /// repo stops resolving afterwards, so a query names it in vain until
+    /// something registers it again — `reindex` on the same path does.
+    ///
+    /// Holds the same update leases a rebuild does, so a query sees the repo
+    /// whole or reports it unknown, never half-emptied.
+    pub async fn forget_repo(&self, repo: &str) -> Result<String> {
+        fn decrement(counter: &AtomicUsize) {
+            let _ = counter.fetch_update(Ordering::Release, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            });
+        }
+
+        let repo_key = self.resolve_repo(repo)?;
+        let path = PathBuf::from(&repo_key);
+        let leases = self
+            .index_update_leases(std::slice::from_ref(&repo_key))
+            .await;
+
+        // Stop what could still write to this repo before dropping its data,
+        // so nothing refills a map behind the teardown.
+        if let Some((_, build)) = self.definition_builds.remove(&repo_key) {
+            build.abort();
+        }
+        if let Some(lsp) = &self.lsp_manager {
+            lsp.forget_repo(&path).await;
+        }
+
+        self.search_index.drop_repo(&repo_key);
+        self.embedding_engine.drop_repo(&repo_key);
+        let was_indexed = self.repos.remove(&repo_key).is_some();
+        self.symbols.remove(&repo_key);
+        self.git_repos.remove(&repo_key);
+        self.call_graphs.remove(&repo_key);
+        self.index_filtered_repos.remove(&repo_key);
+        self.compile_commands_filtered_files.remove(&repo_key);
+        self.gitignore_matchers.remove(&path);
+        self.gtags_last_refresh.remove(&path);
+
+        // A repo registered underneath this one keeps its own cached contents.
+        let nested: Vec<PathBuf> = self
+            .registered_repo_paths()
+            .into_iter()
+            .filter(|other| other != &path && other.starts_with(&path))
+            .collect();
+        self.file_cache.retain(|cached, _| {
+            !cached.starts_with(&path) || nested.iter().any(|n| cached.starts_with(n))
+        });
+
+        self.query_cache.invalidate_for_repo(&repo_key);
+        self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
+
+        if let Some(store) = &self.index_store {
+            if let Err(e) = store.forget(&path) {
+                warn!("forget_repo: {}", e);
+            }
+        }
+
+        // Last: until here a concurrent resolve_repo still finds the repo and
+        // blocks on the write lease above; afterwards it reports it unknown.
+        // The watcher keeps its descriptor, but process_file_changes drops a
+        // change no registered repo encloses.
+        self.repo_paths.write().retain(|other| other != &path);
+        decrement(&self.total_repos_count);
+        if was_indexed {
+            decrement(&self.indexed_repos_count);
+        }
+        self.refresh_memory_snapshot();
+
+        // After the guard, so a task already holding this lease keeps it alive;
+        // one arriving later makes a fresh lease for a repo that no longer
+        // resolves anyway.
+        drop(leases);
+        self.index_leases.remove(&repo_key);
+
+        info!("Forgot repository {}", repo_key);
+        Ok(format!("Forgot repository: {}", repo_key))
     }
 
     /// Register a repo `resolve_repo` did not know, when `name` names a

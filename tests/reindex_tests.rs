@@ -1,6 +1,9 @@
 //! `reindex` is the documented first move when a query returns nothing for
 //! code that exists — including for a repository the server was never started
 //! with, which it has to register before it can index.
+//!
+//! `forget_repo` is its counterpart: it unregisters a repository and drops
+//! everything the engine held for it.
 
 use narsil_mcp::index::{CodeIntelEngine, EngineOptions};
 use narsil_mcp::response_budget::ListWindow;
@@ -15,10 +18,10 @@ fn write_repo(root: &Path, function: &str) -> std::io::Result<()> {
     )
 }
 
-async fn engine_for(repo: &Path, index_dir: &Path) -> CodeIntelEngine {
+async fn engine_for_all(repos: &[&Path], index_dir: &Path) -> CodeIntelEngine {
     let engine = CodeIntelEngine::with_options(
         index_dir.to_path_buf(),
-        vec![repo.to_path_buf()],
+        repos.iter().map(|repo| repo.to_path_buf()).collect(),
         EngineOptions::default(),
     )
     .await
@@ -28,6 +31,10 @@ async fn engine_for(repo: &Path, index_dir: &Path) -> CodeIntelEngine {
         .await
         .expect("initialization");
     engine
+}
+
+async fn engine_for(repo: &Path, index_dir: &Path) -> CodeIntelEngine {
+    engine_for_all(&[repo], index_dir).await
 }
 
 /// A repository absent at startup is registered and indexed, not rejected.
@@ -70,6 +77,71 @@ async fn reindex_registers_a_repo_the_server_never_saw() {
         .await
         .expect("find_symbols on the original repo");
     assert!(known.contains("known_fn"), "{}", known);
+}
+
+/// Forgetting a repo undoes its registration: it stops answering, and reindex
+/// on the same path brings it back.
+#[tokio::test]
+async fn forget_repo_drops_a_repo_that_reindex_can_bring_back() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_repo(repo.path(), "known_fn").unwrap();
+
+    let engine = engine_for(repo.path(), index_dir.path()).await;
+    let repo_arg = repo.path().to_str().unwrap();
+    let found = engine
+        .find_symbols(repo_arg, None, Some("known_fn"), None, None, 10)
+        .await
+        .expect("find_symbols before forgetting");
+    assert!(found.contains("known_fn"), "{}", found);
+
+    let forgotten = engine.forget_repo(repo_arg).await.expect("forget_repo");
+    assert!(forgotten.contains("Forgot"), "{}", forgotten);
+
+    let after = engine
+        .find_symbols(repo_arg, None, Some("known_fn"), None, None, 10)
+        .await;
+    assert!(after.is_err(), "{:?}", after.map(|out| out.len()));
+
+    engine
+        .reindex(Some(repo_arg))
+        .await
+        .expect("reindex after forget_repo");
+    let again = engine
+        .find_symbols(repo_arg, None, Some("known_fn"), None, None, 10)
+        .await
+        .expect("find_symbols after reindex");
+    assert!(again.contains("known_fn"), "{}", again);
+}
+
+/// Dropping one repo must leave every other repo the engine serves intact --
+/// the search index and the file cache are shared across all of them.
+#[tokio::test]
+async fn forget_repo_leaves_the_other_repo_answering() {
+    let kept = tempfile::TempDir::new().unwrap();
+    let dropped = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_repo(kept.path(), "kept_fn").unwrap();
+    write_repo(dropped.path(), "dropped_fn").unwrap();
+
+    let engine = engine_for_all(&[kept.path(), dropped.path()], index_dir.path()).await;
+    engine
+        .forget_repo(dropped.path().to_str().unwrap())
+        .await
+        .expect("forget_repo");
+
+    let still_there = engine
+        .find_symbols(
+            kept.path().to_str().unwrap(),
+            None,
+            Some("kept_fn"),
+            None,
+            None,
+            10,
+        )
+        .await
+        .expect("the repo that was kept must still answer");
+    assert!(still_there.contains("kept_fn"), "{}", still_there);
 }
 
 /// A path that is not a repository leaves the original "not found" error in

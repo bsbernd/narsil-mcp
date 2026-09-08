@@ -166,6 +166,21 @@ impl ToolHandler for ReindexHandler {
     }
 }
 
+/// Handler for forget_repo tool
+pub struct ForgetRepoHandler;
+
+#[async_trait::async_trait]
+impl ToolHandler for ForgetRepoHandler {
+    fn name(&self) -> &'static str {
+        "forget_repo"
+    }
+
+    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
+        let repo = args.get_str("repo").unwrap_or("");
+        engine.forget_repo(repo).await
+    }
+}
+
 /// Handler for get_index_status tool
 pub struct GetIndexStatusHandler;
 

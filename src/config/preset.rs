@@ -387,6 +387,7 @@ impl ExposeGroup {
             "get_index_status",
             // The documented recovery when a query comes back empty.
             "reindex",
+            "forget_repo",
             "discover_repos",
             "validate_repo",
             "get_metrics",

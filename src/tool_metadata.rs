@@ -274,6 +274,25 @@ lazy_static! {
             aliases: vec!["refresh", "rebuild_index"],
         });
 
+        map.insert("forget_repo", ToolMetadata {
+            name: "forget_repo",
+            description: "Drop a repository from the index, freeing the memory and the on-disk store it held. The repository stops answering queries until `reindex` registers it again.",
+            category: ToolCategory::Repository,
+            tags: ["forget", "evict", "index", "memory"].iter().copied().collect(),
+            stability: StabilityLevel::Stable,
+            performance: PerformanceImpact::Medium,
+            required_flags: HashSet::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository to drop. Absolute path, relative path, or `.`."}
+                },
+                "required": ["repo"]
+            }),
+            requires_api_key: false,
+            aliases: vec!["drop_repo", "evict_repo"],
+        });
+
         map.insert("get_index_status", ToolMetadata {
             name: "get_index_status",
             description: "Get status of the search index and enabled features. Shows which optional features are enabled (--git, --call-graph, --persist, --watch) and index statistics.",
