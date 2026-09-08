@@ -125,10 +125,10 @@ pub fn register_at(path: &Path, url: &str, repos: &[PathBuf]) -> Result<Discover
     })
 }
 
-/// Return the base URL of the first record whose repo list is a superset
-/// of `repos` AND which answers an MCP `ping` POST. Removes records that
+/// Return the base URL of a record that answers an MCP `ping` POST, together
+/// with the entries of `repos` that record does not list. Removes records that
 /// fail the probe with a transport-level error as a side effect.
-pub fn find_server_for_repos(repos: &[PathBuf]) -> Option<String> {
+pub fn find_server_for_repos(repos: &[PathBuf]) -> Option<(String, Vec<PathBuf>)> {
     let path = discovery_file_path().ok()?;
     find_at(&path, repos)
 }
@@ -145,7 +145,7 @@ pub fn find_server_for_repos(repos: &[PathBuf]) -> Option<String> {
 pub async fn find_server_for_repos_with_retry(
     repos: &[PathBuf],
     retry_budget: Duration,
-) -> Option<String> {
+) -> Option<(String, Vec<PathBuf>)> {
     let path = discovery_file_path().ok()?;
     find_at_with_retry(&path, repos, retry_budget).await
 }
@@ -156,7 +156,7 @@ pub async fn find_at_with_retry(
     path: &Path,
     repos: &[PathBuf],
     retry_budget: Duration,
-) -> Option<String> {
+) -> Option<(String, Vec<PathBuf>)> {
     const POLL_INTERVAL: Duration = Duration::from_millis(250);
     let deadline = std::time::Instant::now() + retry_budget;
     loop {
@@ -179,7 +179,7 @@ pub async fn find_at_with_retry(
 
 /// Same as [`find_server_for_repos`] but reads from an explicit path;
 /// used by tests.
-pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<String> {
+pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<(String, Vec<PathBuf>)> {
     info!("SSE discovery: checking {}", path.display());
     if !path.exists() {
         info!("SSE discovery: no registry file yet");
@@ -190,7 +190,10 @@ pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<String> {
     let records = read_records(&mut file).unwrap_or_default();
 
     let mut surviving: Vec<SseServerRecord> = Vec::with_capacity(records.len());
-    let mut matched: Option<String> = None;
+    // A server covering every requested repo needs nothing from the caller, so
+    // it wins over one that would first have to be told about the rest.
+    let mut exact: Option<String> = None;
+    let mut partial: Option<(String, Vec<PathBuf>)> = None;
 
     for record in records {
         debug!(
@@ -198,28 +201,25 @@ pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<String> {
             record.url, record.repos
         );
 
-        if matched.is_some() {
+        if exact.is_some() {
             // Already picked a winner — keep this record but do not probe.
             surviving.push(record);
             continue;
         }
 
-        match superset_check(&record.repos, repos) {
-            Ok(()) => debug!("SSE discovery: repo superset check: match"),
-            Err(missing) => {
-                debug!(
-                    "SSE discovery: repo superset check: miss (missing {})",
-                    missing.display()
-                );
-                surviving.push(record);
-                continue;
-            }
-        }
+        let missing = missing_repos(&record.repos, repos);
 
         match http_probe(&record.url) {
             ProbeResult::Ok => {
-                debug!("SSE discovery: ping {}/mcp → 200", record.url);
-                matched = Some(record.url.clone());
+                debug!(
+                    "SSE discovery: ping {}/mcp → 200, does not serve {:?}",
+                    record.url, missing
+                );
+                if missing.is_empty() {
+                    exact = Some(record.url.clone());
+                } else if partial.is_none() {
+                    partial = Some((record.url.clone(), missing));
+                }
                 surviving.push(record);
             }
             ProbeResult::HttpError(status) => {
@@ -241,7 +241,7 @@ pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<String> {
         warn!("SSE discovery: failed to rewrite registry: {}", e);
     }
 
-    matched
+    exact.map(|url| (url, Vec::new())).or(partial)
 }
 
 // ── internals ────────────────────────────────────────────────────────────
@@ -336,18 +336,14 @@ fn remove_entry(path: &Path, url: &str) -> Result<()> {
     atomic_write(path, &records)
 }
 
-/// Verify that every path in `requested` is present in `available`.
-/// Returns the first missing path so the caller can log a precise reason.
-fn superset_check(
-    available: &[PathBuf],
-    requested: &[PathBuf],
-) -> std::result::Result<(), PathBuf> {
-    for path in requested {
-        if !available.iter().any(|p| p == path) {
-            return Err(path.clone());
-        }
-    }
-    Ok(())
+/// The paths in `requested` that `available` does not list, in the order the
+/// caller gave them. Empty means `available` is a superset.
+fn missing_repos(available: &[PathBuf], requested: &[PathBuf]) -> Vec<PathBuf> {
+    requested
+        .iter()
+        .filter(|path| !available.iter().any(|have| have == *path))
+        .cloned()
+        .collect()
 }
 
 enum ProbeResult {
@@ -461,9 +457,48 @@ mod tests {
         let requested_extra: Vec<PathBuf> =
             ["/repo/a", "/repo/c"].iter().map(PathBuf::from).collect();
 
-        assert!(superset_check(&available, &requested_subset).is_ok());
-        let miss = superset_check(&available, &requested_extra).unwrap_err();
-        assert_eq!(miss, PathBuf::from("/repo/c"));
+        assert!(missing_repos(&available, &requested_subset).is_empty());
+        assert_eq!(
+            missing_repos(&available, &requested_extra),
+            vec![PathBuf::from("/repo/c")]
+        );
+    }
+
+    /// A live server that serves only some of the requested repos is still a
+    /// match, reported with the ones it lacks so the caller can act on them.
+    #[test]
+    fn partial_match_reports_the_repos_the_server_lacks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json");
+        let url = spawn_200_server();
+        write_records(&path, &[record(&url, &["/a"])]);
+
+        let (found, missing) = find_at(&path, &[PathBuf::from("/a"), PathBuf::from("/b")])
+            .expect("a live server matches even when it lacks a repo");
+        assert_eq!(found, url);
+        assert_eq!(missing, vec![PathBuf::from("/b")]);
+    }
+
+    /// With a partial and an exact match both alive, the exact one wins even
+    /// though the partial one is probed first.
+    #[test]
+    fn exact_match_wins_over_a_partial_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json");
+        let partial_url = spawn_200_server();
+        let exact_url = spawn_200_server();
+        write_records(
+            &path,
+            &[
+                record(&partial_url, &["/a"]),
+                record(&exact_url, &["/a", "/b"]),
+            ],
+        );
+
+        let (found, missing) = find_at(&path, &[PathBuf::from("/a"), PathBuf::from("/b")])
+            .expect("the exact record is alive");
+        assert_eq!(found, exact_url);
+        assert!(missing.is_empty(), "exact match must lack nothing");
     }
 
     #[test]
@@ -519,12 +554,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("servers.json");
 
-        // Two unreachable entries plus one live-but-irrelevant entry whose
-        // URL also refuses (so we don't accidentally probe a real server
-        // during tests). The non-matching repo set prevents the probe from
-        // running at all on that record.
+        // Two unreachable entries every thread must prune, plus one live entry
+        // every thread must keep -- exactly once, however the writes interleave.
         let irrelevant = SseServerRecord {
-            url: "http://127.0.0.1:2".to_string(),
+            url: spawn_200_server(),
             repos: vec![PathBuf::from("/elsewhere")],
         };
         write_records(
@@ -566,14 +599,15 @@ mod tests {
         );
     }
 
-    /// A minimal listener that answers exactly one connection with a bare
-    /// 200 -- enough for http_probe, which only checks the status code.
-    fn spawn_single_shot_200_server() -> String {
+    /// A minimal listener that answers every connection with a bare 200 --
+    /// enough for http_probe, which only checks the status code. Serves until
+    /// the test binary exits; its thread is never joined.
+    fn spawn_200_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
-            if let Ok((mut stream, _)) = listener.accept() {
+            for mut stream in listener.incoming().flatten() {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -590,7 +624,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("servers.json");
         // No record at t=0: the first probe inside the loop must miss.
-        let url = spawn_single_shot_200_server();
+        let url = spawn_200_server();
 
         let writer_path = path.clone();
         let writer_url = url.clone();
@@ -599,11 +633,10 @@ mod tests {
             write_records(&writer_path, &[record(&writer_url, &["/r"])]);
         });
 
-        let found =
-            find_at_with_retry(&path, &[PathBuf::from("/r")], Duration::from_secs(3)).await;
+        let found = find_at_with_retry(&path, &[PathBuf::from("/r")], Duration::from_secs(3)).await;
         assert_eq!(
-            found.as_deref(),
-            Some(url.as_str()),
+            found,
+            Some((url, Vec::new())),
             "a retry budget spanning the late registration must still find it"
         );
     }

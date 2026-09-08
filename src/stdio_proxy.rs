@@ -306,7 +306,11 @@ impl ProxySession {
             })
             .await
             .ok()
-            .flatten();
+            .flatten()
+            // A restarted server short of a repo this session serves cannot
+            // answer for it; keep waiting for one that indexes them all.
+            .filter(|(_, missing)| missing.is_empty())
+            .map(|(url, _)| url);
 
             if let Some(url) = found {
                 self.endpoint = format!("{}/mcp", url.trim_end_matches('/'));

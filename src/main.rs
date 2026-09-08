@@ -379,31 +379,37 @@ async fn main() -> Result<()> {
         let retry_budget = std::time::Duration::from_secs(server_args.discovery_retry_secs);
         let discovered =
             sse_discovery::find_server_for_repos_with_retry(&repos, retry_budget).await;
-        if let Some(proxy_url) = discovered {
-            info!("SSE discovery: delegating stdio to {}", proxy_url);
-            // The upstream daemon decides its own tool list; nothing on this
-            // side can narrow it, so say so rather than appear to have applied it.
-            if !expose.is_empty() {
-                warn!(
-                    "--expose is ignored when delegating to {}: the upstream server's \
-                     own --expose/--preset decides the tool list",
-                    proxy_url
-                );
+        match discovered {
+            Some((proxy_url, missing)) if missing.is_empty() => {
+                info!("SSE discovery: delegating stdio to {}", proxy_url);
+                // The upstream daemon decides its own tool list; nothing on this
+                // side can narrow it, so say so rather than appear to have applied it.
+                if !expose.is_empty() {
+                    warn!(
+                        "--expose is ignored when delegating to {}: the upstream server's \
+                         own --expose/--preset decides the tool list",
+                        proxy_url
+                    );
+                }
+                // Record this delegating process so `narsil-mcp stats` can show the
+                // stdio→SSE link; the guard removes the file on a clean return.
+                let _pid_status_entry = pid_status::write_status(&pid_status::PidStatus::new(
+                    "stdio",
+                    pid_status::ProcessRole::StdioProxy {
+                        upstream_url: proxy_url.clone(),
+                    },
+                    &repos,
+                ))
+                .map_err(|e| warn!("pid status: could not write: {}", e))
+                .ok();
+                return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url, &repos).await;
             }
-            // Record this delegating process so `narsil-mcp stats` can show the
-            // stdio→SSE link; the guard removes the file on a clean return.
-            let _pid_status_entry = pid_status::write_status(&pid_status::PidStatus::new(
-                "stdio",
-                pid_status::ProcessRole::StdioProxy {
-                    upstream_url: proxy_url.clone(),
-                },
-                &repos,
-            ))
-            .map_err(|e| warn!("pid status: could not write: {}", e))
-            .ok();
-            return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url, &repos).await;
+            Some((proxy_url, missing)) => info!(
+                "SSE discovery: {} does not index {:?}; building local index",
+                proxy_url, missing
+            ),
+            None => info!("SSE discovery: no matching server, building local index"),
         }
-        info!("SSE discovery: no matching server, building local index");
     }
 
     // Check if --graph flag is used but feature isn't compiled
