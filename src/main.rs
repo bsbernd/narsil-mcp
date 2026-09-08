@@ -587,6 +587,7 @@ async fn main() -> Result<()> {
         neural_config,
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
+        adopted_repo_ttl_days: index::DEFAULT_ADOPTED_REPO_TTL_DAYS,
         embedding_dim: server_args.embedding_dim.unwrap_or(1000),
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
@@ -696,6 +697,11 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // A long-running server picks up repositories over its lifetime — every
+    // stdio start in a project it does not index asks it to. Without this the
+    // set only ever grows. Held for the same reason as the watcher's sender.
+    let _sweep_shutdown_tx = index::spawn_idle_repo_sweep(Arc::clone(&engine));
 
     // The chosen transport is raced against Ctrl-C (and SIGTERM on Unix)
     // so that, when the user terminates the process, we get a chance to

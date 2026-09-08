@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -175,6 +175,9 @@ pub struct EngineOptions {
     pub cache_enabled: bool,
     /// Cache TTL in seconds (default: 1800 = 30 minutes)
     pub cache_ttl_seconds: u64,
+    /// Days an adopted repository may go unqueried before the idle sweep drops
+    /// it (default: 7). Repos the server was started with are never swept.
+    pub adopted_repo_ttl_days: u64,
     /// TF-IDF embedding vocabulary size / vector dimension (default: 1000)
     pub embedding_dim: usize,
     /// When true, restrict C/C++ source indexing to files in compile_commands.json
@@ -225,6 +228,7 @@ impl Default for EngineOptions {
             neural_config: NeuralConfig::default(),
             cache_enabled: true,
             cache_ttl_seconds: 1800,
+            adopted_repo_ttl_days: DEFAULT_ADOPTED_REPO_TTL_DAYS,
             embedding_dim: 1000,
             use_compile_commands: false,
             compile_commands_path: None,
@@ -328,6 +332,82 @@ fn is_merge_conflict_artifact(path: &Path) -> bool {
 /// waits longer than that anyway — while still far short of a checkout.
 const INDEX_LEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How a repository came to be registered. Only an adopted repo is ever swept:
+/// the repos a server was started with are its declared set, however long they
+/// sit idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoOrigin {
+    /// Named by `--repos`, `--discover`, or a config profile.
+    Configured,
+    /// Registered at run time by `reindex` on a path the server never saw.
+    Adopted,
+}
+
+/// A repository the engine answers for, with what an idle sweep needs to
+/// decide whether to drop it.
+struct RegisteredRepo {
+    path: PathBuf,
+    origin: RepoOrigin,
+    /// Unix seconds when a caller last named this repo. Atomic so the stamp
+    /// costs a read lock and not a write lock on every query.
+    last_used: AtomicU64,
+}
+
+impl RegisteredRepo {
+    /// Registered now, so a freshly adopted repo gets a whole TTL before the
+    /// first sweep can consider it.
+    fn new(path: PathBuf, origin: RepoOrigin) -> Self {
+        Self {
+            path,
+            origin,
+            last_used: AtomicU64::new(unix_secs()),
+        }
+    }
+}
+
+/// Seconds since the unix epoch, 0 if the clock reads before it.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Days an adopted repository may go unqueried before the idle sweep drops it.
+/// Long enough to survive a holiday, short enough that a project touched once
+/// does not sit in a server's memory for a month.
+pub const DEFAULT_ADOPTED_REPO_TTL_DAYS: u64 = 7;
+
+/// How often the idle sweep looks for adopted repos to drop. Well below any
+/// sensible TTL, so a repo is forgotten within the hour of crossing it.
+const IDLE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Run the idle sweep for as long as the returned `Sender` is held.
+///
+/// **The caller must hold the `Sender`**; dropping it makes the sweep exit on
+/// its next poll, the same trap `spawn_watch_mode` documents.
+#[must_use = "the returned Sender must be held until the sweep should stop; \
+              dropping it immediately exits the sweep"]
+pub fn spawn_idle_repo_sweep(engine: Arc<CodeIntelEngine>) -> tokio::sync::broadcast::Sender<()> {
+    let ttl = std::time::Duration::from_secs(engine.options.adopted_repo_ttl_days * 24 * 60 * 60);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(IDLE_SWEEP_INTERVAL);
+        // interval fires its first tick immediately; the engine has nothing to
+        // sweep at startup.
+        ticks.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => engine.sweep_idle_repos(ttl).await,
+                _ = shutdown_rx.recv() => {
+                    info!("Idle repo sweep shutting down");
+                    break;
+                }
+            }
+        }
+    });
+    shutdown_tx
+}
+
 /// Per-repo index lease. A query holds the read side for the duration of its
 /// tool call, an index update the write side. tokio's RwLock is
 /// write-preferring, so a waiting update also keeps new queries out — the
@@ -390,7 +470,7 @@ pub struct CodeIntelEngine {
     _index_path: PathBuf,
     /// Registered repository paths. Behind a lock because `reindex` takes
     /// `&self` yet may register a repo the server was never started with.
-    repo_paths: parking_lot::RwLock<Vec<PathBuf>>,
+    repo_paths: parking_lot::RwLock<Vec<RegisteredRepo>>,
     /// Cached repo metadata
     repos: DashMap<String, RepoMetadata>,
     /// Symbol index: repo -> symbols
@@ -706,7 +786,12 @@ impl CodeIntelEngine {
 
         let engine = Self {
             _index_path: expanded_index,
-            repo_paths: parking_lot::RwLock::new(expanded_repos.clone()),
+            repo_paths: parking_lot::RwLock::new(
+                expanded_repos
+                    .iter()
+                    .map(|path| RegisteredRepo::new(path.clone(), RepoOrigin::Configured))
+                    .collect(),
+            ),
             repos: DashMap::new(),
             symbols: DashMap::new(),
             file_cache: DashMap::new(),
@@ -2916,18 +3001,65 @@ impl CodeIntelEngine {
     /// borrow: callers iterate across `.await` points, and holding the lock
     /// there would block a concurrent registration for the whole pass.
     fn registered_repo_paths(&self) -> Vec<PathBuf> {
-        self.repo_paths.read().clone()
+        self.repo_paths
+            .read()
+            .iter()
+            .map(|repo| repo.path.clone())
+            .collect()
     }
 
     /// Register `path` as a repository the engine answers for. Returns false if
     /// it was already registered.
-    fn register_repo_path(&self, path: PathBuf) -> bool {
-        let mut paths = self.repo_paths.write();
-        if paths.contains(&path) {
+    fn register_repo_path(&self, path: PathBuf, origin: RepoOrigin) -> bool {
+        let mut repos = self.repo_paths.write();
+        if repos.iter().any(|repo| repo.path == path) {
             return false;
         }
-        paths.push(path);
+        repos.push(RegisteredRepo::new(path, origin));
         true
+    }
+
+    /// Record that a caller just named `repo_key`, so an idle sweep can tell a
+    /// repo still in use from one nobody has asked about in days.
+    fn mark_repo_used(&self, repo_key: &str) {
+        let now = unix_secs();
+        let named = Path::new(repo_key);
+        for repo in self.repo_paths.read().iter() {
+            if repo.path == named {
+                repo.last_used.store(now, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// Forget every adopted repository nobody has named for `ttl`.
+    ///
+    /// `resolve_repo` stamps a repo on every mention, so one still in use never
+    /// reaches the deadline. Does nothing until the first index pass finishes:
+    /// before that a configured repo carries no stamp either.
+    pub async fn sweep_idle_repos(&self, ttl: std::time::Duration) {
+        if !self.initialization_complete.load(Ordering::Acquire) {
+            return;
+        }
+        let deadline = unix_secs().saturating_sub(ttl.as_secs());
+        let idle: Vec<PathBuf> = self
+            .repo_paths
+            .read()
+            .iter()
+            .filter(|repo| {
+                repo.origin == RepoOrigin::Adopted
+                    && repo.last_used.load(Ordering::Relaxed) < deadline
+            })
+            .map(|repo| repo.path.clone())
+            .collect();
+
+        for path in idle {
+            let repo = path.to_string_lossy().into_owned();
+            info!("Idle sweep: dropping {} after {:?} unused", repo, ttl);
+            if let Err(e) = self.forget_repo(&repo).await {
+                warn!("Idle sweep: could not drop {}: {}", repo, e);
+            }
+        }
     }
 
     /// Canonical keys of every configured repo — what a query naming no repo
@@ -3093,7 +3225,7 @@ impl CodeIntelEngine {
         // blocks on the write lease above; afterwards it reports it unknown.
         // The watcher keeps its descriptor, but process_file_changes drops a
         // change no registered repo encloses.
-        self.repo_paths.write().retain(|other| other != &path);
+        self.repo_paths.write().retain(|other| other.path != path);
         decrement(&self.total_repos_count);
         if was_indexed {
             decrement(&self.indexed_repos_count);
@@ -3123,7 +3255,7 @@ impl CodeIntelEngine {
         }
 
         let repo_key = canonical_repo_key(&canonical).ok()?;
-        if self.register_repo_path(canonical) {
+        if self.register_repo_path(canonical, RepoOrigin::Adopted) {
             info!("reindex: registered new repository {}", repo_key);
         }
         Some(repo_key)
@@ -3175,6 +3307,15 @@ impl CodeIntelEngine {
     /// The returned string is the canonical absolute path as stored in the
     /// engine's repository maps — use it directly as the lookup key.
     pub(crate) fn resolve_repo(&self, input: &str) -> Result<String> {
+        let key = self.repo_key_for(input)?;
+        // Stamped here rather than per tool: this is the one funnel a caller
+        // passes through to name a repo, whatever it goes on to ask for.
+        self.mark_repo_used(&key);
+        Ok(key)
+    }
+
+    /// The canonical key `input` names, without recording the use.
+    fn repo_key_for(&self, input: &str) -> Result<String> {
         if input.is_empty() {
             // With a single indexed repo there is nothing to disambiguate, so
             // naming it adds nothing the engine doesn't already know.
@@ -14633,6 +14774,72 @@ similarity index 90%
 
         drop(update);
         assert!(engine.try_query_lease(&repo_key).await.is_some());
+    }
+
+    /// The sweep exists to bound what stdio delegation adds to a long-running
+    /// server, so it must leave the repos that server was started with alone
+    /// however long they sit -- those are its declared set.
+    #[tokio::test]
+    async fn idle_sweep_drops_the_adopted_repo_and_keeps_the_configured_one() {
+        let temp = TempDir::new().unwrap();
+        let configured = temp.path().join("configured");
+        let adopted = temp.path().join("adopted");
+        for repo in [&configured, &adopted] {
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::write(repo.join("lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        }
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![configured.clone()])
+            .await
+            .unwrap();
+        engine.complete_initialization().await.unwrap();
+        engine
+            .reindex(Some(adopted.to_str().unwrap()))
+            .await
+            .expect("adopting a repo the engine was not started with");
+
+        // Age every stamp past the deadline: origin, not idleness, is what must
+        // decide here.
+        for repo in engine.repo_paths.read().iter() {
+            repo.last_used.store(0, Ordering::Relaxed);
+        }
+        engine
+            .sweep_idle_repos(std::time::Duration::from_secs(60))
+            .await;
+
+        let surviving = engine.registered_repo_paths();
+        assert!(
+            surviving.iter().any(|path| path == &configured),
+            "a configured repo must survive any idle time: {surviving:?}"
+        );
+        assert!(
+            !surviving.iter().any(|path| path == &adopted),
+            "an idle adopted repo must be dropped: {surviving:?}"
+        );
+    }
+
+    /// A repo named by a query is stamped, which is what keeps one in active
+    /// use out of the sweep however long the server runs.
+    #[tokio::test]
+    async fn resolving_a_repo_stamps_it_as_used() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+
+        for registered in engine.repo_paths.read().iter() {
+            registered.last_used.store(0, Ordering::Relaxed);
+        }
+        engine
+            .resolve_repo(repo.to_str().unwrap())
+            .expect("resolve");
+
+        let stamp = engine.repo_paths.read()[0]
+            .last_used
+            .load(Ordering::Relaxed);
+        assert!(stamp > 0, "resolve_repo must record the use");
     }
 
     /// A watch batch names files; the update window needs the repos they belong
