@@ -25,6 +25,7 @@ fn test_validate_valid_config() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -56,6 +57,7 @@ fn test_validate_invalid_version() {
         version: "999.0".to_string(), // Invalid version
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -97,6 +99,7 @@ fn test_validate_unknown_category() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -131,6 +134,7 @@ fn test_validate_performance_budgets() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -157,6 +161,7 @@ fn test_validate_empty_categories() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -202,6 +207,7 @@ fn test_validate_conflicting_overrides() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -240,6 +246,7 @@ fn test_validate_unknown_tool_in_override() {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {

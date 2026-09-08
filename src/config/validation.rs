@@ -158,6 +158,7 @@ mod tests {
             version: "1.0".to_string(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -177,6 +178,7 @@ mod tests {
             version: "999.0".to_string(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -196,6 +198,7 @@ mod tests {
             version: "1.0".to_string(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -230,6 +233,7 @@ mod tests {
             version: "1.0".to_string(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {
@@ -263,6 +267,7 @@ mod tests {
             version: "1.0".to_string(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig {

@@ -30,6 +30,14 @@ pub struct ToolConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<String>,
 
+    /// Days an adopted repository may go unqueried before the idle sweep drops
+    /// it. A repository is adopted when a stdio process asks a running server
+    /// to index a project that server was not started with; the ones it *was*
+    /// started with are never swept. The machine-wide default, overridden by a
+    /// profile's own value and by `--adopted-repo-ttl-days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_repo_ttl_days: Option<u64>,
+
     /// Editor-specific configurations (optional)
     #[serde(default)]
     pub editors: HashMap<String, serde_json::Value>,
@@ -58,6 +66,7 @@ impl Default for ToolConfig {
             version: default_version(),
             preset: None,
             expose: Vec::new(),
+            adopted_repo_ttl_days: None,
             editors: HashMap::new(),
             profiles: HashMap::new(),
             tools: ToolsConfig::default(),
@@ -285,6 +294,12 @@ pub struct RepoProfile {
     /// Same values as `--expose`, which takes precedence when both are set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<String>,
+
+    /// Days an adopted repository may go unqueried before the idle sweep drops
+    /// it, for a server running this profile. Takes precedence over the
+    /// machine-wide value; `--adopted-repo-ttl-days` takes precedence over both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_repo_ttl_days: Option<u64>,
 
     /// Enable git integration for this profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]

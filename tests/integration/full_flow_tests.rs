@@ -119,6 +119,7 @@ async fn test_config_priority_cli_flags_override() -> Result<()> {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -346,6 +347,7 @@ async fn test_category_level_filtering() -> Result<()> {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -399,6 +401,7 @@ async fn test_tool_level_override() -> Result<()> {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -438,6 +441,7 @@ async fn test_performance_budget_max_tool_count() -> Result<()> {
         version: "1.0".to_string(),
         preset: Some("balanced".to_string()),
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {
@@ -509,6 +513,7 @@ async fn test_feature_flag_validation() -> Result<()> {
         version: "1.0".to_string(),
         preset: None,
         expose: Vec::new(),
+        adopted_repo_ttl_days: None,
         editors: HashMap::new(),
         profiles: HashMap::new(),
         tools: ToolsConfig {

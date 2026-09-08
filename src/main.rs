@@ -248,6 +248,14 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_CACHE_TTL", default_value = "1800")]
     cache_ttl: u64,
 
+    /// Days an adopted repository may go unqueried before it is dropped
+    /// (default: 7). A repo is adopted when a stdio process asks this server to
+    /// index a project it was not started with; the repos it was started with
+    /// are never dropped. Falls back to `adopted_repo_ttl_days` in the selected
+    /// profile, then to the machine-wide value in config.yaml.
+    #[arg(long, env = "NARSIL_ADOPTED_REPO_TTL_DAYS")]
+    adopted_repo_ttl_days: Option<u64>,
+
     /// Enable RDF knowledge graph storage for SPARQL queries and CCG export.
     /// NOTE: Binary must be built with --features graph for this to work.
     /// If unsure, check the startup log for warnings.
@@ -335,6 +343,7 @@ async fn main() -> Result<()> {
     info!("Starting narsil-mcp v{}", env!("CARGO_PKG_VERSION"));
 
     apply_named_profile(&mut server_args)?;
+    apply_machine_wide_defaults(&mut server_args);
 
     // --sse-host / --sse-port are SSE-specific flags; passing either one
     // implicitly activates SSE transport so `narsil-mcp --sse-host localhost`
@@ -587,7 +596,9 @@ async fn main() -> Result<()> {
         neural_config,
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
-        adopted_repo_ttl_days: index::DEFAULT_ADOPTED_REPO_TTL_DAYS,
+        adopted_repo_ttl_days: server_args
+            .adopted_repo_ttl_days
+            .unwrap_or(index::DEFAULT_ADOPTED_REPO_TTL_DAYS),
         embedding_dim: server_args.embedding_dim.unwrap_or(1000),
         use_compile_commands: server_args.use_compile_commands,
         compile_commands_path: server_args.compile_commands_path,
@@ -947,9 +958,28 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     if server_args.include.is_empty() {
         server_args.include = profile.include.clone();
     }
+    if server_args.adopted_repo_ttl_days.is_none() {
+        server_args.adopted_repo_ttl_days = profile.adopted_repo_ttl_days;
+    }
 
     info!("Applied repository profile '{}'", profile_name);
     Ok(())
+}
+
+/// Fill in the config.yaml defaults that apply whether or not `--profile` is
+/// given, for anything no flag and no profile has already set.
+///
+/// Loaded separately from `apply_named_profile`, which returns before reading
+/// the file when no profile is named. An unreadable config leaves the built-in
+/// defaults rather than stopping the server: nothing here was asked for by name.
+fn apply_machine_wide_defaults(server_args: &mut ServerArgs) {
+    if server_args.adopted_repo_ttl_days.is_some() {
+        return;
+    }
+    match config::ConfigLoader::new().load() {
+        Ok(config) => server_args.adopted_repo_ttl_days = config.adopted_repo_ttl_days,
+        Err(e) => warn!("Ignoring unreadable configuration: {}", e),
+    }
 }
 
 fn apply_bool_default(target: &mut bool, profile_value: Option<bool>) {
@@ -1254,6 +1284,59 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let resolved = resolve_repo_paths(vec![cwd.clone()], None, false).unwrap();
         assert_eq!(resolved, vec![cwd]);
+    }
+
+    /// Three places can set the idle TTL, and the more specific one has to win:
+    /// the flag over the profile, the profile over the machine-wide value.
+    #[test]
+    fn adopted_repo_ttl_takes_the_most_specific_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"version: "1.0"
+adopted_repo_ttl_days: 30
+profiles:
+  work:
+    adopted_repo_ttl_days: 3
+  bare: {}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("NARSIL_CONFIG_PATH", &config_path);
+
+        let resolve = |argv: &[&str]| {
+            let mut args = Args::try_parse_from(argv).unwrap();
+            apply_named_profile(&mut args.server).unwrap();
+            apply_machine_wide_defaults(&mut args.server);
+            args.server.adopted_repo_ttl_days
+        };
+
+        assert_eq!(resolve(&["narsil-mcp"]), Some(30), "machine-wide value");
+        assert_eq!(
+            resolve(&["narsil-mcp", "--profile", "work"]),
+            Some(3),
+            "a profile's own value beats the machine-wide one"
+        );
+        assert_eq!(
+            resolve(&["narsil-mcp", "--profile", "bare"]),
+            Some(30),
+            "a profile that sets nothing falls back to the machine-wide value"
+        );
+        assert_eq!(
+            resolve(&[
+                "narsil-mcp",
+                "--profile",
+                "work",
+                "--adopted-repo-ttl-days",
+                "1"
+            ]),
+            Some(1),
+            "the flag beats both"
+        );
+
+        std::env::remove_var("NARSIL_CONFIG_PATH");
     }
 
     #[test]

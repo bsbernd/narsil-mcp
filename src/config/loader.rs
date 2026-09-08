@@ -212,6 +212,10 @@ impl ConfigLoader {
             base.preset = overlay.preset;
         }
 
+        if overlay.adopted_repo_ttl_days.is_some() {
+            base.adopted_repo_ttl_days = overlay.adopted_repo_ttl_days;
+        }
+
         // Overlay expose groups if specified. Replaced wholesale rather than
         // appended: "expose these groups" is an absolute statement, and a
         // project config that unions with the user config could only ever
