@@ -244,7 +244,73 @@ pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<(String, Vec<PathBuf>)>
     exact.map(|url| (url, Vec::new())).or(partial)
 }
 
+/// Ask the server at `url` to index every repo in `missing`, one at a time.
+///
+/// Each call blocks until that repo's index pass has finished, so it runs on
+/// the blocking pool rather than on the async worker.
+pub async fn adopt_repos(url: &str, missing: &[PathBuf]) -> Result<()> {
+    for repo in missing {
+        info!("SSE discovery: asking {} to index {}", url, repo.display());
+        let target = url.to_string();
+        let path = repo.clone();
+        tokio::task::spawn_blocking(move || adopt_repo(&target, &path))
+            .await
+            .context("the adopt request task was cancelled")?
+            .with_context(|| format!("{} could not index {}", url, repo.display()))?;
+    }
+    Ok(())
+}
+
 // ── internals ────────────────────────────────────────────────────────────
+
+/// How long to wait for a server to finish indexing a repo it was asked to
+/// adopt. `reindex` answers only once the index pass is done, so this bounds
+/// stdio startup and not the server's work: past the timeout the server keeps
+/// indexing, and a later stdio start finds the repo already registered.
+const ADOPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Call the `reindex` tool on `url` for `repo`.
+///
+/// `reindex` registers a repository the server was never started with, which
+/// is what lets a stdio process delegate to a server that does not yet know
+/// its project. The POST carries no `Mcp-Session-Id`; the server opens a fresh
+/// session for it, exactly as it does for [`http_probe`]'s `ping`.
+fn adopt_repo(url: &str, repo: &Path) -> Result<()> {
+    let endpoint = format!("{}/mcp", url.trim_end_matches('/'));
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "reindex",
+            "arguments": { "repo": repo.to_string_lossy() },
+        },
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(ADOPT_TIMEOUT)
+        .build()?;
+    let response = client
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(serde_json::to_vec(&request)?)
+        .send()
+        .with_context(|| format!("POST reindex to {endpoint}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("HTTP {}", status.as_u16()));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .with_context(|| format!("parsing the reindex response from {endpoint}"))?;
+    match body.pointer("/error/message").and_then(|m| m.as_str()) {
+        Some(message) => Err(anyhow::anyhow!("{}", message)),
+        None => Ok(()),
+    }
+}
 
 fn ensure_parent_dir(file: &Path) -> Result<()> {
     let dir = file
@@ -599,21 +665,57 @@ mod tests {
         );
     }
 
-    /// A minimal listener that answers every connection with a bare 200 --
-    /// enough for http_probe, which only checks the status code. Serves until
-    /// the test binary exits; its thread is never joined.
-    fn spawn_200_server() -> String {
+    /// A minimal listener that answers every connection with `body` as a 200
+    /// JSON response. Serves until the test binary exits; its thread is never
+    /// joined.
+    fn spawn_json_server(body: &'static str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
             for mut stream in listener.incoming().flatten() {
-                let mut buf = [0u8; 1024];
+                let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// A live server for the probe, which only checks the status code.
+    fn spawn_200_server() -> String {
+        spawn_json_server("{}")
+    }
+
+    /// A tool that fails answers with a JSON-RPC error, not an HTTP one, so
+    /// adopt_repo has to read the body to know the repo was not indexed.
+    #[test]
+    fn adopt_repo_reports_the_servers_error() {
+        let url = spawn_json_server(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"repo not found"}}"#,
+        );
+
+        let error = adopt_repo(&url, Path::new("/r")).expect_err("a JSON-RPC error must not pass");
+        assert!(
+            error.to_string().contains("repo not found"),
+            "the server's own message must survive: {error}"
+        );
+    }
+
+    #[test]
+    fn adopt_repo_accepts_an_indexed_repo() {
+        let url = spawn_json_server(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text",
+                "text":"Registered and indexed repository: /r"}]}}"#,
+        );
+
+        adopt_repo(&url, Path::new("/r")).expect("a successful reindex must be accepted");
     }
 
     /// The regression this whole feature exists for: a stdio process started
