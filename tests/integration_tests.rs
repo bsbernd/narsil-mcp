@@ -2399,74 +2399,6 @@ fn test_hybrid_search_tfidf_finalizes_vocabulary() -> Result<()> {
 }
 
 #[test]
-fn test_find_similar_code_scoped_to_repo() -> Result<()> {
-    // Distinct relative paths: both repos would otherwise render as the same
-    // "src/lib.rs", making a cross-repo leak invisible in the file_path field
-    // that's actually checked below (document content is empty after
-    // finalize() by design, so it can't be used to tell the repos apart).
-    let repo_a = TestRepo::new()?;
-    repo_a.add_rust_file(
-        "src/alpha_module.rs",
-        r#"
-        pub fn unique_alpha_calculation(x: i32) -> i32 {
-            x * 2
-        }
-    "#,
-    )?;
-    let repo_b = TestRepo::new()?;
-    repo_b.add_rust_file(
-        "src/beta_module.rs",
-        r#"
-        pub fn unique_beta_calculation(x: i32) -> i32 {
-            x * 2
-        }
-    "#,
-    )?;
-
-    let server = TestMcpServer::start_with_repos(&[repo_a.path(), repo_b.path()])?;
-    let repo_a_name = repo_a.path().to_str().unwrap();
-    let repo_b_name = repo_b.path().to_str().unwrap();
-    server.wait_for_repo(repo_a_name, Duration::from_secs(30))?;
-    server.wait_for_repo(repo_b_name, Duration::from_secs(30))?;
-
-    // find_similar_code: the embedding store is shared across every indexed
-    // repo, so a query scoped to repo_a must not surface repo_b's file.
-    let response = server.call_tool(
-        "find_similar_code",
-        json!({
-            "repo": repo_a_name,
-            "query": "unique_alpha_calculation",
-            "max_results": 5
-        }),
-    )?;
-    assert!(response["error"].is_null());
-    let content = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("Expected text content");
-    assert!(!content.contains("Found 0 similar"));
-    assert!(content.contains("alpha_module.rs"));
-    assert!(!content.contains("beta_module.rs"));
-
-    // find_similar_to_symbol: same store, reached through a symbol lookup
-    // instead of a text query.
-    let response = server.call_tool(
-        "find_similar_to_symbol",
-        json!({
-            "repo": repo_a_name,
-            "symbol": "unique_alpha_calculation",
-            "max_results": 5
-        }),
-    )?;
-    assert!(response["error"].is_null());
-    let content = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("Expected text content");
-    assert!(!content.contains("beta_module.rs"));
-
-    Ok(())
-}
-
-#[test]
 fn test_semantic_search_scoped_to_repo() -> Result<()> {
     // Distinct relative paths so a cross-repo leak is visible in file_path.
     let repo_a = TestRepo::new()?;
@@ -2637,57 +2569,6 @@ fn test_get_symbol_definition_notes_other_real_definitions() -> Result<()> {
     let names_real = content.contains("real_impl.rs");
     let names_stub = content.contains("stub_impl.rs");
     assert!(names_real && names_stub);
-
-    Ok(())
-}
-
-#[test]
-fn test_find_unused_exports_caps_output() -> Result<()> {
-    let repo = TestRepo::new()?;
-    // Not lib.rs/main.rs: those are treated as entry points and skipped
-    // wholesale by exclude_entry_points (default true).
-    let mut content = String::new();
-    for export_idx in 0..55 {
-        content.push_str(&format!(
-            "pub fn unused_export_{export_idx}() -> i32 {{ {export_idx} }}\n"
-        ));
-    }
-    repo.add_rust_file("src/exports.rs", &content)?;
-
-    let server = TestMcpServer::start_with_repo(repo.path())?;
-    let repo_name = repo.path().to_str().unwrap();
-    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
-
-    let response = server.call_tool(
-        "find_unused_exports",
-        json!({
-            "repo": repo_name
-        }),
-    )?;
-    assert!(response["error"].is_null());
-    let content = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("Expected text content");
-
-    assert_eq!(content.matches("unused_export_").count(), 50);
-    assert!(content.contains("Showing 50 of 55"));
-
-    Ok(())
-}
-
-#[test]
-fn test_infer_types_error_missing_function() -> Result<()> {
-    let (_repo, server, repo_name) = require_arg_test_server()?;
-
-    let response = server.call_tool(
-        "infer_types",
-        json!({"repo": repo_name, "path": "src/lib.rs"}),
-    )?;
-
-    assert!(response["error"].is_object());
-    let error_msg = response["error"]["message"].as_str().unwrap();
-    assert!(error_msg.contains("infer_types"));
-    assert!(error_msg.contains("function"));
 
     Ok(())
 }

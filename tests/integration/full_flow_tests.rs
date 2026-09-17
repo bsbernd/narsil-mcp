@@ -75,8 +75,8 @@ async fn test_backwards_compatibility_cli_only() -> Result<()> {
 
     // Should have most tools enabled (excluding call graph tools since call_graph_enabled=false)
     assert!(
-        enabled_tools.len() > 50,
-        "Expected >50 tools enabled, got {}",
+        enabled_tools.len() > 40,
+        "Expected >40 tools enabled, got {}",
         enabled_tools.len()
     );
 
@@ -173,8 +173,8 @@ async fn test_minimal_preset_filters_tools() -> Result<()> {
 
     // Minimal preset should have ~26 tools
     assert!(
-        enabled_tools.len() >= 24 && enabled_tools.len() <= 28,
-        "Minimal preset should have 24-28 tools, got {}",
+        enabled_tools.len() >= 19 && enabled_tools.len() <= 23,
+        "Minimal preset should have 19-23 tools, got {}",
         enabled_tools.len()
     );
 
@@ -212,8 +212,8 @@ async fn test_balanced_preset() -> Result<()> {
 
     // Balanced preset should have ~44-51 tools (depending on which flags are enabled)
     assert!(
-        enabled_tools.len() >= 40 && enabled_tools.len() <= 55,
-        "Balanced preset should have 40-55 tools, got {}",
+        enabled_tools.len() >= 30 && enabled_tools.len() <= 40,
+        "Balanced preset should have 30-40 tools, got {}",
         enabled_tools.len()
     );
 
@@ -257,8 +257,8 @@ async fn test_full_preset() -> Result<()> {
 
     // Full preset should have most/all tools, minus ones requiring unavailable flags.
     assert!(
-        enabled_tools.len() >= 60,
-        "Full preset should have 60+ tools, got {}",
+        enabled_tools.len() >= 50,
+        "Full preset should have 50+ tools, got {}",
         enabled_tools.len()
     );
 
@@ -292,8 +292,8 @@ async fn test_security_focused_preset() -> Result<()> {
     // Security preset should have ~28 tools
     // Security (9) + SupplyChain (4) + Analysis (11) + Repository basics (4)
     assert!(
-        enabled_tools.len() >= 26 && enabled_tools.len() <= 32,
-        "Security preset should have 26-32 tools, got {}",
+        enabled_tools.len() >= 22 && enabled_tools.len() <= 28,
+        "Security preset should have 22-28 tools, got {}",
         enabled_tools.len()
     );
 
@@ -308,7 +308,6 @@ async fn test_security_focused_preset() -> Result<()> {
 
     // Analysis tools should be enabled
     assert!(enabled_tools.contains(&"get_control_flow"));
-    assert!(enabled_tools.contains(&"find_dead_code"));
 
     // Core navigation tools should be enabled
     assert!(enabled_tools.contains(&"list_repos"));
@@ -534,7 +533,7 @@ async fn test_feature_flag_validation() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_completeness() -> Result<()> {
     // Verify all tools in TOOL_METADATA have required fields
-    assert_eq!(TOOL_METADATA.len(), 72, "Expected 72 tools in metadata");
+    assert_eq!(TOOL_METADATA.len(), 56, "Expected 56 tools in metadata");
 
     for (name, meta) in TOOL_METADATA.iter() {
         // Name should match key

@@ -94,7 +94,7 @@ fn test_full_mcp_flow_claude_desktop() {
 
     // Claude Desktop should get full preset (50-60 tools without feature flags)
     assert!(
-        enabled_tools.len() >= 50 && enabled_tools.len() <= 60,
+        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
         "Claude Desktop should get 50-60 tools in full preset (without flags), got {}",
         enabled_tools.len()
     );
@@ -171,7 +171,7 @@ fn test_mcp_flow_no_client_info() {
 
     // Should default to full preset (50-60 tools without flags)
     assert!(
-        enabled_tools.len() >= 50 && enabled_tools.len() <= 60,
+        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
         "No client info should default to full preset, got {}",
         enabled_tools.len()
     );
@@ -187,8 +187,8 @@ fn test_all_tools_have_metadata() {
 
     // Verify we have a reasonable number of tools
     assert!(
-        TOOL_METADATA.len() >= 70,
-        "Should have at least 70 tools in metadata"
+        TOOL_METADATA.len() >= 50,
+        "Should have at least 50 tools in metadata"
     );
 }
 
@@ -351,7 +351,7 @@ fn test_cli_preset_overrides_editor_detection() {
 
     // Should get full preset (50-60 tools), NOT minimal preset (20-30)
     assert!(
-        enabled_tools.len() >= 50 && enabled_tools.len() <= 60,
+        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
         "CLI preset=full should override Zed's default minimal preset, got {} tools",
         enabled_tools.len()
     );
@@ -385,8 +385,8 @@ fn test_cli_preset_all_values() {
     let filter = ToolFilter::new(config, &options, None);
     let balanced_tools = filter.get_enabled_tools();
     assert!(
-        balanced_tools.len() >= 30 && balanced_tools.len() <= 50,
-        "balanced preset should have 30-50 tools, got {}",
+        balanced_tools.len() >= 20 && balanced_tools.len() <= 35,
+        "balanced preset should have 20-35 tools, got {}",
         balanced_tools.len()
     );
 
@@ -398,8 +398,8 @@ fn test_cli_preset_all_values() {
     let filter = ToolFilter::new(config, &options, None);
     let full_tools = filter.get_enabled_tools();
     assert!(
-        full_tools.len() >= 50 && full_tools.len() <= 60,
-        "full preset should have 50-60 tools, got {}",
+        full_tools.len() >= 35 && full_tools.len() <= 45,
+        "full preset should have 35-45 tools, got {}",
         full_tools.len()
     );
 
@@ -433,7 +433,7 @@ fn test_cli_preset_invalid_value_fallback() {
 
     // Invalid preset should fall back to Full
     assert!(
-        enabled_tools.len() >= 50 && enabled_tools.len() <= 60,
+        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
         "Invalid preset should fall back to Full, got {} tools",
         enabled_tools.len()
     );

@@ -136,20 +136,3 @@ impl ToolHandler for GetExportMapHandler {
         engine.get_export_map(repo, path).await
     }
 }
-
-/// Handler for workspace_symbol_search tool
-pub struct WorkspaceSymbolSearchHandler;
-
-#[async_trait::async_trait]
-impl ToolHandler for WorkspaceSymbolSearchHandler {
-    fn name(&self) -> &'static str {
-        "workspace_symbol_search"
-    }
-
-    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
-        let query = args.get_str("query").unwrap_or("");
-        let kind = args.get_str("kind");
-        let limit = args.get_u64_or("limit", 20) as usize;
-        engine.workspace_symbol_search(query, kind, limit).await
-    }
-}

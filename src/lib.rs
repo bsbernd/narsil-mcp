@@ -7,7 +7,6 @@ pub mod callgraph;
 pub mod cfg;
 pub mod chunking;
 pub mod config;
-pub mod dead_code;
 pub mod dfg;
 pub mod embeddings;
 pub mod extract;
@@ -28,7 +27,6 @@ pub mod symbols;
 pub mod syscall;
 pub mod taint;
 pub mod tool_metadata;
-pub mod type_inference;
 pub mod validation;
 
 // Native-only modules (require tokio, lsp, etc.)

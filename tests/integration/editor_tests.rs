@@ -153,7 +153,7 @@ fn test_claude_desktop_gets_full_preset() {
     // (All tools that don't require Git, CallGraph, Neural flags)
     // With all flags enabled, would be 70+ tools
     assert!(
-        enabled.len() >= 50 && enabled.len() <= 60,
+        enabled.len() >= 35 && enabled.len() <= 45,
         "Claude Desktop should get full preset (50-60 tools without flags), got {}",
         enabled.len()
     );
@@ -186,7 +186,7 @@ fn test_claude_alternate_name() {
 
     // "claude" should also map to full preset (without flags)
     assert!(
-        enabled.len() >= 50 && enabled.len() <= 60,
+        enabled.len() >= 35 && enabled.len() <= 45,
         "'claude' editor should map to full preset, got {} tools",
         enabled.len()
     );
@@ -207,7 +207,7 @@ fn test_unknown_editor_gets_full_preset() {
 
     // Unknown editors should get all tools (full preset, without flags = 50-60)
     assert!(
-        enabled.len() >= 50 && enabled.len() <= 60,
+        enabled.len() >= 35 && enabled.len() <= 45,
         "Unknown editor should get full preset by default, got {}",
         enabled.len()
     );
@@ -223,7 +223,7 @@ fn test_no_client_info_gets_full_preset() {
 
     // No client info = full preset (without flags = 50-60)
     assert!(
-        enabled.len() >= 50 && enabled.len() <= 60,
+        enabled.len() >= 35 && enabled.len() <= 45,
         "No client info should get full preset, got {}",
         enabled.len()
     );

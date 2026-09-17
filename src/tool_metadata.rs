@@ -345,7 +345,7 @@ lazy_static! {
             aliases: vec!["performance", "stats"],
         });
 
-        // ===== Symbol Tools (7) =====
+        // ===== Symbol Tools (6) =====
 
         map.insert("find_symbols", ToolMetadata {
             name: "find_symbols",
@@ -480,28 +480,7 @@ lazy_static! {
             aliases: vec!["exports", "export_map"],
         });
 
-        map.insert("workspace_symbol_search", ToolMetadata {
-            name: "workspace_symbol_search",
-            description: "Typo-tolerant trigram symbol search across every indexed repo — takes no repo argument and is far slower than find_symbols. Use when the exact name is unknown.",
-            category: ToolCategory::Symbols,
-            tags: ["search", "symbols", "fuzzy", "workspace"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Symbol name or partial name to search for"},
-                    "kind": {"type": "string", "enum": ["function", "class", "struct", "interface", "enum", "variable", "all"], "description": "Filter by symbol kind (default: all)"},
-                    "limit": {"type": "integer", "description": "Maximum results to return (default: 20)"}
-                },
-                "required": ["query"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["search_symbols", "fuzzy_symbols"],
-        });
-
-        // ===== Search Tools (9) =====
+        // ===== Search Tools (3) =====
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
@@ -570,125 +549,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["combined_search", "rrf_search"],
-        });
-
-        map.insert("search_chunks", ToolMetadata {
-            name: "search_chunks",
-            description: "Search at chunk granularity, each hit carrying its symbol context. Usually search_code or semantic_search is what you want.",
-            category: ToolCategory::Search,
-            tags: ["search", "chunks", "ast", "semantic"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "repo": {"type": "string", "description": "Repository to limit to (optional, all repositories if omitted). Absolute path, relative path, or `.`."},
-                    "chunk_type": {"type": "string", "enum": ["function", "method", "class", "trait", "module", "all"], "description": "Filter by chunk type"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: false)"}
-                },
-                "required": ["query"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["chunk_search", "ast_search"],
-        });
-
-        map.insert("find_similar_code", ToolMetadata {
-            name: "find_similar_code",
-            description: "Code resembling a snippet you supply, by TF-IDF vector similarity. Finds near-duplicates; for meaning-based lookup use semantic_search.",
-            category: ToolCategory::Search,
-            tags: ["similar", "duplicate", "clone", "tfidf"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Code snippet to find similar code for"},
-                    "repo": {"type": "string", "description": "Repository to search in (optional, searches all if omitted). Absolute path, relative path, or `.`."},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: false)"}
-                },
-                "required": ["query"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["similar_code", "find_duplicates"],
-        });
-
-        map.insert("find_similar_to_symbol", ToolMetadata {
-            name: "find_similar_to_symbol",
-            description: "Near-duplicates of a named symbol, by TF-IDF vector similarity. Only symbols whose signature was captured at index time are present.",
-            category: ToolCategory::Search,
-            tags: ["similar", "symbol", "clone", "duplicate"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "symbol": {"type": "string", "description": "Symbol name to find similar code for"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
-                },
-                "required": ["repo", "symbol"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["similar_symbol", "find_related"],
-        });
-
-        map.insert("get_embedding_stats", ToolMetadata {
-            name: "get_embedding_stats",
-            description: "Document count, vocabulary size and dimension of the TF-IDF index behind find_similar_code. Diagnostics, not a code query.",
-            category: ToolCategory::Search,
-            tags: ["stats", "embedding", "tfidf", "index"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: HashSet::new(),
-            input_schema: json!({"type": "object", "properties": {}, "required": []}),
-            requires_api_key: false,
-            aliases: vec!["embedding_stats", "tfidf_stats"],
-        });
-
-        map.insert("get_chunk_stats", ToolMetadata {
-            name: "get_chunk_stats",
-            description: "Chunk counts and sizes for a repository — diagnostics for the chunker, not a code query.",
-            category: ToolCategory::Search,
-            tags: ["stats", "chunks", "ast", "analysis"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["chunk_stats", "chunking_stats"],
-        });
-
-        map.insert("get_chunks", ToolMetadata {
-            name: "get_chunks",
-            description: "Inspect how the chunker split one file. A debug view of the index behind semantic_search — re-emits the whole file.",
-            category: ToolCategory::Search,
-            tags: ["chunks", "ast", "code", "symbols"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "File path"},
-                    "include_imports": {"type": "boolean", "description": "Include import statements in context (default: true)"}
-                },
-                "required": ["repo", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["chunks", "code_chunks"],
         });
 
         // ===== Call Graph Tools (6) =====
@@ -1391,7 +1251,7 @@ lazy_static! {
             aliases: vec!["upgrade_path", "upgrade"],
         });
 
-        // ===== Analysis Tools (11) =====
+        // ===== Analysis Tools (3) =====
 
         map.insert("get_control_flow", ToolMetadata {
             name: "get_control_flow",
@@ -1412,28 +1272,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["cfg", "control_flow"],
-        });
-
-        map.insert("find_dead_code", ToolMetadata {
-            name: "find_dead_code",
-            description: "Find unreachable code blocks in a function or file using control flow analysis.",
-            category: ToolCategory::Analysis,
-            tags: ["dead-code", "analysis", "cfg", "unreachable"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string", "description": "File path to analyze"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: true)"}
-                },
-                "required": ["repo", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["dead_code", "unreachable"],
         });
 
         map.insert("get_data_flow", ToolMetadata {
@@ -1476,181 +1314,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["reaching_defs", "definitions"],
-        });
-
-        map.insert("find_uninitialized", ToolMetadata {
-            name: "find_uninitialized",
-            description: "Find variables that may be used before being initialized.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "uninitialized", "variables", "bugs"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: true)"}
-                },
-                "required": ["repo", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["uninitialized", "uninitialized_vars"],
-        });
-
-        map.insert("find_dead_stores", ToolMetadata {
-            name: "find_dead_stores",
-            description: "Find variable assignments that are never read (dead stores).",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "dead-stores", "variables", "optimization"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "function": {"type": "string", "description": "Optional: specific function to analyze"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: true)"}
-                },
-                "required": ["repo", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["dead_stores", "unused_assignments"],
-        });
-
-        map.insert("infer_types", ToolMetadata {
-            name: "infer_types",
-            description: "Infer types for variables in a Python/JavaScript/TypeScript function. Shows what types flow through the code without running external type checkers.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "types", "inference", "python", "javascript"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "function": {"type": "string"}
-                },
-                "required": ["repo", "path", "function"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["type_inference", "infer"],
-        });
-
-        map.insert("check_type_errors", ToolMetadata {
-            name: "check_type_errors",
-            description: "Find potential type errors in Python/JavaScript/TypeScript code without running mypy/tsc. Detects type mismatches, undefined variables, etc.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "types", "errors", "python", "javascript"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: true)"}
-                },
-                "required": ["repo", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["type_errors", "type_check"],
-        });
-
-        map.insert("get_typed_taint_flow", ToolMetadata {
-            name: "get_typed_taint_flow",
-            description: "Enhanced taint analysis with type information. More precise than untyped taint tracking, combines data flow with type inference.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "taint", "types", "security", "dataflow"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "source_line": {"type": "integer", "description": "Line number to trace from"}
-                },
-                "required": ["repo", "path", "source_line"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["typed_taint", "taint_flow"],
-        });
-
-        map.insert("get_import_graph", ToolMetadata {
-            name: "get_import_graph",
-            description: "Build and analyze the import/dependency graph for a codebase. Shows which files import which other files, helps identify circular dependencies.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "imports", "dependencies", "graph", "circular"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "file": {"type": "string", "description": "Optional: focus on imports from/to a specific file"},
-                    "direction": {"type": "string", "enum": ["imports", "importers", "both"], "description": "Direction to show (default: both)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["import_graph", "dependency_graph"],
-        });
-
-        map.insert("find_circular_imports", ToolMetadata {
-            name: "find_circular_imports",
-            description: "Detect circular import dependencies in the codebase. Returns all cycles with the files involved.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "imports", "circular", "dependencies", "cycles"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: true)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["circular_imports", "import_cycles"],
-        });
-
-        map.insert("find_unused_exports", ToolMetadata {
-            name: "find_unused_exports",
-            description: "Detect exported symbols never imported by other files in repo. Cross-file analysis using import graph. Configurable to exclude public API surface.",
-            category: ToolCategory::Analysis,
-            tags: ["analysis", "exports", "dead-code", "unused", "imports"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "exclude_entry_points": {"type": "boolean", "description": "Exclude entry point files like lib.rs, main.rs, index.js (default: true)"},
-                    "exclude_patterns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Glob patterns for files to exclude from analysis (public API surface)"
-                    },
-                    "limit": {"type": "integer", "description": "Max unused exports to list (default: 50; 0 = all)"},
-                    "offset": {"type": "integer", "description": "Index of the first unused export to list (default: 0)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["unused_exports", "dead_exports"],
         });
 
         // ===== Graph Tools (1) =====

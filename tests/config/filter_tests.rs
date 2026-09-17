@@ -100,7 +100,7 @@ fn test_filter_by_feature_flags_all_enabled() {
     let enabled = filter.get_enabled_tools();
 
     // Should include tools from all categories
-    assert!(enabled.len() >= 70, "Most tools should be enabled");
+    assert!(enabled.len() >= 50, "Most tools should be enabled");
     assert!(enabled.contains(&"get_blame"));
     assert!(enabled.contains(&"get_call_graph"));
 }
@@ -388,7 +388,7 @@ fn test_empty_config_with_all_flags_enabled() {
 
     // Should get most tools; some still depend on compile-time or runtime flags.
     assert!(
-        enabled.len() >= 65,
+        enabled.len() >= 50,
         "Should have most tools enabled with all flags"
     );
 }

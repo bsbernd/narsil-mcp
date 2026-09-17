@@ -76,18 +76,11 @@ impl ToolRegistry {
         registry.register(Box::new(symbols::GetDependenciesHandler));
         registry.register(Box::new(symbols::FindSymbolUsagesHandler));
         registry.register(Box::new(symbols::GetExportMapHandler));
-        registry.register(Box::new(symbols::WorkspaceSymbolSearchHandler));
 
         // Register search handlers
         registry.register(Box::new(search::SearchCodeHandler));
         registry.register(Box::new(search::SemanticSearchHandler));
         registry.register(Box::new(search::HybridSearchHandler));
-        registry.register(Box::new(search::SearchChunksHandler));
-        registry.register(Box::new(search::FindSimilarCodeHandler));
-        registry.register(Box::new(search::FindSimilarToSymbolHandler));
-        registry.register(Box::new(search::GetEmbeddingStatsHandler));
-        registry.register(Box::new(search::GetChunkStatsHandler));
-        registry.register(Box::new(search::GetChunksHandler));
 
         // Register call graph handlers
         registry.register(Box::new(callgraph::GetCallGraphHandler));
@@ -133,17 +126,8 @@ impl ToolRegistry {
 
         // Register analysis handlers
         registry.register(Box::new(analysis::GetControlFlowHandler));
-        registry.register(Box::new(analysis::FindDeadCodeHandler));
         registry.register(Box::new(analysis::GetDataFlowHandler));
         registry.register(Box::new(analysis::GetReachingDefinitionsHandler));
-        registry.register(Box::new(analysis::FindUninitializedHandler));
-        registry.register(Box::new(analysis::FindDeadStoresHandler));
-        registry.register(Box::new(analysis::InferTypesHandler));
-        registry.register(Box::new(analysis::CheckTypeErrorsHandler));
-        registry.register(Box::new(analysis::GetTypedTaintFlowHandler));
-        registry.register(Box::new(analysis::GetImportGraphHandler));
-        registry.register(Box::new(analysis::FindCircularImportsHandler));
-        registry.register(Box::new(analysis::FindUnusedExportsHandler));
 
         // Register graph visualization handler
         registry.register(Box::new(graph::GetCodeGraphHandler));

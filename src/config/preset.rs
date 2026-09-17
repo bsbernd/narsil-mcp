@@ -107,14 +107,10 @@ impl Preset {
             "get_dependencies",
             "find_symbol_usages",
             "get_export_map",
-            "workspace_symbol_search",
             // Search (basic, 6 tools)
             "search_code",
             "semantic_search",
             "hybrid_search",
-            "search_chunks",
-            "get_chunk_stats",
-            "get_chunks",
             // LSP (3 tools - basic, not dependent on --lsp flag)
             "get_hover_info",
             "get_type_info",
@@ -142,13 +138,6 @@ impl Preset {
             "get_modified_files",
         ]);
 
-        // Add more search tools
-        tools.extend([
-            "find_similar_code",
-            "find_similar_to_symbol",
-            "get_embedding_stats",
-        ]);
-
         // Add some call graph tools (requires --call-graph flag)
         tools.extend([
             "get_call_graph",
@@ -163,13 +152,7 @@ impl Preset {
         tools.extend(["scan_security", "find_injection_vulnerabilities"]);
 
         // Add code analysis basics
-        tools.extend([
-            "get_control_flow",
-            "find_dead_code",
-            "get_data_flow",
-            "get_import_graph",
-            "find_circular_imports",
-        ]);
+        tools.extend(["get_control_flow", "get_data_flow"]);
 
         tools
     }
@@ -196,7 +179,6 @@ impl Preset {
             "find_references",
             // Search
             "search_code",
-            "search_chunks",
             // Security tools (9)
             "scan_security",
             "check_owasp_top10",
@@ -214,14 +196,8 @@ impl Preset {
             "find_upgrade_path",
             // Code analysis (useful for security)
             "get_control_flow",
-            "find_dead_code",
             "get_data_flow",
             "get_reaching_definitions",
-            "find_uninitialized",
-            "find_dead_stores",
-            "infer_types",
-            "check_type_errors",
-            "get_typed_taint_flow",
         ]
         .iter()
         .copied()
@@ -255,28 +231,21 @@ pub enum ExposeGroup {
     /// flow. Off by default — a model holding the source can work these out,
     /// so the schemas cost context to restate what is already in front of it.
     Analysis,
-    /// Defect finders that duplicate compiler diagnostics. Off by default —
-    /// the build already reports these, with type information narsil lacks.
-    Lint,
     /// Vulnerability scanning and taint tracking.
     Security,
     /// SBOM, licences, dependency and upgrade checks.
     SupplyChain,
-    /// Chunk and embedding retrieval, similarity search.
-    Retrieval,
 }
 
 impl ExposeGroup {
     /// Every group, in the order they are printed in `--help` and the docs.
-    pub const ALL: [ExposeGroup; 8] = [
+    pub const ALL: [ExposeGroup; 6] = [
         ExposeGroup::Base,
         ExposeGroup::Code,
         ExposeGroup::Git,
         ExposeGroup::Analysis,
-        ExposeGroup::Lint,
         ExposeGroup::Security,
         ExposeGroup::SupplyChain,
-        ExposeGroup::Retrieval,
     ];
 
     /// The CLI spelling of this group.
@@ -286,10 +255,8 @@ impl ExposeGroup {
             ExposeGroup::Code => "code",
             ExposeGroup::Git => "git",
             ExposeGroup::Analysis => "analysis",
-            ExposeGroup::Lint => "lint",
             ExposeGroup::Security => "security",
             ExposeGroup::SupplyChain => "supply-chain",
-            ExposeGroup::Retrieval => "retrieval",
         }
     }
 
@@ -309,10 +276,8 @@ impl ExposeGroup {
             ExposeGroup::Code => Self::code_tools(),
             ExposeGroup::Git => Self::git_tools(),
             ExposeGroup::Analysis => Self::analysis_tools(),
-            ExposeGroup::Lint => Self::lint_tools(),
             ExposeGroup::Security => Self::security_tools(),
             ExposeGroup::SupplyChain => Self::supply_chain_tools(),
-            ExposeGroup::Retrieval => Self::retrieval_tools(),
         }
     }
 
@@ -399,11 +364,9 @@ impl ExposeGroup {
         [
             "get_complexity",
             "get_function_hotspots",
-            "get_import_graph",
-            "find_circular_imports",
-            "find_unused_exports",
             "get_control_flow",
             "get_data_flow",
+            "get_code_graph",
         ]
         .iter()
         .copied()
@@ -427,19 +390,6 @@ impl ExposeGroup {
         .collect()
     }
 
-    fn lint_tools() -> HashSet<&'static str> {
-        [
-            "find_dead_code",
-            "find_dead_stores",
-            "find_uninitialized",
-            "check_type_errors",
-            "infer_types",
-        ]
-        .iter()
-        .copied()
-        .collect()
-    }
-
     fn security_tools() -> HashSet<&'static str> {
         [
             "scan_security",
@@ -450,7 +400,6 @@ impl ExposeGroup {
             "find_injection_vulnerabilities",
             "trace_taint",
             "get_taint_sources",
-            "get_typed_taint_flow",
             "explain_vulnerability",
             "suggest_fix",
         ]
@@ -465,22 +414,6 @@ impl ExposeGroup {
             "check_dependencies",
             "check_licenses",
             "find_upgrade_path",
-        ]
-        .iter()
-        .copied()
-        .collect()
-    }
-
-    fn retrieval_tools() -> HashSet<&'static str> {
-        [
-            "get_chunks",
-            "search_chunks",
-            "get_chunk_stats",
-            "get_embedding_stats",
-            "find_similar_code",
-            "find_similar_to_symbol",
-            "workspace_symbol_search",
-            "get_code_graph",
         ]
         .iter()
         .copied()
@@ -630,7 +563,6 @@ mod tests {
     fn test_expose_of_names_the_owning_group() {
         assert_eq!(ExposeGroup::of("get_callers"), Some(ExposeGroup::Code));
         assert_eq!(ExposeGroup::of("get_blame"), Some(ExposeGroup::Git));
-        assert_eq!(ExposeGroup::of("find_dead_stores"), Some(ExposeGroup::Lint));
         assert_eq!(
             ExposeGroup::of("get_complexity"),
             Some(ExposeGroup::Analysis)
@@ -650,10 +582,7 @@ mod tests {
             "get_complexity",
             "get_control_flow",
             "get_data_flow",
-            "get_import_graph",
             "get_function_hotspots",
-            "find_circular_imports",
-            "find_unused_exports",
         ] {
             assert!(
                 analysis.contains(restated),
