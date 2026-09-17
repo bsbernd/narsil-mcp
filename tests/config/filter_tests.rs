@@ -2,11 +2,9 @@
 ///
 /// These tests verify that the filtering logic correctly applies:
 /// 1. Feature flags (git_enabled → Git tools)
-/// 2. Category configuration
-/// 3. Tool overrides
-/// 4. Editor presets (future)
-/// 5. Performance budgets
-use narsil_mcp::config::schema::{CategoryConfig, PerformanceConfig, ToolConfig, ToolOverride};
+/// 2. Tool overrides
+/// 3. Expose groups
+use narsil_mcp::config::schema::{ToolConfig, ToolOverride};
 use narsil_mcp::config::ConfigLoader;
 use narsil_mcp::index::EngineOptions;
 use narsil_mcp::tool_metadata::{FeatureFlag, TOOL_METADATA};
@@ -26,7 +24,7 @@ fn test_filter_by_feature_flags_git() {
     };
 
     let config = ToolConfig::default();
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Git tools should be included
@@ -60,7 +58,7 @@ fn test_filter_by_feature_flags_call_graph() {
     };
 
     let config = ToolConfig::default();
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Call graph tools should be included
@@ -96,56 +94,13 @@ fn test_filter_by_feature_flags_all_enabled() {
     };
 
     let config = ToolConfig::default();
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Should include tools from all categories
     assert!(enabled.len() >= 35, "Most tools should be enabled");
     assert!(enabled.contains(&"get_blame"));
     assert!(enabled.contains(&"get_call_graph"));
-}
-
-#[test]
-fn test_filter_by_category_disabled() {
-    // Disable Search category
-    let mut config = ToolConfig::default();
-    config.tools.categories.insert(
-        "Search".to_string(),
-        CategoryConfig {
-            enabled: false,
-            description: None,
-            required_flags: vec![],
-            config: HashMap::new(),
-        },
-    );
-
-    let options = EngineOptions::default();
-    let filter = ToolFilter::new(config, &options, None);
-    let enabled = filter.get_enabled_tools();
-
-    // Search tools should NOT be included
-    assert!(
-        !enabled.contains(&"search_code"),
-        "Search tools should be disabled"
-    );
-    assert!(
-        !enabled.contains(&"semantic_search"),
-        "Search tools should be disabled"
-    );
-    assert!(
-        !enabled.contains(&"hybrid_search"),
-        "Search tools should be disabled"
-    );
-
-    // Other tools should still be included
-    assert!(
-        enabled.contains(&"list_repos"),
-        "Repository tools should be enabled"
-    );
-    assert!(
-        enabled.contains(&"find_symbols"),
-        "Symbol tools should be enabled"
-    );
 }
 
 #[test]
@@ -166,7 +121,7 @@ fn test_filter_by_tool_override_disabled() {
 
     let options = EngineOptions::default();
 
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     assert!(
@@ -196,7 +151,7 @@ fn test_filter_by_tool_override_enabled() {
         ..Default::default()
     };
 
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // get_blame should be enabled due to override
@@ -213,34 +168,11 @@ fn test_filter_by_tool_override_enabled() {
 }
 
 #[test]
-fn test_performance_budget_respected() {
-    // Set max_tool_count to 10. Use the Balanced preset because Full bypasses
-    // the cap by design (see issue #23 — "Full" means "give me everything").
-    let mut config = ToolConfig::default();
-    config.performance.max_tool_count = 10;
-    config.preset = Some("balanced".to_string());
-
-    let options = EngineOptions::default();
-    let filter = ToolFilter::new(config, &options, None);
-    let enabled = filter.get_enabled_tools();
-
-    // Should not exceed budget
-    assert!(
-        enabled.len() <= 10,
-        "Should not exceed max_tool_count budget"
-    );
-
-    // Should prioritize low-performance-impact tools
-    // Check that we got some basic tools
-    assert!(!enabled.is_empty(), "Should have at least some tools");
-}
-
-#[test]
 fn test_default_config_includes_all_basic_tools() {
     // Default config with no feature flags
     let config = ToolConfig::default();
     let options = EngineOptions::default();
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Should include Repository, Symbols, Search categories
@@ -263,7 +195,7 @@ fn test_filtering_performance() {
         ..Default::default()
     };
 
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
 
     let _ = filter.get_enabled_tools();
 
@@ -287,10 +219,10 @@ fn test_filtering_is_deterministic() {
         ..Default::default()
     };
 
-    let filter = ToolFilter::new(config.clone(), &options, None);
+    let filter = ToolFilter::new(config.clone(), &options);
     let enabled1 = filter.get_enabled_tools();
 
-    let filter2 = ToolFilter::new(config, &options, None);
+    let filter2 = ToolFilter::new(config, &options);
     let enabled2 = filter2.get_enabled_tools();
 
     assert_eq!(enabled1, enabled2, "Filtering should be deterministic");
@@ -328,7 +260,7 @@ fn test_all_enabled_tools_have_metadata() {
         ..Default::default()
     };
 
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     for tool_name in enabled {
@@ -338,33 +270,6 @@ fn test_all_enabled_tools_have_metadata() {
             tool_name
         );
     }
-}
-
-#[test]
-fn test_filter_respects_category_required_flags() {
-    // Category enabled but required flag not set
-    let mut config = ToolConfig::default();
-    config.tools.categories.insert(
-        "Git".to_string(),
-        CategoryConfig {
-            enabled: true,
-            description: None,
-            required_flags: vec!["git".to_string()],
-            config: HashMap::new(),
-        },
-    );
-
-    let options = EngineOptions {
-        git_enabled: false,
-        ..Default::default()
-    };
-
-    let filter = ToolFilter::new(config, &options, None);
-    let enabled = filter.get_enabled_tools();
-
-    // Git tools should NOT be included (missing required flag)
-    assert!(!enabled.contains(&"get_blame"));
-    assert!(!enabled.contains(&"get_file_history"));
 }
 
 #[test]
@@ -383,7 +288,7 @@ fn test_empty_config_with_all_flags_enabled() {
         ..Default::default()
     };
 
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Should get most tools; some still depend on compile-time or runtime flags.
@@ -400,40 +305,12 @@ fn test_filter_with_loaded_config() {
     let config = loader.load().unwrap();
 
     let options = EngineOptions::default();
-    let filter = ToolFilter::new(config, &options, None);
+    let filter = ToolFilter::new(config, &options);
     let enabled = filter.get_enabled_tools();
 
     // Should have basic tools
     assert!(!enabled.is_empty());
     assert!(enabled.contains(&"list_repos"));
-}
-
-#[test]
-fn test_security_focused_preset() {
-    let config = ToolConfig {
-        preset: Some("security-focused".to_string()),
-        ..Default::default()
-    };
-
-    let options = EngineOptions::default();
-    let filter = ToolFilter::new(config, &options, None);
-
-    let enabled = filter.get_enabled_tools();
-    println!("\nSecurity-focused preset tool count: {}", enabled.len());
-    println!("Enabled tools:");
-    for tool in &enabled {
-        println!("  {}", tool);
-    }
-
-    // Should have ~32 tools as defined in preset.rs
-    assert!(
-        enabled.len() >= 10 && enabled.len() <= 16,
-        "Security-focused preset should have 10-16 tools, got {}",
-        enabled.len()
-    );
-
-    // Should include analysis tools
-    assert!(enabled.contains(&"get_control_flow"));
 }
 
 /// All feature flags on, so nothing below is filtered out by a missing flag.
@@ -453,7 +330,7 @@ fn all_features_enabled() -> EngineOptions {
 
 #[test]
 fn test_expose_narrows_to_selected_groups() {
-    let filter = ToolFilter::new(ToolConfig::default(), &all_features_enabled(), None)
+    let filter = ToolFilter::new(ToolConfig::default(), &all_features_enabled())
         .with_expose(&[ExposeGroup::Code, ExposeGroup::Git]);
     let enabled = filter.get_enabled_tools();
 
@@ -467,39 +344,6 @@ fn test_expose_narrows_to_selected_groups() {
     );
 }
 
-/// Without the flag the filter must behave exactly as before.
-#[test]
-fn test_expose_empty_leaves_preset_in_charge() {
-    let options = all_features_enabled();
-    let before = ToolFilter::new(ToolConfig::default(), &options, None).get_enabled_tools();
-    let after = ToolFilter::new(ToolConfig::default(), &options, None)
-        .with_expose(&[])
-        .get_enabled_tools();
-
-    assert_eq!(before.len(), after.len());
-}
-
-/// The two compose by intersection: a group cannot re-enable what the preset
-/// excluded, and the preset cannot re-enable what the groups excluded.
-#[test]
-fn test_expose_intersects_preset() {
-    let config = ToolConfig {
-        preset: Some("minimal".to_string()),
-        ..Default::default()
-    };
-
-    let filter = ToolFilter::new(config, &all_features_enabled(), None)
-        .with_expose(&[ExposeGroup::Code, ExposeGroup::Git]);
-    let enabled = filter.get_enabled_tools();
-
-    // In both minimal and code -> present.
-    assert!(enabled.contains(&"find_symbols"));
-    // In the git group but not in the minimal preset -> still excluded.
-    assert!(!enabled.contains(&"get_blame"));
-    // In the minimal preset but not in code/git/base -> still excluded.
-    assert!(!enabled.contains(&"search_chunks"));
-}
-
 /// A top-level `expose:` in config.yaml is the machine-wide default, for
 /// invocations whose command line comes from an editor plugin.
 #[test]
@@ -509,7 +353,7 @@ fn test_config_expose_applies_without_the_flag() {
         ..Default::default()
     };
 
-    let enabled = ToolFilter::new(config, &all_features_enabled(), None).get_enabled_tools();
+    let enabled = ToolFilter::new(config, &all_features_enabled()).get_enabled_tools();
 
     assert!(enabled.contains(&"find_symbols"));
     assert!(enabled.contains(&"get_blame"));
@@ -523,7 +367,7 @@ fn test_cli_expose_overrides_config_expose() {
         ..Default::default()
     };
 
-    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
+    let enabled = ToolFilter::new(config, &all_features_enabled())
         .with_expose(&[ExposeGroup::Analysis])
         .get_enabled_tools();
 
@@ -544,7 +388,7 @@ fn test_empty_cli_expose_keeps_config_expose() {
         ..Default::default()
     };
 
-    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
+    let enabled = ToolFilter::new(config, &all_features_enabled())
         .with_expose(&[])
         .get_enabled_tools();
 
@@ -560,32 +404,8 @@ fn test_unknown_config_expose_group_is_ignored() {
         ..Default::default()
     };
 
-    let enabled = ToolFilter::new(config, &all_features_enabled(), None).get_enabled_tools();
+    let enabled = ToolFilter::new(config, &all_features_enabled()).get_enabled_tools();
 
     assert!(enabled.contains(&"find_symbols"), "the valid group applies");
     assert!(!enabled.contains(&"get_blame"), "the typo adds nothing");
-}
-
-/// An explicit --expose is a deliberate narrowing, so it must not be trimmed
-/// further by the editor token budget.
-#[test]
-fn test_expose_bypasses_performance_budget() {
-    let config = ToolConfig {
-        preset: Some("balanced".to_string()),
-        performance: PerformanceConfig {
-            max_tool_count: 5,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let enabled = ToolFilter::new(config, &all_features_enabled(), None)
-        .with_expose(&[ExposeGroup::Code])
-        .get_enabled_tools();
-
-    assert!(
-        enabled.len() > 5,
-        "max_tool_count must not trim an explicit --expose, got {}",
-        enabled.len()
-    );
 }

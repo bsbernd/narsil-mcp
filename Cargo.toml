@@ -134,14 +134,6 @@ harness = false
 name = "parsing"
 harness = false
 
-[[bench]]
-name = "filtering"
-harness = false
-
-[[bench]]
-name = "token_usage"
-harness = false
-
 [profile.release]
 lto = "thin"
 codegen-units = 16

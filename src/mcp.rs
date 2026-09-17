@@ -1,42 +1,15 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
 use crate::config::schema::ToolConfig;
-use crate::config::{ClientInfo, ConfigLoader, ExposeGroup, ToolFilter};
+use crate::config::{ConfigLoader, ExposeGroup, ToolFilter};
 use crate::index::CodeIntelEngine;
 use crate::tool_metadata::TOOL_METADATA;
-
-/// Per-session state owned by the caller of [`McpServer::handle_request`].
-///
-/// Each MCP transport session has its own `SessionState`: stdio creates one
-/// for the lifetime of `run()`; the SSE transport creates one per connected
-/// editor so concurrent sessions cannot overwrite each other's detected
-/// client info.
-#[derive(Default)]
-pub struct SessionState {
-    client_info: Mutex<Option<ClientInfo>>,
-}
-
-impl SessionState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn set_client_info(&self, info: ClientInfo) {
-        if let Ok(mut guard) = self.client_info.lock() {
-            *guard = Some(info);
-        }
-    }
-
-    fn client_info(&self) -> Option<ClientInfo> {
-        self.client_info.lock().ok().and_then(|guard| guard.clone())
-    }
-}
 
 // Re-export for internal use
 pub use crate::tool_handlers::ToolRegistry;
@@ -105,9 +78,8 @@ impl JsonRpcResponse {
 /// knows what to turn on and telling the caller not to retry — a client that
 /// connected before the set was narrowed still holds the old tools/list.
 ///
-/// Only `--expose` is enforced, not the whole tools/list filter: exposed groups
-/// are a server-wide statement by the operator, whereas the preset can be picked
-/// per client from the `initialize` handshake and is presentation, not policy.
+/// Only `--expose` is enforced, not the per-tool overrides from config.yaml:
+/// exposed groups are a server-wide statement by the operator.
 /// Returns `None` for an unknown name — that is the registry's error to report.
 fn expose_rejection(expose: &[ExposeGroup], tool_name: &str) -> Option<String> {
     if expose.is_empty() || ExposeGroup::union(expose).contains(tool_name) {
@@ -134,7 +106,7 @@ pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
     config: ToolConfig,
-    /// Tool groups from `--expose`. Empty leaves the preset in charge.
+    /// Tool groups from `--expose`. Empty exposes every registered tool.
     expose: Vec<ExposeGroup>,
 }
 
@@ -177,22 +149,13 @@ impl McpServer {
     ///
     /// # Arguments
     /// * `engine` - The code intelligence engine
-    /// * `preset_override` - Optional preset to override config file (from CLI --preset)
-    /// * `expose` - Tool groups from CLI --expose; empty defers to the preset
-    pub fn from_arc(
-        engine: Arc<CodeIntelEngine>,
-        preset_override: Option<String>,
-        expose: Vec<ExposeGroup>,
-    ) -> Self {
-        let mut config = ConfigLoader::new().load().unwrap_or_else(|e| {
+    /// * `expose` - Tool groups from CLI --expose; empty keeps the config's
+    ///   `expose:` or, absent that, every registered tool
+    pub fn from_arc(engine: Arc<CodeIntelEngine>, expose: Vec<ExposeGroup>) -> Self {
+        let config = ConfigLoader::new().load().unwrap_or_else(|e| {
             eprintln!("Warning: Failed to load config: {}. Using defaults.", e);
             ConfigLoader::new().default_config.clone()
         });
-
-        // CLI preset override takes highest priority
-        if preset_override.is_some() {
-            config.preset = preset_override;
-        }
 
         let tool_registry = ToolRegistry::new();
         engine.metrics.set_known_tools(
@@ -217,7 +180,6 @@ impl McpServer {
         let mut stdout = tokio::io::stdout();
         let mut reader = tokio::io::BufReader::new(stdin);
         let mut line = String::new();
-        let session = SessionState::new();
 
         loop {
             line.clear();
@@ -265,10 +227,10 @@ impl McpServer {
                     if request.id.is_none() {
                         // This is a notification - handle it but don't respond
                         debug!("Handling notification: {}", request.method);
-                        let _ = self.dispatch(request, &session).await;
+                        let _ = self.dispatch(request).await;
                         continue;
                     }
-                    self.dispatch(request, &session).await
+                    self.dispatch(request).await
                 }
                 Err(e) => {
                     // Parse error - try to extract ID from raw JSON for error response
@@ -309,20 +271,16 @@ impl McpServer {
         Ok(())
     }
 
-    pub(crate) async fn dispatch(
-        &self,
-        request: JsonRpcRequest,
-        session: &SessionState,
-    ) -> JsonRpcResponse {
+    pub(crate) async fn dispatch(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let id = request.id.clone();
 
         match request.method.as_str() {
             // MCP Lifecycle
-            "initialize" => self.handle_initialize(id, request.params, session),
+            "initialize" => self.handle_initialize(id),
             "initialized" => JsonRpcResponse::success(id, json!({})),
 
             // Tool listing and execution
-            "tools/list" => self.handle_tools_list(id, session),
+            "tools/list" => self.handle_tools_list(id),
             "tools/call" => self.handle_tool_call(id, request.params).await,
 
             // Resource listing
@@ -339,30 +297,7 @@ impl McpServer {
         }
     }
 
-    fn handle_initialize(
-        &self,
-        id: Option<Value>,
-        params: Value,
-        session: &SessionState,
-    ) -> JsonRpcResponse {
-        // Extract and store client info for editor detection
-        if let Some(client_info_value) = params.get("clientInfo") {
-            if let (Some(name), version) = (
-                client_info_value.get("name").and_then(|v| v.as_str()),
-                client_info_value
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            ) {
-                let client = ClientInfo {
-                    name: name.to_string(),
-                    version,
-                };
-                info!("MCP client detected: {} {:?}", client.name, client.version);
-                session.set_client_info(client);
-            }
-        }
-
+    fn handle_initialize(&self, id: Option<Value>) -> JsonRpcResponse {
         JsonRpcResponse::success(
             id,
             json!({
@@ -377,7 +312,7 @@ impl McpServer {
                     // exists for the one case where a client's view can go
                     // stale without the client noticing: the stdio proxy
                     // reconnecting to a restarted daemon that may have been
-                    // started with a different --expose or --preset.
+                    // started with a different --expose.
                     "tools": { "listChanged": true },
                     "resources": {
                         "subscribe": false,
@@ -389,13 +324,10 @@ impl McpServer {
         )
     }
 
-    fn handle_tools_list(&self, id: Option<Value>, session: &SessionState) -> JsonRpcResponse {
-        // Get client info for editor-specific filtering
-        let client_info: Option<ClientInfo> = session.client_info();
-
+    fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
         // Create tool filter with current config and engine options
-        let filter = ToolFilter::new(self.config.clone(), self.engine.options(), client_info)
-            .with_expose(&self.expose);
+        let filter =
+            ToolFilter::new(self.config.clone(), self.engine.options()).with_expose(&self.expose);
 
         // Get filtered list of enabled tools
         let enabled_tools = filter.get_enabled_tools();
@@ -827,20 +759,6 @@ mod tests {
             .unwrap_or("<repository>");
 
         assert_eq!(repo, "<repository>", "Should use default placeholder");
-    }
-
-    /// Test that MCP server from_arc with preset override works
-    #[test]
-    fn test_mcp_server_preset_override() {
-        // This tests that the preset override path works correctly
-        let preset_override = Some("minimal".to_string());
-
-        // Verify the preset override is set correctly
-        assert_eq!(preset_override, Some("minimal".to_string()));
-
-        // Also test with None
-        let no_override: Option<String> = None;
-        assert!(no_override.is_none());
     }
 
     #[test]

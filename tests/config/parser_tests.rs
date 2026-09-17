@@ -2,7 +2,7 @@
 ///
 /// These tests verify that YAML configuration files are parsed correctly
 /// and that the config loader works as expected.
-use narsil_mcp::config::schema::{CategoryConfig, ToolConfig, ToolOverride, ToolsConfig};
+use narsil_mcp::config::schema::{ToolConfig, ToolOverride, ToolsConfig};
 use narsil_mcp::config::ConfigLoader;
 use std::collections::HashMap;
 
@@ -11,77 +11,39 @@ fn test_parse_minimal_config() {
     let yaml = r#"
 version: "1.0"
 tools:
-  categories:
-    Repository:
-      enabled: true
-      description: "Repository and file operations"
   overrides: {}
 "#;
 
     let config: ToolConfig = serde_saphyr::from_str(yaml).expect("Should parse minimal config");
     assert_eq!(config.version, "1.0");
-    assert!(config.tools.categories.contains_key("Repository"));
-    assert!(config.tools.categories.get("Repository").unwrap().enabled);
+    assert!(config.tools.overrides.is_empty());
 }
 
 #[test]
 fn test_parse_full_config() {
     let yaml = r#"
 version: "1.0"
+expose: [code, git]
 tools:
-  categories:
-    Repository:
-      enabled: true
-      description: "Repository and file operations"
-    Git:
-      enabled: false
-      description: "Git integration tools"
-      required_flags: ["git"]
   overrides:
-    neural_search:
+    semantic_search:
       enabled: false
       reason: "Too slow for IDE usage"
       performance_impact: "high"
-      requires_api_key: true
 "#;
 
     let config: ToolConfig = serde_saphyr::from_str(yaml).expect("Should parse full config");
     assert_eq!(config.version, "1.0");
-
-    // Check categories
-    assert!(config.tools.categories.contains_key("Repository"));
-    assert!(config.tools.categories.contains_key("Git"));
-
-    let git_cat = config.tools.categories.get("Git").unwrap();
-    assert!(!git_cat.enabled);
-    assert_eq!(git_cat.required_flags, vec!["git"]);
+    assert_eq!(config.expose, vec!["code".to_string(), "git".to_string()]);
 
     // Check overrides
-    assert!(config.tools.overrides.contains_key("neural_search"));
-    let neural_override = config.tools.overrides.get("neural_search").unwrap();
-    assert!(!neural_override.enabled);
+    assert!(config.tools.overrides.contains_key("semantic_search"));
+    let search_override = config.tools.overrides.get("semantic_search").unwrap();
+    assert!(!search_override.enabled);
     assert_eq!(
-        neural_override.reason,
+        search_override.reason,
         Some("Too slow for IDE usage".to_string())
     );
-}
-
-#[test]
-fn test_parse_category_config() {
-    let yaml = r#"
-enabled: true
-description: "Test category"
-required_flags: ["git", "call_graph"]
-config:
-  max_depth: 5
-"#;
-
-    let cat_config: CategoryConfig =
-        serde_saphyr::from_str(yaml).expect("Should parse category config");
-    assert!(cat_config.enabled);
-    assert_eq!(cat_config.description, Some("Test category".to_string()));
-    assert_eq!(cat_config.required_flags, vec!["git", "call_graph"]);
-    assert!(cat_config.config.contains_key("max_depth"));
 }
 
 #[test]
@@ -89,7 +51,7 @@ fn test_parse_tool_override() {
     let yaml = r#"
 enabled: false
 reason: "Performance concerns"
-required_flags: ["neural"]
+required_flags: ["git"]
 performance_impact: "high"
 requires_api_key: true
 config:
@@ -103,7 +65,7 @@ config:
         override_config.reason,
         Some("Performance concerns".to_string())
     );
-    assert_eq!(override_config.required_flags, vec!["neural"]);
+    assert_eq!(override_config.required_flags, vec!["git"]);
     assert!(override_config.requires_api_key);
 }
 
@@ -113,15 +75,6 @@ fn test_load_default_config() {
     let config = loader.load().expect("Should load default config");
 
     assert_eq!(config.version, "1.0");
-    assert!(
-        !config.tools.categories.is_empty(),
-        "Should have categories"
-    );
-
-    // Default config should enable all basic categories
-    assert!(config.tools.categories.contains_key("Repository"));
-    assert!(config.tools.categories.contains_key("Symbols"));
-    assert!(config.tools.categories.contains_key("Search"));
 }
 
 #[test]
@@ -129,9 +82,6 @@ fn test_config_with_empty_overrides() {
     let yaml = r#"
 version: "1.0"
 tools:
-  categories:
-    Repository:
-      enabled: true
   overrides: {}
 "#;
 
@@ -143,30 +93,25 @@ tools:
 #[test]
 fn test_config_roundtrip() {
     // Create a config programmatically
-    let mut categories = HashMap::new();
-    categories.insert(
-        "Repository".to_string(),
-        CategoryConfig {
-            enabled: true,
-            description: Some("Test".to_string()),
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "get_blame".to_string(),
+        ToolOverride {
+            enabled: false,
+            reason: Some("Test".to_string()),
             required_flags: vec![],
             config: HashMap::new(),
+            performance_impact: None,
+            requires_api_key: false,
         },
     );
 
     let original = ToolConfig {
         version: "1.0".to_string(),
-        preset: None,
-        expose: Vec::new(),
+        expose: vec!["code".to_string()],
         adopted_repo_ttl_days: None,
-        editors: HashMap::new(),
         profiles: HashMap::new(),
-        tools: ToolsConfig {
-            categories,
-            overrides: HashMap::new(),
-        },
-        performance: Default::default(),
-        feature_requirements: HashMap::new(),
+        tools: ToolsConfig { overrides },
     };
 
     // Serialize to YAML
@@ -176,10 +121,8 @@ fn test_config_roundtrip() {
     let parsed: ToolConfig = serde_saphyr::from_str(&yaml).expect("Should deserialize");
 
     assert_eq!(parsed.version, original.version);
-    assert_eq!(
-        parsed.tools.categories.len(),
-        original.tools.categories.len()
-    );
+    assert_eq!(parsed.expose, original.expose);
+    assert_eq!(parsed.tools.overrides.len(), original.tools.overrides.len());
 }
 
 #[test]
@@ -187,7 +130,6 @@ fn test_parse_invalid_version() {
     let yaml = r#"
 version: "999.0"
 tools:
-  categories: {}
   overrides: {}
 "#;
 
@@ -208,59 +150,5 @@ version: "1.0"
         serde_saphyr::from_str(yaml).expect("Should parse without tools field");
     assert_eq!(config.version, "1.0");
     // Tools should be empty by default
-    assert!(config.tools.categories.is_empty());
     assert!(config.tools.overrides.is_empty());
-}
-
-#[test]
-fn test_default_values() {
-    let yaml = r#"
-version: "1.0"
-tools:
-  categories:
-    Repository:
-      enabled: true
-  overrides: {}
-"#;
-
-    let config: ToolConfig = serde_saphyr::from_str(yaml).expect("Should parse");
-
-    // Performance config should have defaults
-    assert_eq!(config.performance.max_tool_count, 128);
-    assert_eq!(config.performance.startup_latency_ms, 10);
-    assert_eq!(config.performance.filtering_latency_ms, 1);
-}
-
-#[test]
-fn test_parse_nested_config() {
-    let yaml = r#"
-version: "1.0"
-tools:
-  categories:
-    Security:
-      enabled: true
-      config:
-        severity_threshold: "medium"
-        exclude_tests: true
-  overrides: {}
-"#;
-
-    let config: ToolConfig = serde_saphyr::from_str(yaml).expect("Should parse");
-    let security_cat = config.tools.categories.get("Security").unwrap();
-
-    assert_eq!(
-        security_cat
-            .config
-            .get("severity_threshold")
-            .unwrap()
-            .as_str()
-            .unwrap(),
-        "medium"
-    );
-    assert!(security_cat
-        .config
-        .get("exclude_tests")
-        .unwrap()
-        .as_bool()
-        .unwrap());
 }

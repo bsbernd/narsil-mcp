@@ -13,25 +13,18 @@
 /// 4. User config (~/.config/narsil-mcp/config.yaml)
 /// 5. Default config (built-in)
 pub mod cli;
-pub mod editor;
+pub mod expose;
 pub mod filter;
 pub mod loader;
-pub mod preset;
 pub mod schema;
 pub mod validation;
-pub mod wizard;
 
 // Re-export main types used by other modules and tests
 pub use cli::{handle_config_command, handle_tools_command, ConfigCommand, ToolsCommand};
-pub use filter::{ClientInfo, ToolFilter};
-// Unlike Preset, ExposeGroup is part of the CLI surface: main.rs parses
-// --expose into it and hands the result to the filter.
+pub use expose::ExposeGroup;
+pub use filter::ToolFilter;
 pub use loader::ConfigLoader;
-pub use preset::ExposeGroup;
 pub use validation::validate_config;
 
-// Schema types are available at narsil_mcp::config::schema::{CategoryConfig, ...}
+// Schema types are available at narsil_mcp::config::schema::{ToolOverride, ...}
 // for programmatic configuration construction.
-
-// Note: Preset is an internal implementation detail of the filter module and
-// is not re-exported. External code should use preset strings in YAML configs.

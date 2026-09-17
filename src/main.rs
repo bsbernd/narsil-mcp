@@ -183,15 +183,10 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_DISCOVERY_RETRY_SECS", default_value = "0")]
     discovery_retry_secs: u64,
 
-    /// Tool preset (minimal, balanced, full, security-focused)
-    /// Overrides the preset from config file
-    #[arg(long, env = "NARSIL_PRESET")]
-    preset: Option<String>,
-
     /// Expose only these tool groups in tools/list. Example: --expose code,git
     ///
     /// Comma-separated and composable; repo-addressing tools are always
-    /// present. Empty falls back to --preset. Tool schemas are re-sent on
+    /// present. Empty exposes every tool. Tool schemas are re-sent on
     /// every request, so an unused group costs context all session.
     ///
     ///   code          symbols, references, search, file text; call and
@@ -214,6 +209,10 @@ struct ServerArgs {
         verbatim_doc_comment
     )]
     expose: Vec<String>,
+
+    /// Ignored. Tool selection is --expose; kept so old launch configs still start.
+    #[arg(long, hide = true, value_name = "NAME")]
+    preset: Option<String>,
 
     /// TF-IDF embedding dimension (default: 512).
     /// Lower values reduce memory usage; higher values improve find_similar_code accuracy.
@@ -345,6 +344,10 @@ async fn main() -> Result<()> {
     // whether or not this invocation ends up delegating.
     let expose = parse_expose_groups(&server_args.expose)?;
 
+    if server_args.preset.is_some() {
+        warn!("--preset is ignored; tool selection is --expose");
+    }
+
     // Stdio auto-discovery: if a long-running SSE narsil-mcp is already
     // indexing a superset of these repos, delegate to it and skip local
     // engine construction entirely. The probe is a single MCP `ping`;
@@ -384,7 +387,7 @@ async fn main() -> Result<()> {
             if !expose.is_empty() {
                 warn!(
                     "--expose is ignored when delegating to {}: the upstream server's \
-                     own --expose/--preset decides the tool list",
+                     own --expose decides the tool list",
                     proxy_url
                 );
             }
@@ -655,7 +658,7 @@ async fn main() -> Result<()> {
                 });
             }
 
-            let server = mcp::McpServer::from_arc(Arc::clone(&engine), server_args.preset, expose);
+            let server = mcp::McpServer::from_arc(Arc::clone(&engine), expose);
             run_stdio_with_shutdown(server).await
         }
         Transport::Sse => {
@@ -684,11 +687,7 @@ async fn main() -> Result<()> {
                 );
             }
             let keepalive = Duration::from_secs(server_args.sse_keepalive_secs);
-            let mcp_server = Arc::new(mcp::McpServer::from_arc(
-                Arc::clone(&engine),
-                server_args.preset,
-                expose,
-            ));
+            let mcp_server = Arc::new(mcp::McpServer::from_arc(Arc::clone(&engine), expose));
             info!(
                 "Starting MCP SSE transport on http://{}:{}/mcp/sse",
                 sse_host, sse_port
@@ -802,7 +801,7 @@ fn parse_expose_groups(names: &[String]) -> Result<Vec<config::ExposeGroup>> {
 /// Apply a named repository profile from the loaded configuration.
 ///
 /// Explicit CLI/env values remain authoritative. Profiles provide defaults for
-/// repos, discovery, preset, and feature booleans.
+/// repos, discovery, expose groups, and feature booleans.
 fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     let Some(profile_name) = server_args.profile.as_deref() else {
         return Ok(());
@@ -848,9 +847,6 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     }
     if server_args.discover.is_none() {
         server_args.discover = profile.discover.clone();
-    }
-    if server_args.preset.is_none() {
-        server_args.preset = profile.preset.clone();
     }
     if server_args.expose.is_empty() {
         server_args.expose = profile.expose.clone();
@@ -1054,7 +1050,6 @@ mod tests {
             "NARSIL_STREAMING",
             "NARSIL_HTTP",
             "NARSIL_HTTP_PORT",
-            "NARSIL_PRESET",
             "NARSIL_NO_CACHE",
             "NARSIL_CACHE_TTL",
         ] {
@@ -1121,6 +1116,14 @@ mod tests {
         let args = Args::try_parse_from(["narsil-mcp", "--http-port", "5555"]).unwrap();
         std::env::remove_var("NARSIL_HTTP_PORT");
         assert_eq!(args.server.http_port, 5555);
+    }
+
+    #[test]
+    fn preset_flag_is_accepted_and_ignored() {
+        let args =
+            Args::try_parse_from(["narsil-mcp", "--preset", "balanced"]).expect("should parse");
+        assert_eq!(args.server.preset.as_deref(), Some("balanced"));
+        assert!(args.server.expose.is_empty());
     }
 
     #[test]
@@ -1238,7 +1241,7 @@ profiles:
       - {}
     git: true
     call_graph: true
-    preset: balanced
+    expose: [code, git]
 "#,
                 repo.display()
             ),
@@ -1253,6 +1256,9 @@ profiles:
         assert_eq!(args.server.repos, vec![repo]);
         assert!(args.server.git);
         assert!(args.server.call_graph);
-        assert_eq!(args.server.preset.as_deref(), Some("balanced"));
+        assert_eq!(
+            args.server.expose,
+            vec!["code".to_string(), "git".to_string()]
+        );
     }
 }

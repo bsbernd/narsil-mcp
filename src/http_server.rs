@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::index::CodeIntelEngine;
-use crate::mcp::{JsonRpcRequest, McpServer, SessionState};
+use crate::mcp::{JsonRpcRequest, McpServer};
 use crate::tool_handlers::ToolRegistry;
 
 /// Maximum HTTP request body size (2 MB).
@@ -85,9 +85,6 @@ struct SessionEntry {
     /// Sender to the SSE event stream. JSON-RPC response strings written
     /// here arrive at the client as `data:` events.
     tx: mpsc::Sender<String>,
-    /// Per-session MCP state — client identity, etc. Shared between the
-    /// SSE event stream and the POST dispatch task.
-    state: Arc<SessionState>,
 }
 
 /// Shared application state
@@ -100,8 +97,8 @@ pub struct AppState {
     mcp_server: Option<Arc<McpServer>>,
     /// Active SSE sessions keyed by `sessionId`.
     sessions: Arc<DashMap<Uuid, SessionEntry>>,
-    /// Active Streamable HTTP sessions keyed by session ID.
-    streamable_sessions: Arc<DashMap<Uuid, Arc<SessionState>>>,
+    /// Active Streamable HTTP session IDs.
+    streamable_sessions: Arc<DashMap<Uuid, ()>>,
     sse_keepalive: Duration,
 }
 
@@ -284,24 +281,25 @@ async fn mcp_streamable_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let (session_id, session_state) = match header_session_id {
-        Some(id) => match state.streamable_sessions.get(&id) {
-            Some(entry) => (id, Arc::clone(entry.value())),
+    let session_id = match header_session_id {
+        Some(id) => {
             // Session not found: tell the client to start a new session.
-            None => return StatusCode::NOT_FOUND.into_response(),
-        },
+            if !state.streamable_sessions.contains_key(&id) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            id
+        }
         None => {
             // No session yet — create one (this should be the initialize request).
             let id = Uuid::new_v4();
-            let new_state = Arc::new(SessionState::new());
-            state.streamable_sessions.insert(id, Arc::clone(&new_state));
+            state.streamable_sessions.insert(id, ());
             debug!(
                 "session opened (streamable): {} — active: sse={} streamable={}",
                 id,
                 state.sessions.len(),
                 state.streamable_sessions.len()
             );
-            (id, new_state)
+            id
         }
     };
 
@@ -312,16 +310,15 @@ async fn mcp_streamable_handler(
     // Notifications have no id and never need a response body.
     if req.id.is_none() {
         let server = mcp_server.clone();
-        let ss = Arc::clone(&session_state);
         tokio::spawn(async move {
-            server.dispatch(req, &ss).await;
+            server.dispatch(req).await;
         });
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert(HeaderName::from_static("mcp-session-id"), sid_header);
         return (StatusCode::ACCEPTED, resp_headers).into_response();
     }
 
-    let response = mcp_server.dispatch(req, &session_state).await;
+    let response = mcp_server.dispatch(req).await;
     let json_body = match serde_json::to_string(&response) {
         Ok(j) => j,
         Err(e) => {
@@ -355,15 +352,8 @@ async fn mcp_sse_handler(
 
     let session_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<String>(SSE_CHANNEL_CAPACITY);
-    let session_state = Arc::new(SessionState::new());
 
-    state.sessions.insert(
-        session_id,
-        SessionEntry {
-            tx,
-            state: Arc::clone(&session_state),
-        },
-    );
+    state.sessions.insert(session_id, SessionEntry { tx });
     debug!(
         "session opened (sse): {} — active: sse={} streamable={}",
         session_id,
@@ -433,15 +423,15 @@ async fn mcp_message_handler(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
 
-    let (tx, session_state) = match state.sessions.get(&params.session_id) {
-        Some(entry) => (entry.tx.clone(), Arc::clone(&entry.state)),
+    let tx = match state.sessions.get(&params.session_id) {
+        Some(entry) => entry.tx.clone(),
         None => return Err(StatusCode::GONE),
     };
 
     let is_notification = req.id.is_none();
 
     tokio::spawn(async move {
-        let response = mcp_server.dispatch(req, &session_state).await;
+        let response = mcp_server.dispatch(req).await;
         if is_notification {
             return;
         }

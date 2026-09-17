@@ -235,7 +235,7 @@ tools:
 
     // Verify it loaded correctly
     assert_eq!(config.version, "1.0");
-    assert_eq!(config.preset, Some("minimal".to_string()));
+    assert!(!config.tools.overrides["neural_search"].enabled);
 
     Ok(())
 }

@@ -44,8 +44,6 @@ fn test_default_config_loads() {
     let _guard = ENV_MUTEX.lock().unwrap();
 
     // Clean up environment variables that might be set by other tests
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
     std::env::remove_var("NARSIL_CONFIG_PATH");
 
@@ -59,8 +57,6 @@ fn test_default_config_loads() {
     let config = loader.load().unwrap();
 
     assert_eq!(config.version, "1.0");
-    // Default config has categories defined (Repository, Symbols, Search, etc.)
-    assert!(!config.tools.categories.is_empty());
     assert!(config.tools.overrides.is_empty()); // Default has no tool overrides (no env vars)
 }
 
@@ -69,8 +65,6 @@ fn test_user_config_overrides_default() {
     // ConfigLoader::load() reads NARSIL_* env vars; serialize against tests
     // that set them so we are not affected by mid-test mutations.
     let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
 
     let user_config_content = r#"
@@ -102,8 +96,6 @@ tools:
 #[test]
 fn test_user_config_expose_survives_the_merge() {
     let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
 
     let user_config_content = r#"
@@ -127,8 +119,6 @@ expose: [code, git]
 #[test]
 fn test_project_config_overrides_user_config() {
     let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
     let user_config_content = r#"
 version: "1.0"
@@ -169,45 +159,6 @@ tools:
         override_config.reason.as_deref(),
         Some("Project re-enabled search")
     );
-}
-
-#[test]
-fn test_env_var_preset_override() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-
-    // Set environment variable
-    env::set_var("NARSIL_PRESET", "minimal");
-
-    let loader = ConfigLoader::new();
-    let config = loader.load().unwrap();
-
-    // Should have preset set by env var
-    assert_eq!(config.preset.as_deref(), Some("minimal"));
-
-    // Clean up
-    env::remove_var("NARSIL_PRESET");
-}
-
-#[test]
-fn test_env_var_enabled_categories() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-
-    env::set_var("NARSIL_ENABLED_CATEGORIES", "Repository,Symbols,Search");
-
-    let loader = ConfigLoader::new();
-    let config = loader.load().unwrap();
-
-    // Should have categories enabled by env var
-    assert!(config.tools.categories.contains_key("Repository"));
-    assert!(config.tools.categories.contains_key("Symbols"));
-    assert!(config.tools.categories.contains_key("Search"));
-
-    // Categories should be enabled
-    assert!(config.tools.categories["Repository"].enabled);
-    assert!(config.tools.categories["Symbols"].enabled);
-    assert!(config.tools.categories["Search"].enabled);
-
-    env::remove_var("NARSIL_ENABLED_CATEGORIES");
 }
 
 #[test]
@@ -292,8 +243,6 @@ tools:
 #[test]
 fn test_config_merging_preserves_both_tools() {
     let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
     let user_config_content = r#"
 version: "1.0"
@@ -336,15 +285,13 @@ tools:
 #[test]
 fn test_invalid_config_returns_error() {
     let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
     // Use a config with a type mismatch - 'enabled' should be a bool, not a string
     let invalid_config_content = r#"
 version: "1.0"
 tools:
-  categories:
-    Repository:
+  overrides:
+    list_repos:
       enabled: "not_a_boolean"
 "#;
 
@@ -365,8 +312,6 @@ fn test_missing_user_config_falls_back_to_default() {
 
     // Clean up env vars that could affect this test
     std::env::remove_var("NARSIL_DISABLED_TOOLS");
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
 
     let mut loader = ConfigLoader::new();
     loader = loader.with_user_config_path(Some(PathBuf::from("/nonexistent/path/config.yaml")));
@@ -377,74 +322,4 @@ fn test_missing_user_config_falls_back_to_default() {
     assert_eq!(config.version, "1.0");
     // Default config has no tool overrides
     assert!(config.tools.overrides.is_empty());
-    // But has default categories
-    assert!(!config.tools.categories.is_empty());
-}
-
-#[test]
-fn test_performance_budget_in_config() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
-    std::env::remove_var("NARSIL_DISABLED_TOOLS");
-    let config_content = r#"
-version: "1.0"
-tools:
-  categories: {}
-  overrides: {}
-performance:
-  max_tool_count: 30
-  startup_latency_ms: 5
-  filtering_latency_ms: 2
-"#;
-
-    let temp_dir = create_user_config(config_content);
-    let user_config_path = temp_dir.path().join("config.yaml");
-
-    let mut loader = ConfigLoader::new();
-    loader = loader.with_user_config_path(Some(user_config_path));
-
-    let config = loader.load().unwrap();
-
-    assert_eq!(config.performance.max_tool_count, 30);
-    assert_eq!(config.performance.startup_latency_ms, 5);
-    assert_eq!(config.performance.filtering_latency_ms, 2);
-}
-
-#[test]
-fn test_category_config_in_user_config() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-    std::env::remove_var("NARSIL_PRESET");
-    std::env::remove_var("NARSIL_ENABLED_CATEGORIES");
-    std::env::remove_var("NARSIL_DISABLED_TOOLS");
-    let config_content = r#"
-version: "1.0"
-tools:
-  categories:
-    Git:
-      enabled: false
-      description: "Git tools disabled by user"
-    Security:
-      enabled: true
-      description: "Security tools enabled"
-"#;
-
-    let temp_dir = create_user_config(config_content);
-    let user_config_path = temp_dir.path().join("config.yaml");
-
-    let mut loader = ConfigLoader::new();
-    loader = loader.with_user_config_path(Some(user_config_path));
-
-    let config = loader.load().unwrap();
-
-    // User config should override defaults for these categories
-    assert!(config.tools.categories.contains_key("Git"));
-    assert!(config.tools.categories.contains_key("Security"));
-
-    assert!(!config.tools.categories["Git"].enabled);
-    // Security should be explicitly enabled by user config
-    assert!(
-        config.tools.categories["Security"].enabled,
-        "Security category should be enabled by user config"
-    );
 }
