@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use narsil_mcp::lsp::CxxLspBackend;
 use narsil_mcp::{
-    config, http_server, index, lsp, mcp, neural, persist, pid_status, repo, sse_discovery,
-    stats_cli, stdio_proxy, streaming,
+    config, http_server, index, lsp, mcp, persist, pid_status, repo, sse_discovery, stats_cli,
+    stdio_proxy, streaming,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,26 +144,6 @@ struct ServerArgs {
     #[arg(long, env = "NARSIL_STREAMING")]
     streaming: bool,
 
-    /// Enable remote GitHub repository support (uses GITHUB_TOKEN env var for auth)
-    #[arg(long, env = "NARSIL_REMOTE")]
-    remote: bool,
-
-    /// Enable neural embeddings for semantic search (requires EMBEDDING_API_KEY, VOYAGE_API_KEY, or OPENAI_API_KEY)
-    #[arg(long, env = "NARSIL_NEURAL")]
-    neural: bool,
-
-    /// Neural embedding backend: "api" (default) or "onnx"
-    #[arg(long, env = "NARSIL_NEURAL_BACKEND", default_value = "api")]
-    neural_backend: String,
-
-    /// Neural embedding model name (e.g., "voyage-code-2", "text-embedding-3-small")
-    #[arg(long, env = "NARSIL_NEURAL_MODEL")]
-    neural_model: Option<String>,
-
-    /// Neural embedding dimension (auto-detected from model if not specified)
-    #[arg(long, env = "NARSIL_NEURAL_DIMENSION")]
-    neural_dimension: Option<usize>,
-
     /// Enable HTTP server for visualization frontend
     #[arg(long, env = "NARSIL_HTTP")]
     http: bool,
@@ -255,17 +235,6 @@ struct ServerArgs {
     /// profile, then to the machine-wide value in config.yaml.
     #[arg(long, env = "NARSIL_ADOPTED_REPO_TTL_DAYS")]
     adopted_repo_ttl_days: Option<u64>,
-
-    /// Enable RDF knowledge graph storage for SPARQL queries and CCG export.
-    /// NOTE: Binary must be built with --features graph for this to work.
-    /// If unsure, check the startup log for warnings.
-    #[arg(long, env = "NARSIL_GRAPH")]
-    graph: bool,
-
-    /// Path for knowledge graph storage (default: <index_path>/graph).
-    /// Only used when --graph is enabled and the graph feature is compiled in.
-    #[arg(long, env = "NARSIL_GRAPH_PATH")]
-    graph_path: Option<PathBuf>,
 
     /// Use compile_commands.json to restrict which C/C++ source files are indexed.
     /// Headers are always indexed regardless.
@@ -434,22 +403,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Check if --graph flag is used but feature isn't compiled
-    #[cfg(not(feature = "graph"))]
-    if server_args.graph {
-        warn!(
-            "--graph flag was passed but the binary was built without the 'graph' feature. \
-             SPARQL and CCG tools will not be available. \
-             Rebuild with: cargo build --release --features graph"
-        );
-    }
-
-    // Determine actual graph availability
-    #[cfg(feature = "graph")]
-    let graph_available = server_args.graph;
-    #[cfg(not(feature = "graph"))]
-    let graph_available = false;
-
     // gtags intent: --gtags forces on, --no-gtags forces off, else Auto
     // (auto-detect global(1)). The manager exists whenever intent ≠ Off and a
     // backend is available; per-repo gating happens in index_repo.
@@ -478,10 +431,9 @@ async fn main() -> Result<()> {
     };
 
     info!(
-        "Features: call_graph={}, git={}, watch={}, persist={}, lsp_intent={:?}, gtags={}, streaming={}, remote={}, neural={}, cache={}, graph={}",
+        "Features: call_graph={}, git={}, watch={}, persist={}, lsp_intent={:?}, gtags={}, streaming={}, cache={}",
         server_args.call_graph, server_args.git, server_args.watch, server_args.persist,
-        lsp_intent, gtags_enabled, server_args.streaming, server_args.remote,
-        server_args.neural, !server_args.no_cache, graph_available
+        lsp_intent, gtags_enabled, server_args.streaming, !server_args.no_cache
     );
 
     // Build LSP config. Resolve C/C++ backends first so Auto can enable LSP when
@@ -566,34 +518,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Build neural config
-    let neural_dimension = server_args.neural_dimension.unwrap_or_else(|| {
-        neural::default_dimension_for_model(server_args.neural_model.as_deref())
-    });
-    let neural_config = neural::NeuralConfig {
-        enabled: server_args.neural,
-        backend: server_args.neural_backend.clone(),
-        model_name: server_args.neural_model.clone(),
-        dimension: neural_dimension,
-        ..Default::default()
-    };
-    if server_args.neural {
-        info!(
-            "Neural embeddings requested (backend={}, model={:?}, dimension={})",
-            server_args.neural_backend, server_args.neural_model, neural_dimension
-        );
-    }
-
     // Initialize the code intelligence engine with options
     let options = index::EngineOptions {
         git_enabled: server_args.git,
         call_graph_enabled: server_args.call_graph,
         persist_enabled: server_args.persist,
         watch_enabled: server_args.watch,
-        remote_enabled: server_args.remote,
         streaming_config,
         lsp_config,
-        neural_config,
         cache_enabled: !server_args.no_cache,
         cache_ttl_seconds: server_args.cache_ttl,
         adopted_repo_ttl_days: server_args
@@ -610,27 +542,14 @@ async fn main() -> Result<()> {
         lsp_intent,
         gtags_intent,
         gtags_generate: server_args.gtags_generate,
-        #[cfg(feature = "graph")]
-        graph_enabled: server_args.graph,
-        #[cfg(feature = "graph")]
-        graph_path: server_args.graph_path,
     };
 
     // NOTE: Engine creation is now fast and returns immediately.
     // Indexing happens in background to allow quick MCP server startup.
-    let mut engine =
+    let engine = Arc::new(
         index::CodeIntelEngine::with_options(server_args.index_path, repos.clone(), options)
-            .await?;
-
-    // Initialize remote repository support if enabled
-    if server_args.remote {
-        match engine.init_remote_manager() {
-            Ok(()) => info!("Remote repository support enabled"),
-            Err(e) => warn!("Failed to initialize remote repository support: {}", e),
-        }
-    }
-
-    let engine = Arc::new(engine);
+            .await?,
+    );
 
     // Publish this process's status so `narsil-mcp stats` (and a human
     // diagnosing the stdio↔SSE path) can see its role, URL, and repos. The
@@ -942,9 +861,6 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
     apply_bool_default(&mut server_args.persist, profile.persist);
     apply_bool_default(&mut server_args.watch, profile.watch);
     apply_bool_default(&mut server_args.lsp, profile.lsp);
-    apply_bool_default(&mut server_args.remote, profile.remote);
-    apply_bool_default(&mut server_args.neural, profile.neural);
-    apply_bool_default(&mut server_args.graph, profile.graph);
     if server_args.embedding_dim.is_none() {
         server_args.embedding_dim = profile.embedding_dim;
     }
@@ -1136,18 +1052,11 @@ mod tests {
             "NARSIL_LSP_CXX_BACKENDS",
             "NARSIL_GTAGS",
             "NARSIL_STREAMING",
-            "NARSIL_REMOTE",
-            "NARSIL_NEURAL",
-            "NARSIL_NEURAL_BACKEND",
-            "NARSIL_NEURAL_MODEL",
-            "NARSIL_NEURAL_DIMENSION",
             "NARSIL_HTTP",
             "NARSIL_HTTP_PORT",
             "NARSIL_PRESET",
             "NARSIL_NO_CACHE",
             "NARSIL_CACHE_TTL",
-            "NARSIL_GRAPH",
-            "NARSIL_GRAPH_PATH",
         ] {
             std::env::remove_var(var);
         }
@@ -1156,43 +1065,16 @@ mod tests {
     }
 
     #[test]
-    fn neural_model_is_settable_via_env() {
-        let args = parse_with_env(|| {
-            std::env::set_var("NARSIL_NEURAL_MODEL", "voyage-code-2");
-        });
-        std::env::remove_var("NARSIL_NEURAL_MODEL");
-        assert_eq!(args.server.neural_model.as_deref(), Some("voyage-code-2"));
-    }
-
-    #[test]
-    fn neural_dimension_is_settable_via_env() {
-        let args = parse_with_env(|| {
-            std::env::set_var("NARSIL_NEURAL_DIMENSION", "1024");
-        });
-        std::env::remove_var("NARSIL_NEURAL_DIMENSION");
-        assert_eq!(args.server.neural_dimension, Some(1024));
-    }
-
-    #[test]
     fn boolean_flags_are_settable_via_env() {
         let args = parse_with_env(|| {
             std::env::set_var("NARSIL_GIT", "true");
             std::env::set_var("NARSIL_CALL_GRAPH", "true");
-            std::env::set_var("NARSIL_REMOTE", "true");
-            std::env::set_var("NARSIL_NEURAL", "true");
         });
-        for var in [
-            "NARSIL_GIT",
-            "NARSIL_CALL_GRAPH",
-            "NARSIL_REMOTE",
-            "NARSIL_NEURAL",
-        ] {
+        for var in ["NARSIL_GIT", "NARSIL_CALL_GRAPH"] {
             std::env::remove_var(var);
         }
         assert!(args.server.git);
         assert!(args.server.call_graph);
-        assert!(args.server.remote);
-        assert!(args.server.neural);
     }
 
     #[test]
@@ -1235,10 +1117,10 @@ mod tests {
     #[test]
     fn cli_args_override_env_vars() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("NARSIL_NEURAL_MODEL", "from-env");
-        let args = Args::try_parse_from(["narsil-mcp", "--neural-model", "from-cli"]).unwrap();
-        std::env::remove_var("NARSIL_NEURAL_MODEL");
-        assert_eq!(args.server.neural_model.as_deref(), Some("from-cli"));
+        std::env::set_var("NARSIL_HTTP_PORT", "4444");
+        let args = Args::try_parse_from(["narsil-mcp", "--http-port", "5555"]).unwrap();
+        std::env::remove_var("NARSIL_HTTP_PORT");
+        assert_eq!(args.server.http_port, 5555);
     }
 
     #[test]

@@ -69,23 +69,6 @@ impl ToolHandler for HybridSearchHandler {
     }
 }
 
-/// Handler for neural_search tool
-pub struct NeuralSearchHandler;
-
-#[async_trait::async_trait]
-impl ToolHandler for NeuralSearchHandler {
-    fn name(&self) -> &'static str {
-        "neural_search"
-    }
-
-    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
-        let repo = args.get_str("repo");
-        let query = args.get_str("query").unwrap_or("");
-        let max_results = args.get_u64_or("max_results", 10) as usize;
-        engine.neural_search(repo, query, max_results).await
-    }
-}
-
 /// Handler for search_chunks tool
 pub struct SearchChunksHandler;
 
@@ -146,29 +129,6 @@ impl ToolHandler for FindSimilarToSymbolHandler {
     }
 }
 
-/// Handler for find_semantic_clones tool
-pub struct FindSemanticClonesHandler;
-
-#[async_trait::async_trait]
-impl ToolHandler for FindSemanticClonesHandler {
-    fn name(&self) -> &'static str {
-        "find_semantic_clones"
-    }
-
-    async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
-        let repo = args.get_str("repo").unwrap_or("");
-        let path = args.get_str("path").unwrap_or("");
-        let function = args.get_str("function").unwrap_or("");
-        let threshold = args
-            .get("threshold")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.8) as f32;
-        engine
-            .find_semantic_clones(repo, path, function, threshold)
-            .await
-    }
-}
-
 /// Handler for get_embedding_stats tool
 pub struct GetEmbeddingStatsHandler;
 
@@ -180,20 +140,6 @@ impl ToolHandler for GetEmbeddingStatsHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, _args: Value) -> Result<String> {
         engine.get_embedding_stats().await
-    }
-}
-
-/// Handler for get_neural_stats tool
-pub struct GetNeuralStatsHandler;
-
-#[async_trait::async_trait]
-impl ToolHandler for GetNeuralStatsHandler {
-    fn name(&self) -> &'static str {
-        "get_neural_stats"
-    }
-
-    async fn execute(&self, engine: &CodeIntelEngine, _args: Value) -> Result<String> {
-        engine.get_neural_stats().await
     }
 }
 

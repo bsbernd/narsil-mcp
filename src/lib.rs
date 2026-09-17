@@ -31,15 +31,7 @@ pub mod tool_metadata;
 pub mod type_inference;
 pub mod validation;
 
-// Knowledge graph persistence (requires oxigraph)
-#[cfg(feature = "graph")]
-pub mod persistence;
-
-// Code Context Graph generation (requires graph feature)
-#[cfg(feature = "graph")]
-pub mod ccg;
-
-// Native-only modules (require tokio, octocrab, lsp, etc.)
+// Native-only modules (require tokio, lsp, etc.)
 #[cfg(feature = "native")]
 pub mod git;
 #[cfg(feature = "native")]
@@ -53,11 +45,7 @@ pub mod lsp;
 #[cfg(feature = "native")]
 pub mod mcp;
 #[cfg(feature = "native")]
-pub mod neural;
-#[cfg(feature = "native")]
 pub mod persist;
-#[cfg(feature = "native")]
-pub mod remote;
 #[cfg(feature = "native")]
 pub mod sse_discovery;
 #[cfg(feature = "native")]
@@ -66,7 +54,3 @@ pub mod stdio_proxy;
 pub mod streaming;
 #[cfg(feature = "native")]
 pub mod tool_handlers;
-
-// WASM module (only compiled when targeting wasm32)
-#[cfg(feature = "wasm")]
-pub mod wasm;

@@ -112,16 +112,6 @@ impl ToolFilter {
         if options.lsp_config.enabled {
             flags.insert(FeatureFlag::Lsp);
         }
-        if options.neural_config.enabled {
-            flags.insert(FeatureFlag::Neural);
-        }
-        if options.remote_enabled {
-            flags.insert(FeatureFlag::Remote);
-        }
-        #[cfg(feature = "graph")]
-        if options.graph_enabled {
-            flags.insert(FeatureFlag::Graph);
-        }
 
         flags
     }
@@ -281,34 +271,21 @@ mod tests {
             call_graph_enabled: true,
             persist_enabled: true,
             watch_enabled: true,
-            remote_enabled: true,
             lsp_config: crate::lsp::LspConfig {
                 enabled: true,
                 ..Default::default()
             },
-            neural_config: crate::neural::NeuralConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            #[cfg(feature = "graph")]
-            graph_enabled: true,
             ..Default::default()
         };
 
         let flags = ToolFilter::convert_engine_options(&options);
 
-        // 7 baseline flags + Graph when the graph feature is compiled in.
-        let expected_count = if cfg!(feature = "graph") { 8 } else { 7 };
-        assert_eq!(flags.len(), expected_count);
+        assert_eq!(flags.len(), 5);
         assert!(flags.contains(&FeatureFlag::Git));
         assert!(flags.contains(&FeatureFlag::CallGraph));
         assert!(flags.contains(&FeatureFlag::Persist));
         assert!(flags.contains(&FeatureFlag::Watch));
         assert!(flags.contains(&FeatureFlag::Lsp));
-        assert!(flags.contains(&FeatureFlag::Neural));
-        assert!(flags.contains(&FeatureFlag::Remote));
-        #[cfg(feature = "graph")]
-        assert!(flags.contains(&FeatureFlag::Graph));
     }
 
     #[test]
@@ -435,10 +412,6 @@ mod tests {
         let options = EngineOptions {
             git_enabled: true,
             call_graph_enabled: true,
-            neural_config: crate::neural::NeuralConfig {
-                enabled: true,
-                ..Default::default()
-            },
             ..Default::default()
         };
 
@@ -509,39 +482,6 @@ mod tests {
         );
     }
 
-    /// Issue #23: `convert_engine_options` must propagate `remote_enabled` to
-    /// `FeatureFlag::Remote` so Remote-category tools can surface when
-    /// `--remote` is passed.
-    #[test]
-    fn test_convert_engine_options_propagates_remote() {
-        let options = EngineOptions {
-            remote_enabled: true,
-            ..Default::default()
-        };
-        let flags = ToolFilter::convert_engine_options(&options);
-        assert!(
-            flags.contains(&FeatureFlag::Remote),
-            "FeatureFlag::Remote must be set when EngineOptions.remote_enabled is true"
-        );
-    }
-
-    /// Issue #23: under `feature = "graph"`, `convert_engine_options` must
-    /// propagate `graph_enabled` to `FeatureFlag::Graph` so SPARQL/CCG tools
-    /// can surface when `--graph` is passed.
-    #[cfg(feature = "graph")]
-    #[test]
-    fn test_convert_engine_options_propagates_graph() {
-        let options = EngineOptions {
-            graph_enabled: true,
-            ..Default::default()
-        };
-        let flags = ToolFilter::convert_engine_options(&options);
-        assert!(
-            flags.contains(&FeatureFlag::Graph),
-            "FeatureFlag::Graph must be set when EngineOptions.graph_enabled is true"
-        );
-    }
-
     /// Issue #23: the Full preset should expose every registered tool whose
     /// feature requirements are met, regardless of `max_tool_count`. Without
     /// this bypass, `max_tool_count: 76` silently truncated the 90-tool registry
@@ -563,25 +503,6 @@ mod tests {
         assert!(
             enabled.len() > 5,
             "Full preset must bypass max_tool_count cap; got {} tools",
-            enabled.len()
-        );
-    }
-
-    /// Issue #23: with `--remote` enabled, the `add_remote_repo` tool should
-    /// actually surface in `get_enabled_tools`. Without `FeatureFlag::Remote`
-    /// being propagated from `EngineOptions.remote_enabled`, it never did.
-    #[test]
-    fn test_remote_tool_surfaces_with_remote_flag() {
-        let config = ToolConfig::default();
-        let options = EngineOptions {
-            remote_enabled: true,
-            ..Default::default()
-        };
-        let filter = ToolFilter::new(config, &options, None);
-        let enabled = filter.get_enabled_tools();
-        assert!(
-            enabled.contains(&"add_remote_repo"),
-            "add_remote_repo should surface when --remote is enabled; got {} tools",
             enabled.len()
         );
     }

@@ -334,18 +334,6 @@ pub struct RepoProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gtags: Option<GtagsSettings>,
 
-    /// Enable remote GitHub repository support for this profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<bool>,
-
-    /// Enable neural search for this profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub neural: Option<bool>,
-
-    /// Enable graph/SPARQL/CCG tools for this profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graph: Option<bool>,
-
     /// TF-IDF embedding dimension (default: 512). Lower values reduce memory;
     /// higher values improve find_similar_code accuracy.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -36,10 +36,6 @@ tools:
     LSP:
       enabled: true
       description: "LSP integration (enhanced with --lsp)"
-    Remote:
-      enabled: true
-      description: "Remote repository support (requires --remote)"
-      required_flags: ["remote"]
     Security:
       enabled: true
       description: "Security vulnerability scanning"
@@ -486,7 +482,7 @@ mod tests {
     /// Helper that builds a config with the standard set of categories all enabled.
     fn config_with_all_default_categories() -> ToolConfig {
         let mut config = ToolConfig::default();
-        for name in ["Repository", "Symbols", "Search", "Git", "Lsp", "Remote"] {
+        for name in ["Repository", "Symbols", "Search", "Git", "Lsp"] {
             config.tools.categories.insert(
                 name.to_string(),
                 CategoryConfig {
@@ -515,7 +511,7 @@ mod tests {
 
         env::remove_var("NARSIL_ENABLED_CATEGORIES");
 
-        for cat in ["Repository", "Symbols", "Search", "Git", "Lsp", "Remote"] {
+        for cat in ["Repository", "Symbols", "Search", "Git", "Lsp"] {
             assert!(
                 config.tools.categories.get(cat).unwrap().enabled,
                 "{cat} should remain enabled when NARSIL_ENABLED_CATEGORIES is empty"

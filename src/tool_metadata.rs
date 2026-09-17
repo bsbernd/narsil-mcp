@@ -49,7 +49,6 @@ pub enum ToolCategory {
     CallGraph,
     Git,
     Lsp,
-    Remote,
     Security,
     SupplyChain,
     Analysis,
@@ -65,7 +64,6 @@ impl std::fmt::Display for ToolCategory {
             ToolCategory::CallGraph => write!(f, "CallGraph"),
             ToolCategory::Git => write!(f, "Git"),
             ToolCategory::Lsp => write!(f, "LSP"),
-            ToolCategory::Remote => write!(f, "Remote"),
             ToolCategory::Security => write!(f, "Security"),
             ToolCategory::SupplyChain => write!(f, "SupplyChain"),
             ToolCategory::Analysis => write!(f, "Analysis"),
@@ -93,11 +91,8 @@ pub enum FeatureFlag {
     Git,
     CallGraph,
     Lsp,
-    Neural,
-    Remote,
     Persist,
     Watch,
-    Graph,
 }
 
 impl ToolMetadata {
@@ -506,7 +501,7 @@ lazy_static! {
             aliases: vec!["search_symbols", "fuzzy_symbols"],
         });
 
-        // ===== Search Tools (12) =====
+        // ===== Search Tools (9) =====
 
         map.insert("search_code", ToolMetadata {
             name: "search_code",
@@ -577,27 +572,6 @@ lazy_static! {
             aliases: vec!["combined_search", "rrf_search"],
         });
 
-        map.insert("neural_search", ToolMetadata {
-            name: "neural_search",
-            description: "Search code using neural semantic embeddings. Finds semantically similar code even with different variable names. Requires --neural flag and EMBEDDING_API_KEY.",
-            category: ToolCategory::Search,
-            tags: ["search", "neural", "embeddings", "semantic", "ai"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Neural].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural language or code query"},
-                    "repo": {"type": "string", "description": "Repository to limit to (optional, all repositories if omitted). Absolute path, relative path, or `.`."},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"}
-                },
-                "required": ["query"]
-            }),
-            requires_api_key: true,
-            aliases: vec!["ai_search", "embedding_search"],
-        });
-
         map.insert("search_chunks", ToolMetadata {
             name: "search_chunks",
             description: "Search at chunk granularity, each hit carrying its symbol context. Usually search_code or semantic_search is what you want.",
@@ -664,28 +638,6 @@ lazy_static! {
             aliases: vec!["similar_symbol", "find_related"],
         });
 
-        map.insert("find_semantic_clones", ToolMetadata {
-            name: "find_semantic_clones",
-            description: "Find semantically similar code (Type-3/4 clones) using neural embeddings. Detects code that does the same thing with different implementation.",
-            category: ToolCategory::Search,
-            tags: ["clones", "semantic", "similar", "neural"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Neural].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"},
-                    "function": {"type": "string", "description": "Function name to find clones of"},
-                    "threshold": {"type": "number", "description": "Similarity threshold 0-1 (default: 0.8)"}
-                },
-                "required": ["repo", "path", "function"]
-            }),
-            requires_api_key: true,
-            aliases: vec!["semantic_clones", "clone_detection"],
-        });
-
         map.insert("get_embedding_stats", ToolMetadata {
             name: "get_embedding_stats",
             description: "Document count, vocabulary size and dimension of the TF-IDF index behind find_similar_code. Diagnostics, not a code query.",
@@ -697,19 +649,6 @@ lazy_static! {
             input_schema: json!({"type": "object", "properties": {}, "required": []}),
             requires_api_key: false,
             aliases: vec!["embedding_stats", "tfidf_stats"],
-        });
-
-        map.insert("get_neural_stats", ToolMetadata {
-            name: "get_neural_stats",
-            description: "Get statistics about the neural embedding index. Requires --neural flag.",
-            category: ToolCategory::Search,
-            tags: ["stats", "neural", "embedding", "index"].iter().copied().collect(),
-            stability: StabilityLevel::Beta,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Neural].iter().copied().collect(),
-            input_schema: json!({"type": "object", "properties": {}, "required": []}),
-            requires_api_key: false,
-            aliases: vec!["neural_stats", "ai_stats"],
         });
 
         map.insert("get_chunk_stats", ToolMetadata {
@@ -1147,68 +1086,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["definition", "goto_def"],
-        });
-
-        // ===== Remote Tools (3) =====
-
-        map.insert("add_remote_repo", ToolMetadata {
-            name: "add_remote_repo",
-            description: "Add a remote GitHub repository for indexing. Clones the repo to a temporary location.",
-            category: ToolCategory::Remote,
-            tags: ["remote", "github", "clone", "repository"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Remote].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "GitHub URL (e.g., github.com/owner/repo or https://github.com/owner/repo)"},
-                    "sparse_paths": {"type": "array", "items": {"type": "string"}, "description": "Optional: only clone these paths for efficiency"}
-                },
-                "required": ["url"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["add_repo", "clone_repo"],
-        });
-
-        map.insert("list_remote_files", ToolMetadata {
-            name: "list_remote_files",
-            description: "List files in a remote GitHub repository via API (no clone needed). Rate limited without GITHUB_TOKEN.",
-            category: ToolCategory::Remote,
-            tags: ["remote", "github", "files", "list", "api"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Remote].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "GitHub URL"},
-                    "path": {"type": "string", "description": "Optional subdirectory to list"}
-                },
-                "required": ["url"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["remote_files", "github_files"],
-        });
-
-        map.insert("get_remote_file", ToolMetadata {
-            name: "get_remote_file",
-            description: "Fetch a specific file from a remote GitHub repository via API (no clone needed).",
-            category: ToolCategory::Remote,
-            tags: ["remote", "github", "file", "fetch", "api"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Remote].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "GitHub URL"},
-                    "path": {"type": "string", "description": "File path to fetch"}
-                },
-                "required": ["url", "path"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["remote_file", "fetch_file"],
         });
 
         // ===== Security Tools (10) =====
@@ -1797,299 +1674,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["graph", "visualization"],
-        });
-
-        // ===== SPARQL Tools (3) =====
-
-        map.insert("sparql_query", ToolMetadata {
-            name: "sparql_query",
-            description: "Execute a SPARQL query against the RDF knowledge graph. Supports SELECT and ASK queries with timeout and result limits. Requires --graph flag.",
-            category: ToolCategory::Graph,
-            tags: ["sparql", "rdf", "query", "graph", "knowledge-graph"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "SPARQL query to execute"},
-                    "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000, max: 300000)"},
-                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000, max: 10000)"},
-                    "offset": {"type": "integer", "description": "Offset for pagination (default: 0)"},
-                    "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
-                },
-                "required": ["query"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["sparql", "rdf_query"],
-        });
-
-        map.insert("list_sparql_templates", ToolMetadata {
-            name: "list_sparql_templates",
-            description: "List available SPARQL query templates for common code intelligence patterns. Requires --graph flag.",
-            category: ToolCategory::Graph,
-            tags: ["sparql", "templates", "query", "graph"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({"type": "object", "properties": {}, "required": []}),
-            requires_api_key: false,
-            aliases: vec!["sparql_templates"],
-        });
-
-        map.insert("run_sparql_template", ToolMetadata {
-            name: "run_sparql_template",
-            description: "Execute a predefined SPARQL query template with parameters. Requires --graph flag.",
-            category: ToolCategory::Graph,
-            tags: ["sparql", "templates", "query", "graph"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "template": {"type": "string", "description": "Template name (e.g., find_functions, find_calls)"},
-                    "params": {"type": "object", "description": "Template parameters as key-value pairs"},
-                    "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
-                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"},
-                    "format": {"type": "string", "enum": ["json", "markdown", "csv"], "description": "Output format (default: json)"}
-                },
-                "required": ["template"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["run_template"],
-        });
-
-        // ===== CCG Tools (12) =====
-
-        map.insert("get_ccg_manifest", ToolMetadata {
-            name: "get_ccg_manifest",
-            description: "Get CCG Layer 0 manifest (~1-2KB JSON-LD) with repository identity, symbol counts, languages, and security summary. Always fits in AI context window.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "manifest", "context", "json-ld", "layer0"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "include_security": {"type": "boolean", "description": "Include security summary in manifest (default: true)"},
-                    "base_url": {"type": "string", "description": "Base URL for layer URIs (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_manifest", "manifest"],
-        });
-
-        map.insert("export_ccg_manifest", ToolMetadata {
-            name: "export_ccg_manifest",
-            description: "Export CCG Layer 0 manifest to a file. Returns content or writes to specified path.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "manifest", "export", "json-ld", "layer0"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "include_security": {"type": "boolean", "description": "Include security summary (default: true)"},
-                    "base_url": {"type": "string", "description": "Base URL for layer URIs"},
-                    "output": {"type": "string", "description": "Output file path (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["export_manifest"],
-        });
-
-        map.insert("export_ccg_architecture", ToolMetadata {
-            name: "export_ccg_architecture",
-            description: "Export CCG Layer 1 architecture (~10-50KB JSON-LD) with module hierarchy, public API, and dependencies.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "architecture", "export", "json-ld", "layer1", "modules"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "output": {"type": "string", "description": "Output file path (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["export_architecture", "ccg_architecture"],
-        });
-
-        map.insert("export_ccg_index", ToolMetadata {
-            name: "export_ccg_index",
-            description: "Export CCG Layer 2 symbol index (~100-500KB N-Quads gzipped) with all symbols and call graph edges.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "index", "export", "nquads", "layer2", "symbols"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "output": {"type": "string", "description": "Output file path (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["export_symbol_index", "ccg_index"],
-        });
-
-        map.insert("export_ccg_full", ToolMetadata {
-            name: "export_ccg_full",
-            description: "Export CCG Layer 3 full detail (~1-20MB N-Quads gzipped) with complete RDF dataset including imports and security findings.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "full", "export", "nquads", "layer3", "rdf"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "output": {"type": "string", "description": "Output file path (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["export_full_detail", "ccg_full"],
-        });
-
-        map.insert("export_ccg", ToolMetadata {
-            name: "export_ccg",
-            description: "Export all CCG layers as a bundle to a directory. Generates manifest.json, architecture.json, symbol-index.nq.gz.b64, and full-detail.nq.gz.b64.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "bundle", "export", "all-layers"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "output_dir": {"type": "string", "description": "Output directory path (optional)"},
-                    "base_url": {"type": "string", "description": "Base URL for layer URIs"},
-                    "include_security": {"type": "boolean", "description": "Include security summary (default: true)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_bundle", "export_all_layers"],
-        });
-
-        map.insert("query_ccg", ToolMetadata {
-            name: "query_ccg",
-            description: "Query CCG Layer 3 using SPARQL. Enables rich semantic queries against the full code context graph.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "query", "sparql", "layer3", "semantic"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "query": {"type": "string", "description": "SPARQL query to execute"},
-                    "timeout_ms": {"type": "integer", "description": "Query timeout in milliseconds (default: 30000)"},
-                    "limit": {"type": "integer", "description": "Maximum number of results (default: 1000)"}
-                },
-                "required": ["repo", "query"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_query", "query_context_graph"],
-        });
-
-        map.insert("get_ccg_acl", ToolMetadata {
-            name: "get_ccg_acl",
-            description: "Generate WebACL access control document for CCG layers. Supports Triple-Heart Model (public/authenticated/private tiers).",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "acl", "access", "webacl", "security", "triple-heart"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "tier": {"type": "string", "description": "Access tier: 'public' or 'triple-heart' (default)"},
-                    "agent": {"type": "string", "description": "Specific agent URI to grant private access to (optional)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_acl", "ccg_access_control"],
-        });
-
-        map.insert("get_ccg_access_info", ToolMetadata {
-            name: "get_ccg_access_info",
-            description: "Get information about CCG access tiers and permissions. Explains the Triple-Heart Model and WebACL configuration.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "access", "info", "triple-heart", "help"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Low,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tier": {"type": "string", "description": "Access tier to explain: 'public', 'authenticated', or 'private'"}
-                },
-                "required": []
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_access_info", "ccg_tier_info"],
-        });
-
-        map.insert("import_ccg", ToolMetadata {
-            name: "import_ccg",
-            description: "Import a CCG layer from URL or local file. Supports JSON-LD (L0/L1) and gzipped N-Quads (L2/L3) formats.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "import", "fetch", "load", "registry"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch CCG layer from (e.g., codecontextgraph.com registry)"},
-                    "path": {"type": "string", "description": "Local file path to load CCG layer from"},
-                    "layer": {"type": "string", "description": "Layer type: 'manifest', 'architecture', 'symbol_index', 'full_detail' (or 0-3)"}
-                },
-                "required": []
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_import", "load_ccg", "fetch_ccg"],
-        });
-
-        map.insert("import_ccg_from_registry", ToolMetadata {
-            name: "import_ccg_from_registry",
-            description: "Import all CCG layers from the codecontextgraph.com registry for a repository.",
-            category: ToolCategory::Graph,
-            tags: ["ccg", "import", "registry", "fetch", "all-layers"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: [FeatureFlag::Graph].iter().copied().collect(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "host": {"type": "string", "description": "Git host (default: github.com)"},
-                    "owner": {"type": "string", "description": "Repository owner"},
-                    "repo": {"type": "string", "description": "Repository name (as in host/owner/repo), not a local path"},
-                    "commit": {"type": "string", "description": "Commit SHA or 'latest' (default: latest)"}
-                },
-                "required": ["owner", "repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["ccg_import_registry", "fetch_ccg_from_registry"],
         });
 
         map

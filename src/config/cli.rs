@@ -42,10 +42,6 @@ pub enum ConfigCommand {
         /// Create user config (~/.config/narsil-mcp/config.yaml)
         #[arg(long)]
         user: bool,
-
-        /// Run the neural API key setup wizard
-        #[arg(long)]
-        neural: bool,
     },
 
     /// Apply a preset to configuration
@@ -134,8 +130,7 @@ pub async fn handle_config_command(cmd: ConfigCommand) -> Result<()> {
             preset,
             project,
             user,
-            neural,
-        } => cmd_init(preset, project, user, neural).await,
+        } => cmd_init(preset, project, user).await,
         ConfigCommand::Preset { preset, project } => cmd_preset(preset, project),
         ConfigCommand::Export { resolved, format } => cmd_export(resolved, format),
         ConfigCommand::Profiles { format } => cmd_profiles(format),
@@ -251,13 +246,7 @@ fn cmd_validate(path: PathBuf, verbose: bool) -> Result<()> {
     }
 }
 
-async fn cmd_init(preset: Option<String>, project: bool, user: bool, neural: bool) -> Result<()> {
-    // If --neural flag is set, run the neural API key wizard instead
-    if neural {
-        use crate::config::wizard::NeuralWizard;
-        let wizard = NeuralWizard::new();
-        return wizard.run().await;
-    }
+async fn cmd_init(preset: Option<String>, project: bool, user: bool) -> Result<()> {
     // Determine target path
     let target_path = if project {
         PathBuf::from(".narsil.yaml")
@@ -465,9 +454,6 @@ fn cmd_profiles(format: OutputFormat) -> Result<()> {
                     ("persist", profile.persist),
                     ("watch", profile.watch),
                     ("lsp", profile.lsp),
-                    ("remote", profile.remote),
-                    ("neural", profile.neural),
-                    ("graph", profile.graph),
                 ]
                 .into_iter()
                 .filter_map(|(label, enabled)| enabled.unwrap_or(false).then_some(label))

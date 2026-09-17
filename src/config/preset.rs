@@ -69,8 +69,6 @@ impl Preset {
             Preset::Minimal => {
                 // Disable slow/advanced tools
                 [
-                    "neural_search",
-                    "find_semantic_clones",
                     "generate_sbom",
                     "check_dependencies",
                     "check_licenses",
@@ -82,21 +80,9 @@ impl Preset {
                 .copied()
                 .collect()
             }
-            Preset::Balanced => {
-                // Disable only the slowest tools
-                ["neural_search", "find_semantic_clones"]
-                    .iter()
-                    .copied()
-                    .collect()
-            }
+            Preset::Balanced => HashSet::new(),
             Preset::Full => HashSet::new(), // Nothing disabled
-            Preset::SecurityFocused => {
-                // Disable neural and some graph tools
-                ["neural_search", "find_semantic_clones", "get_call_graph"]
-                    .iter()
-                    .copied()
-                    .collect()
-            }
+            Preset::SecurityFocused => ["get_call_graph"].iter().copied().collect(),
         }
     }
 
@@ -279,33 +265,6 @@ pub enum ExposeGroup {
     /// Chunk and embedding retrieval, similarity search.
     Retrieval,
 }
-
-/// Tools registered in `TOOL_METADATA` but deliberately not reachable over MCP
-/// (HTTP-only, or gated behind a feature flag). Listed so the partition test
-/// can tell "intentionally ungrouped" from "someone forgot".
-#[cfg(test)]
-const UNGROUPED_TOOLS: [&str; 20] = [
-    "add_remote_repo",
-    "export_ccg",
-    "export_ccg_architecture",
-    "export_ccg_full",
-    "export_ccg_index",
-    "export_ccg_manifest",
-    "find_semantic_clones",
-    "get_ccg_access_info",
-    "get_ccg_acl",
-    "get_ccg_manifest",
-    "get_neural_stats",
-    "get_remote_file",
-    "import_ccg",
-    "import_ccg_from_registry",
-    "list_remote_files",
-    "list_sparql_templates",
-    "neural_search",
-    "query_ccg",
-    "run_sparql_template",
-    "sparql_query",
-];
 
 impl ExposeGroup {
     /// Every group, in the order they are printed in `--help` and the docs.
@@ -564,7 +523,6 @@ mod tests {
     #[test]
     fn test_minimal_excludes_advanced() {
         let disabled = Preset::Minimal.get_disabled_tools();
-        assert!(disabled.contains(&"neural_search"));
         assert!(disabled.contains(&"generate_sbom"));
     }
 
@@ -573,12 +531,6 @@ mod tests {
         let tools = Preset::Balanced.get_enabled_tools();
         assert!(tools.contains(&"get_blame"));
         assert!(tools.contains(&"get_file_history"));
-    }
-
-    #[test]
-    fn test_balanced_excludes_neural() {
-        let disabled = Preset::Balanced.get_disabled_tools();
-        assert!(disabled.contains(&"neural_search"));
     }
 
     #[test]
@@ -604,12 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn test_security_excludes_neural() {
-        let disabled = Preset::SecurityFocused.get_disabled_tools();
-        assert!(disabled.contains(&"neural_search"));
-    }
-
-    #[test]
     fn test_parse() {
         assert_eq!(Preset::parse("minimal"), Some(Preset::Minimal));
         assert_eq!(Preset::parse("MINIMAL"), Some(Preset::Minimal));
@@ -626,14 +572,11 @@ mod tests {
         assert_eq!(Preset::parse("unknown"), None);
     }
 
-    /// A tool added to the registry must be assigned a group or explicitly
-    /// opted out; otherwise it is unreachable under any `--expose` and nothing
-    /// says so.
+    /// A tool added to the registry must be assigned a group; otherwise it is
+    /// unreachable under any `--expose` and nothing says so.
     #[test]
     fn test_expose_groups_partition_registry() {
         use crate::tool_metadata::TOOL_METADATA;
-
-        let ungrouped: HashSet<&str> = UNGROUPED_TOOLS.iter().copied().collect();
 
         for tool_name in TOOL_METADATA.keys() {
             let owners: Vec<&'static str> = ExposeGroup::ALL
@@ -642,25 +585,12 @@ mod tests {
                 .map(|g| g.name())
                 .collect();
 
-            assert!(
-                owners.len() <= 1,
-                "{} belongs to several groups: {:?}",
+            assert_eq!(
+                owners.len(),
+                1,
+                "{}: must belong to exactly one ExposeGroup, has {:?}",
                 tool_name,
                 owners
-            );
-            assert_eq!(
-                owners.len() == 1,
-                !ungrouped.contains(tool_name),
-                "{}: assign it to an ExposeGroup or add it to UNGROUPED_TOOLS",
-                tool_name
-            );
-        }
-
-        for tool in UNGROUPED_TOOLS {
-            assert!(
-                TOOL_METADATA.contains_key(tool),
-                "UNGROUPED_TOOLS names {}, which is not in the registry",
-                tool
             );
         }
     }
@@ -705,7 +635,6 @@ mod tests {
             ExposeGroup::of("get_complexity"),
             Some(ExposeGroup::Analysis)
         );
-        assert_eq!(ExposeGroup::of("neural_search"), None);
     }
 
     /// The two kept in `code` earn it by answering something the caller cannot

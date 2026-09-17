@@ -63,7 +63,6 @@ async fn test_backwards_compatibility_cli_only() -> Result<()> {
         watch_enabled: false,
         streaming_config: Default::default(),
         lsp_config: Default::default(),
-        neural_config: Default::default(),
         ..Default::default()
     };
 
@@ -138,7 +137,6 @@ async fn test_config_priority_cli_flags_override() -> Result<()> {
         watch_enabled: false,
         streaming_config: Default::default(),
         lsp_config: Default::default(),
-        neural_config: Default::default(),
         ..Default::default()
     };
 
@@ -491,7 +489,6 @@ async fn test_feature_flag_validation() -> Result<()> {
         watch_enabled: false,
         streaming_config: Default::default(),
         lsp_config: Default::default(),
-        neural_config: Default::default(),
         ..Default::default()
     };
 
@@ -537,7 +534,7 @@ async fn test_feature_flag_validation() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_completeness() -> Result<()> {
     // Verify all tools in TOOL_METADATA have required fields
-    assert_eq!(TOOL_METADATA.len(), 90, "Expected 90 tools in metadata");
+    assert_eq!(TOOL_METADATA.len(), 72, "Expected 72 tools in metadata");
 
     for (name, meta) in TOOL_METADATA.iter() {
         // Name should match key
@@ -593,7 +590,6 @@ async fn test_all_categories_represented() -> Result<()> {
         ToolCategory::CallGraph,
         ToolCategory::Git,
         ToolCategory::Lsp,
-        ToolCategory::Remote,
         ToolCategory::Security,
         ToolCategory::SupplyChain,
         ToolCategory::Analysis,
@@ -632,7 +628,6 @@ async fn test_required_flags_validation() -> Result<()> {
                 watch_enabled: false,
                 streaming_config: Default::default(),
                 lsp_config: Default::default(),
-                neural_config: Default::default(),
                 ..Default::default()
             };
 
@@ -655,7 +650,6 @@ async fn test_required_flags_validation() -> Result<()> {
                 watch_enabled: false,
                 streaming_config: Default::default(),
                 lsp_config: Default::default(),
-                neural_config: Default::default(),
                 ..Default::default()
             };
 

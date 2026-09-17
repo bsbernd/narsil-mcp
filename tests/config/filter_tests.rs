@@ -92,10 +92,6 @@ fn test_filter_by_feature_flags_all_enabled() {
             enabled: true,
             ..Default::default()
         },
-        neural_config: narsil_mcp::neural::NeuralConfig {
-            enabled: true,
-            ..Default::default()
-        },
         ..Default::default()
     };
 
@@ -107,7 +103,6 @@ fn test_filter_by_feature_flags_all_enabled() {
     assert!(enabled.len() >= 70, "Most tools should be enabled");
     assert!(enabled.contains(&"get_blame"));
     assert!(enabled.contains(&"get_call_graph"));
-    assert!(enabled.contains(&"neural_search"));
 }
 
 #[test]
@@ -158,7 +153,7 @@ fn test_filter_by_tool_override_disabled() {
     // Disable specific tool via override
     let mut config = ToolConfig::default();
     config.tools.overrides.insert(
-        "neural_search".to_string(),
+        "semantic_search".to_string(),
         ToolOverride {
             enabled: false,
             reason: Some("Too slow for interactive use".to_string()),
@@ -169,20 +164,15 @@ fn test_filter_by_tool_override_disabled() {
         },
     );
 
-    let mut options = EngineOptions::default();
-    options.neural_config.enabled = true; // Feature enabled, but tool overridden
+    let options = EngineOptions::default();
 
     let filter = ToolFilter::new(config, &options, None);
     let enabled = filter.get_enabled_tools();
 
-    // neural_search should be disabled despite neural flag being enabled
     assert!(
-        !enabled.contains(&"neural_search"),
+        !enabled.contains(&"semantic_search"),
         "Overridden tools should be disabled"
     );
-
-    // Other neural tools should still work if they exist
-    // (find_semantic_clones requires neural flag)
 }
 
 #[test]
@@ -317,10 +307,6 @@ fn test_feature_flag_conversion_from_engine_options() {
             enabled: true,
             ..Default::default()
         },
-        neural_config: narsil_mcp::neural::NeuralConfig {
-            enabled: false,
-            ..Default::default()
-        },
         ..Default::default()
     };
 
@@ -330,7 +316,6 @@ fn test_feature_flag_conversion_from_engine_options() {
     assert!(!flags.contains(&FeatureFlag::CallGraph));
     assert!(flags.contains(&FeatureFlag::Persist));
     assert!(flags.contains(&FeatureFlag::Lsp));
-    assert!(!flags.contains(&FeatureFlag::Neural));
 }
 
 #[test]
@@ -395,10 +380,6 @@ fn test_empty_config_with_all_flags_enabled() {
             enabled: true,
             ..Default::default()
         },
-        neural_config: narsil_mcp::neural::NeuralConfig {
-            enabled: true,
-            ..Default::default()
-        },
         ..Default::default()
     };
 
@@ -455,9 +436,6 @@ fn test_security_focused_preset() {
     assert!(enabled.contains(&"scan_security"));
     assert!(enabled.contains(&"check_owasp_top10"));
     assert!(enabled.contains(&"generate_sbom"));
-
-    // Should NOT include neural tools
-    assert!(!enabled.contains(&"neural_search"));
 }
 
 /// All feature flags on, so nothing below is filtered out by a missing flag.
@@ -467,12 +445,7 @@ fn all_features_enabled() -> EngineOptions {
         call_graph_enabled: true,
         persist_enabled: true,
         watch_enabled: true,
-        remote_enabled: true,
         lsp_config: narsil_mcp::lsp::LspConfig {
-            enabled: true,
-            ..Default::default()
-        },
-        neural_config: narsil_mcp::neural::NeuralConfig {
             enabled: true,
             ..Default::default()
         },

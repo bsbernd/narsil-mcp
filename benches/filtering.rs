@@ -107,10 +107,6 @@ fn bench_tool_filtering(c: &mut Criterion) {
                 enabled: true,
                 ..Default::default()
             },
-            neural_config: narsil_mcp::neural::NeuralConfig {
-                enabled: true,
-                ..Default::default()
-            },
             ..Default::default()
         };
 

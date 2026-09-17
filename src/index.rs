@@ -23,10 +23,8 @@ use crate::git::GitRepo;
 use crate::gtags::{gtags_file_path, GtagsManager};
 use crate::lsp::{LspConfig, LspManager};
 use crate::metrics::{spawn_flush_task, MemoryReport, Metrics, DEFAULT_FLUSH_INTERVAL};
-use crate::neural::{NeuralConfig, NeuralEngine};
 use crate::parser::LanguageParser;
 use crate::persist::{IndexStore, PersistedIndex};
-use crate::remote::RemoteRepoManager;
 use crate::response_budget;
 use crate::search::{build_file_doc, ConcurrentSearchIndex, SearchDocument};
 use crate::streaming::StreamingConfig;
@@ -160,17 +158,10 @@ pub struct EngineOptions {
     pub persist_enabled: bool,
     /// Enable file watching for incremental updates
     pub watch_enabled: bool,
-    /// Enable remote GitHub repository support (gates Remote-category tools).
-    /// Mirrors `--remote` so `ToolFilter::convert_engine_options` can surface
-    /// `FeatureFlag::Remote` and the Remote tools become visible in
-    /// `tools/list`.
-    pub remote_enabled: bool,
     /// Streaming configuration
     pub streaming_config: StreamingConfig,
     /// LSP configuration
     pub lsp_config: LspConfig,
-    /// Neural embedding configuration
-    pub neural_config: NeuralConfig,
     /// Enable analysis caching for expensive operations
     pub cache_enabled: bool,
     /// Cache TTL in seconds (default: 1800 = 30 minutes)
@@ -207,12 +198,6 @@ pub struct EngineOptions {
     /// Build a GTAGS database (via the `gtags` binary) for C/C++ repos that lack
     /// one. Writes into the repo, so opt-in; size-gated by GTAGS_GENERATE_MAX_FILES.
     pub gtags_generate: bool,
-    /// Enable RDF knowledge graph storage (requires graph feature)
-    #[cfg(feature = "graph")]
-    pub graph_enabled: bool,
-    /// Path for knowledge graph storage (defaults to index_path/graph if not set)
-    #[cfg(feature = "graph")]
-    pub graph_path: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -222,10 +207,8 @@ impl Default for EngineOptions {
             call_graph_enabled: false,
             persist_enabled: false,
             watch_enabled: false,
-            remote_enabled: false,
             streaming_config: StreamingConfig::default(),
             lsp_config: LspConfig::default(),
-            neural_config: NeuralConfig::default(),
             cache_enabled: true,
             cache_ttl_seconds: 1800,
             adopted_repo_ttl_days: DEFAULT_ADOPTED_REPO_TTL_DAYS,
@@ -240,10 +223,6 @@ impl Default for EngineOptions {
             lsp_intent: BackendIntent::default(),
             gtags_intent: BackendIntent::default(),
             gtags_generate: false,
-            #[cfg(feature = "graph")]
-            graph_enabled: false,
-            #[cfg(feature = "graph")]
-            graph_path: None,
         }
     }
 }
@@ -487,8 +466,6 @@ pub struct CodeIntelEngine {
     search_index: Arc<ConcurrentSearchIndex>,
     /// Embedding engine for semantic similarity (TF-IDF)
     embedding_engine: Arc<EmbeddingEngine>,
-    /// Neural embedding engine for semantic search (when neural is enabled)
-    neural_engine: Option<Arc<NeuralEngine>>,
     /// Engine options (feature flags)
     options: EngineOptions,
     /// Index store for persistence (when persist is enabled)
@@ -502,8 +479,6 @@ pub struct CodeIntelEngine {
     lsp_manager: Option<Arc<LspManager>>,
     /// GNU Global manager for C/C++ reference queries (when gtags is enabled)
     gtags_manager: Option<Arc<GtagsManager>>,
-    /// Remote repository manager for GitHub integration
-    remote_manager: Option<Arc<tokio::sync::Mutex<RemoteRepoManager>>>,
     /// Cached security rules engine (avoids reloading rules on each scan)
     security_engine: Arc<crate::security_rules::SecurityRulesEngine>,
     /// Analysis cache for expensive operations (security scans, call graphs, etc.)
@@ -516,9 +491,6 @@ pub struct CodeIntelEngine {
     indexed_repos_count: AtomicUsize,
     /// Total number of repositories to index
     total_repos_count: AtomicUsize,
-    /// RDF knowledge graph for persistent code intelligence data (when graph is enabled)
-    #[cfg(feature = "graph")]
-    knowledge_graph: Option<Arc<crate::persistence::KnowledgeGraph>>,
     /// Background task that periodically flushes lifetime metrics to disk.
     /// Aborted on shutdown after a final synchronous flush.
     metrics_flush_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -656,28 +628,6 @@ impl CodeIntelEngine {
             None
         };
 
-        // Initialize neural engine if enabled
-        let neural_engine = if options.neural_config.enabled {
-            match NeuralEngine::new(options.neural_config.clone()) {
-                Ok(engine) => {
-                    info!(
-                        "Neural embedding engine initialized (backend={}, model={:?})",
-                        options.neural_config.backend, options.neural_config.model_name
-                    );
-                    Some(Arc::new(engine))
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize neural engine: {}. Run 'narsil-mcp config init --neural' to set up your API key.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Pre-initialize security rules engine (caches compiled patterns)
         let security_engine = Arc::new(crate::security_rules::SecurityRulesEngine::new());
 
@@ -705,35 +655,6 @@ impl CodeIntelEngine {
         } else {
             // Create a minimal cache even when disabled (0 TTL means immediate expiry)
             Arc::new(QueryCache::new(1, std::time::Duration::from_secs(0)))
-        };
-
-        // Initialize knowledge graph if graph feature is enabled
-        #[cfg(feature = "graph")]
-        let knowledge_graph = if options.graph_enabled {
-            let graph_path = options
-                .graph_path
-                .clone()
-                .unwrap_or_else(|| expanded_index.join("graph"));
-            match crate::persistence::KnowledgeGraph::open(&graph_path) {
-                Ok(graph) => {
-                    info!("Knowledge graph opened at {:?}", graph_path);
-                    // Load ontology if the graph is new/empty
-                    if graph.is_empty() {
-                        if let Err(e) = graph.load_ontology() {
-                            warn!("Failed to load ontology into knowledge graph: {}", e);
-                        } else {
-                            info!("Loaded narsil ontology into knowledge graph");
-                        }
-                    }
-                    Some(Arc::new(graph))
-                }
-                Err(e) => {
-                    warn!("Failed to open knowledge graph at {:?}: {}", graph_path, e);
-                    None
-                }
-            }
-        } else {
-            None
         };
 
         let total_repos = expanded_repos.len();
@@ -800,21 +721,17 @@ impl CodeIntelEngine {
             call_graphs: DashMap::new(),
             search_index: Arc::new(ConcurrentSearchIndex::new()),
             embedding_engine: Arc::new(EmbeddingEngine::new(options.embedding_dim)),
-            neural_engine,
             options: options.clone(),
             index_store,
             metrics,
             lsp_manager,
             gtags_manager,
-            remote_manager: None,
             security_engine,
             analysis_cache,
             query_cache,
             initialization_complete: AtomicBool::new(false),
             indexed_repos_count: AtomicUsize::new(0),
             total_repos_count: AtomicUsize::new(total_repos),
-            #[cfg(feature = "graph")]
-            knowledge_graph,
             metrics_flush_task: parking_lot::Mutex::new(Some(flush_task)),
             definition_builds: DashMap::new(),
             gitignore_matchers: DashMap::new(),
@@ -1171,16 +1088,10 @@ impl CodeIntelEngine {
         status
     }
 
-    /// Index one symbol's signature into the embedding engine and, when neural
-    /// search is enabled, queue it for batch neural indexing. Skips symbols
+    /// Index one symbol's signature into the embedding engine. Skips symbols
     /// without a signature (nothing to embed). `symbol.file_path` must already
     /// be the repo-relative path.
-    fn index_symbol_embeddings(
-        &self,
-        repo: &str,
-        symbol: &Symbol,
-        neural_docs: &mut Vec<crate::neural::NeuralDocument>,
-    ) {
+    fn index_symbol_embeddings(&self, repo: &str, symbol: &Symbol) {
         let sig = match symbol.signature {
             Some(ref sig) => sig,
             None => return,
@@ -1189,23 +1100,13 @@ impl CodeIntelEngine {
         // prefix with repo to keep the embedding store's document id unique.
         let symbol_id = format!("{}::{}::{}", repo, symbol.file_path, symbol.name);
         self.embedding_engine.index_snippet(
-            symbol_id.clone(),
+            symbol_id,
             repo.to_string(),
             symbol.file_path.clone(),
             sig.clone(),
             symbol.start_line,
             symbol.end_line,
         );
-        if self.neural_engine.is_some() {
-            neural_docs.push(crate::neural::NeuralDocument {
-                id: symbol_id,
-                file_path: symbol.file_path.clone(),
-                content: sig.clone(),
-                start_line: symbol.start_line,
-                end_line: symbol.end_line,
-                symbol_name: Some(symbol.name.clone()),
-            });
-        }
     }
 
     /// Does `repo_path` ship a compile_commands.json clangd can read? Honors an
@@ -1723,7 +1624,6 @@ impl CodeIntelEngine {
 
         let mut languages: HashMap<String, LanguageStats> = HashMap::new();
         let mut symbols_vec: Vec<Symbol> = Vec::new();
-        let mut neural_docs: Vec<crate::neural::NeuralDocument> = Vec::new();
         let mut file_count = 0;
         let mut total_lines = 0;
 
@@ -2052,7 +1952,7 @@ impl CodeIntelEngine {
 
                 if let Some(symbols) = reused {
                     for symbol in &symbols {
-                        self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
+                        self.index_symbol_embeddings(&repo_name, symbol);
                     }
                     symbols_vec.extend(symbols);
                 } else if cxx_augment && is_cxx {
@@ -2070,7 +1970,7 @@ impl CodeIntelEngine {
                 } else {
                     for mut symbol in parsed.symbols {
                         symbol.file_path = relative_path.clone();
-                        self.index_symbol_embeddings(&repo_name, &symbol, &mut neural_docs);
+                        self.index_symbol_embeddings(&repo_name, &symbol);
                         symbols_vec.push(symbol);
                     }
                 }
@@ -2123,7 +2023,7 @@ impl CodeIntelEngine {
             // the tree-sitter baseline unchanged.
             for group in cxx_groups {
                 for symbol in &group.symbols {
-                    self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
+                    self.index_symbol_embeddings(&repo_name, symbol);
                 }
                 symbols_vec.extend(group.symbols);
             }
@@ -2217,7 +2117,7 @@ impl CodeIntelEngine {
                 match joined {
                     Ok(file_symbols) => {
                         for symbol in &file_symbols {
-                            self.index_symbol_embeddings(&repo_name, symbol, &mut neural_docs);
+                            self.index_symbol_embeddings(&repo_name, symbol);
                         }
                         symbols_vec.extend(file_symbols);
                     }
@@ -2289,25 +2189,6 @@ impl CodeIntelEngine {
             file_count, symbol_count, repo_name
         );
 
-        // Batch index neural embeddings if enabled (skipped for cached repos)
-        if !symbols_cached {
-            if let Some(ref neural) = self.neural_engine {
-                if !neural_docs.is_empty() {
-                    info!(
-                        "Generating neural embeddings for {} symbols...",
-                        neural_docs.len()
-                    );
-                    let items: Vec<(crate::neural::NeuralDocument,)> =
-                        neural_docs.into_iter().map(|d| (d,)).collect();
-                    if let Err(e) = neural.index_batch(&items) {
-                        warn!("Failed to batch index neural embeddings: {}", e);
-                    } else {
-                        info!("Neural embeddings indexed successfully");
-                    }
-                }
-            }
-        }
-
         // Record indexing metrics
         let elapsed = start_time.elapsed();
         self.metrics
@@ -2365,47 +2246,6 @@ impl CodeIntelEngine {
                     call_hierarchy_start.elapsed(),
                     repo_name
                 );
-            }
-        }
-
-        // Transform symbols to RDF knowledge graph if enabled
-        #[cfg(feature = "graph")]
-        if let Some(ref graph) = self.knowledge_graph {
-            use crate::persistence::{RepositoryTransformer, SymbolTransformer};
-
-            // Get the symbols we just indexed
-            if let Some(symbols) = self.symbols.get(&repo_name) {
-                let symbol_count = symbols.len();
-                if let Err(e) = SymbolTransformer::transform_many(graph, &repo_name, symbols.iter())
-                {
-                    warn!(
-                        "Failed to transform symbols to RDF for {}: {}",
-                        repo_name, e
-                    );
-                } else {
-                    // Also add repository metadata
-                    let file_paths: Vec<String> = symbols
-                        .iter()
-                        .map(|s| s.file_path.clone())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    if let Err(e) = RepositoryTransformer::transform(
-                        graph,
-                        &repo_name,
-                        file_paths.iter().map(|s| s.as_str()),
-                    ) {
-                        warn!(
-                            "Failed to transform repository metadata to RDF for {}: {}",
-                            repo_name, e
-                        );
-                    } else {
-                        info!(
-                            "Transformed {} symbols to RDF knowledge graph for {}",
-                            symbol_count, repo_name
-                        );
-                    }
-                }
             }
         }
 
@@ -3420,15 +3260,6 @@ impl CodeIntelEngine {
     /// Get a reference to the engine options
     pub fn options(&self) -> &EngineOptions {
         &self.options
-    }
-
-    /// Get a reference to the knowledge graph (if enabled).
-    ///
-    /// Returns `None` if the graph feature is disabled or if graph initialization failed.
-    #[cfg(feature = "graph")]
-    #[must_use]
-    pub fn knowledge_graph(&self) -> Option<Arc<crate::persistence::KnowledgeGraph>> {
-        self.knowledge_graph.clone()
     }
 
     /// Get cache statistics for metrics reporting
@@ -6502,22 +6333,11 @@ impl CodeIntelEngine {
             }
         ));
         output.push_str(&format!(
-            "- **Watch mode**: {}\n",
+            "- **Watch mode**: {}\n\n",
             if self.options.watch_enabled {
                 "enabled"
             } else {
                 "disabled"
-            }
-        ));
-        output.push_str(&format!(
-            "- **Neural embeddings**: {}\n\n",
-            if self.neural_engine.is_some() {
-                format!(
-                    "enabled (backend={}, model={:?})",
-                    self.options.neural_config.backend, self.options.neural_config.model_name
-                )
-            } else {
-                "disabled".to_string()
             }
         ));
 
@@ -7742,163 +7562,6 @@ impl CodeIntelEngine {
 
         Ok(output)
     }
-
-    // === Remote Repository Methods ===
-
-    /// Initialize the remote repository manager
-    pub fn init_remote_manager(&mut self) -> Result<()> {
-        if self.remote_manager.is_none() {
-            let manager = RemoteRepoManager::new()?;
-            self.remote_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
-            info!("Remote repository manager initialized");
-        }
-        Ok(())
-    }
-
-    /// Add a remote GitHub repository for indexing
-    pub async fn add_remote_repo(
-        &self,
-        url: &str,
-        sparse_paths: Option<&[String]>,
-    ) -> Result<String> {
-        // Initialize manager if needed
-        let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
-            None => {
-                return Err(anyhow!(
-                    "Remote repository support not initialized. Use init_remote_manager() first."
-                ));
-            }
-        };
-
-        let remote = crate::remote::RemoteRepo::from_url(url)?;
-
-        let mut output = String::new();
-        output.push_str(&format!(
-            "# Adding Remote Repository: {}\n\n",
-            remote.identifier()
-        ));
-        output.push_str(&format!("**URL**: {}\n", remote.url));
-        if let Some(branch) = &remote.branch {
-            output.push_str(&format!("**Branch**: {}\n", branch));
-        }
-        output.push('\n');
-
-        let local_path = {
-            let mut mgr = manager.lock().await;
-            if let Some(paths) = sparse_paths {
-                let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                output.push_str(&format!(
-                    "Performing sparse checkout of {} paths...\n\n",
-                    paths.len()
-                ));
-                mgr.sparse_checkout(&remote, &path_refs).await?
-            } else {
-                output.push_str("Cloning repository...\n\n");
-                mgr.clone_repo(&remote).await?
-            }
-        };
-
-        output.push_str(&format!("**Local Path**: `{}`\n\n", local_path.display()));
-        output.push_str("Repository cloned successfully. You can now index it with `reindex`.\n");
-
-        // Note: Full indexing would require adding this path to repo_paths and calling index_repo
-        // For now we just clone and return the path
-
-        Ok(output)
-    }
-
-    /// List files in a remote GitHub repository via API
-    pub async fn list_remote_files(&self, url: &str, path: Option<&str>) -> Result<String> {
-        let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
-            None => {
-                // Try to create a temporary manager for API-only operation
-                let mgr = RemoteRepoManager::new()?;
-                let remote = crate::remote::RemoteRepo::from_url(url)?;
-                let files = mgr.list_files(&remote, path).await?;
-
-                let mut output = String::new();
-                output.push_str(&format!("# Files in {}\n\n", remote.identifier()));
-                if let Some(p) = path {
-                    output.push_str(&format!("**Path**: `{}`\n\n", p));
-                }
-                output.push_str(&format!("Found {} files:\n\n", files.len()));
-                for file in files {
-                    output.push_str(&format!("- `{}`\n", file));
-                }
-                return Ok(output);
-            }
-        };
-
-        let remote = crate::remote::RemoteRepo::from_url(url)?;
-
-        let files = {
-            let mgr = manager.lock().await;
-            mgr.list_files(&remote, path).await?
-        };
-
-        let mut output = String::new();
-        output.push_str(&format!("# Files in {}\n\n", remote.identifier()));
-        if let Some(p) = path {
-            output.push_str(&format!("**Path**: `{}`\n\n", p));
-        }
-        output.push_str(&format!("Found {} files:\n\n", files.len()));
-        for file in &files {
-            output.push_str(&format!("- `{}`\n", file));
-        }
-
-        if files.is_empty() {
-            output.push_str("*No files found (directory may be empty or not exist)*\n");
-        }
-
-        Ok(output)
-    }
-
-    /// Fetch a specific file from a remote GitHub repository
-    pub async fn get_remote_file(&self, url: &str, path: &str) -> Result<String> {
-        let manager = match &self.remote_manager {
-            Some(m) => m.clone(),
-            None => {
-                // Try to create a temporary manager for API-only operation
-                let mgr = RemoteRepoManager::new()?;
-                let remote = crate::remote::RemoteRepo::from_url(url)?;
-                let content = mgr.get_file(&remote, path).await?;
-
-                let mut output = String::new();
-                output.push_str(&format!("# {} from {}\n\n", path, remote.identifier()));
-                output.push_str("```");
-                output.push_str(get_language_id(path));
-                output.push('\n');
-                output.push_str(&content);
-                output.push_str("\n```\n");
-                return Ok(output);
-            }
-        };
-
-        let remote = crate::remote::RemoteRepo::from_url(url)?;
-
-        let content = {
-            let mgr = manager.lock().await;
-            mgr.get_file(&remote, path).await?
-        };
-
-        let mut output = String::new();
-        output.push_str(&format!("# {} from {}\n\n", path, remote.identifier()));
-
-        let lines: Vec<&str> = content.lines().collect();
-        output.push_str(&format!("**Lines**: {}\n\n", lines.len()));
-
-        output.push_str("```");
-        output.push_str(get_language_id(path));
-        output.push('\n');
-        output.push_str(&content);
-        output.push_str("\n```\n");
-
-        Ok(output)
-    }
-
-    // ==================== Control Flow Graph (CFG) Tools ====================
 
     /// Get control flow graph for a specific function
     pub async fn get_control_flow(&self, repo: &str, path: &str, function: &str) -> Result<String> {
@@ -11055,193 +10718,6 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
-    // === Neural Search Methods ===
-
-    /// Perform neural semantic search
-    pub async fn neural_search(
-        &self,
-        repo: Option<&str>,
-        query: &str,
-        max_results: usize,
-    ) -> Result<String> {
-        let neural = self.neural_engine.as_ref().ok_or_else(|| {
-            anyhow!(
-                "Neural search not available. Enable with --neural flag and set EMBEDDING_API_KEY."
-            )
-        })?;
-
-        let results = neural.search(query, max_results)?;
-
-        let mut output = String::new();
-        output.push_str(&format!("# Neural Search Results for: `{}`\n\n", query));
-
-        // Filter by repo if specified
-        let filtered_results: Vec<_> = if let Some(repo_name) = repo {
-            results
-                .into_iter()
-                .filter(|r| r.document.file_path.contains(repo_name))
-                .collect()
-        } else {
-            results
-        };
-
-        if filtered_results.is_empty() {
-            output.push_str("No results found.\n");
-        } else {
-            output.push_str(&format!(
-                "Found {} semantically similar results:\n\n",
-                filtered_results.len()
-            ));
-
-            for (i, result) in filtered_results.iter().enumerate() {
-                output.push_str(&format!(
-                    "## {}. {} (similarity: {:.3})\n",
-                    i + 1,
-                    result.document.file_path,
-                    result.similarity
-                ));
-                output.push_str(&format!(
-                    "Lines {}-{}\n\n",
-                    result.document.start_line, result.document.end_line
-                ));
-
-                if let Some(ref symbol) = result.document.symbol_name {
-                    output.push_str(&format!("**Symbol**: `{}`\n\n", symbol));
-                }
-
-                // Show snippet (truncated if long)
-                let content = &result.document.content;
-                let snippet = if content.len() > 500 {
-                    format!(
-                        "{}...",
-                        response_budget::truncate_on_char_boundary(content, 500)
-                    )
-                } else {
-                    content.clone()
-                };
-                output.push_str("```\n");
-                output.push_str(&snippet);
-                output.push_str("\n```\n\n");
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// Find code semantically similar to a symbol
-    pub async fn find_semantic_clones(
-        &self,
-        repo: &str,
-        path: &str,
-        function: &str,
-        threshold: f32,
-    ) -> Result<String> {
-        let neural = self
-            .neural_engine
-            .as_ref()
-            .ok_or_else(|| anyhow!("Neural search not available. Enable with --neural flag."))?;
-
-        // Get the symbol's code
-        let repo_key = self.resolve_repo(repo)?;
-        let repo_path = PathBuf::from(&repo_key);
-        let file_path = validate_path(&repo_path, path)?;
-        let content = std::fs::read_to_string(&file_path)?;
-
-        // Find the symbol in our index
-        let symbols = self
-            .symbols
-            .get(&repo_key)
-            .ok_or_else(|| anyhow!("Repository not indexed"))?;
-        let symbol = symbols
-            .iter()
-            .find(|s| s.name == function && s.file_path == path)
-            .ok_or_else(|| anyhow!("Symbol not found: {}", function))?;
-
-        // Extract the symbol's code
-        let lines: Vec<&str> = content.lines().collect();
-        let start = symbol.start_line.saturating_sub(1);
-        let end = symbol.end_line.min(lines.len());
-        let symbol_code = lines[start..end].join("\n");
-
-        // Search for similar code
-        let results = neural.search(&symbol_code, 20)?;
-
-        let mut output = String::new();
-        output.push_str(&format!("# Semantic Clones of `{}`\n\n", function));
-        output.push_str(&format!("Threshold: {:.2}\n\n", threshold));
-
-        let filtered: Vec<_> = results
-            .into_iter()
-            .filter(|r| {
-                r.similarity >= threshold && r.document.symbol_name.as_deref() != Some(function)
-            })
-            .collect();
-
-        if filtered.is_empty() {
-            output.push_str("No semantic clones found above threshold.\n");
-        } else {
-            output.push_str(&format!("Found {} potential clones:\n\n", filtered.len()));
-
-            for (i, result) in filtered.iter().enumerate() {
-                output.push_str(&format!(
-                    "## {}. {} (similarity: {:.3})\n",
-                    i + 1,
-                    result
-                        .document
-                        .symbol_name
-                        .as_deref()
-                        .unwrap_or(&result.document.file_path),
-                    result.similarity
-                ));
-                output.push_str(&format!(
-                    "File: {}:{}-{}\n\n",
-                    result.document.file_path, result.document.start_line, result.document.end_line
-                ));
-
-                let content = &result.document.content;
-                let snippet = if content.len() > 300 {
-                    format!(
-                        "{}...",
-                        response_budget::truncate_on_char_boundary(content, 300)
-                    )
-                } else {
-                    content.clone()
-                };
-                output.push_str("```\n");
-                output.push_str(&snippet);
-                output.push_str("\n```\n\n");
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// Get neural engine statistics
-    pub async fn get_neural_stats(&self) -> Result<String> {
-        let neural = self
-            .neural_engine
-            .as_ref()
-            .ok_or_else(|| anyhow!("Neural search not available. Enable with --neural flag."))?;
-
-        let stats = neural.stats();
-
-        let mut output = String::new();
-        output.push_str("# Neural Embedding Statistics\n\n");
-        output.push_str(&format!("**Backend**: {}\n", stats.backend));
-        if let Some(model) = &stats.model {
-            output.push_str(&format!("**Model**: {}\n", model));
-        }
-        output.push_str(&format!("**Dimension**: {}\n", stats.dimension));
-        output.push_str(&format!("**Indexed Documents**: {}\n", stats.indexed_count));
-
-        Ok(output)
-    }
-
-    /// Check if neural search is available
-    pub fn is_neural_enabled(&self) -> bool {
-        self.neural_engine.is_some()
-    }
-
     // ========== Phase 8: Type Inference ==========
 
     /// Infer types for a Python/JavaScript function
@@ -12042,521 +11518,6 @@ impl CodeIntelEngine {
             vulnerabilities,
             taint_sources,
             taint_sinks,
-        })
-    }
-
-    // ========================================================================
-    // SPARQL Query Methods
-    // ========================================================================
-
-    /// Execute a SPARQL query against the knowledge graph.
-    ///
-    /// # Arguments
-    ///
-    /// * `query` - The SPARQL query to execute
-    /// * `timeout_ms` - Optional timeout in milliseconds (default: 30000)
-    /// * `limit` - Optional maximum number of results (default: 1000)
-    /// * `offset` - Optional offset for pagination (default: 0)
-    /// * `format` - Output format: json, markdown, or csv (default: json)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The graph feature is not enabled
-    /// - No knowledge graph is available
-    /// - The query is invalid
-    /// - The query times out
-    #[cfg(feature = "graph")]
-    pub async fn sparql_query(
-        &self,
-        query: &str,
-        timeout_ms: Option<u64>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-        format: Option<&str>,
-    ) -> Result<String> {
-        use crate::persistence::sparql::{OutputFormat, QueryOptions, SparqlEngine};
-        use std::str::FromStr;
-
-        let graph = self
-            .knowledge_graph
-            .as_ref()
-            .ok_or_else(|| anyhow!("Knowledge graph not enabled. Start with --graph flag."))?;
-
-        let output_format = format
-            .map(OutputFormat::from_str)
-            .transpose()?
-            .unwrap_or_default();
-
-        let options = QueryOptions::default()
-            .with_timeout_ms(timeout_ms.unwrap_or(30_000))
-            .with_limit(limit.unwrap_or(1000))
-            .with_offset(offset.unwrap_or(0))
-            .with_format(output_format);
-
-        let engine = SparqlEngine::new(graph);
-
-        // Determine query type and execute
-        let query_trimmed = query.trim().to_uppercase();
-        if query_trimmed.starts_with("ASK") {
-            let result = engine.query_ask(query, &options)?;
-            let output = format!(
-                "# SPARQL ASK Query Result\n\n**Result**: {}\n\n*Executed in {}ms*",
-                if result.result { "true" } else { "false" },
-                result.execution_time_ms
-            );
-            Ok(output)
-        } else {
-            let result = engine.query_select(query, &options)?;
-            SparqlEngine::format_result(&result, output_format)
-        }
-    }
-
-    /// List available SPARQL query templates.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the graph feature is not enabled.
-    #[cfg(feature = "graph")]
-    pub async fn list_sparql_templates(&self) -> Result<String> {
-        use crate::persistence::sparql::templates;
-
-        let all_templates = templates::all();
-
-        let mut output = String::new();
-        output.push_str("# SPARQL Query Templates\n\n");
-        output.push_str(&format!(
-            "**{} templates available**\n\n",
-            all_templates.len()
-        ));
-
-        for template in all_templates {
-            output.push_str(&format!("## `{}`\n\n", template.name));
-            output.push_str(&format!("{}\n\n", template.description));
-
-            if !template.parameters.is_empty() {
-                output.push_str("**Parameters:**\n");
-                for param in template.parameters {
-                    output.push_str(&format!("- `${}`\n", param));
-                }
-                output.push('\n');
-            } else {
-                output.push_str("*No parameters required*\n\n");
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// Execute a SPARQL query template with parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `template_name` - Name of the template to execute
-    /// * `params` - JSON object with parameter values
-    /// * `timeout_ms` - Optional timeout in milliseconds
-    /// * `limit` - Optional maximum number of results
-    /// * `format` - Output format: json, markdown, or csv
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The template is not found
-    /// - Required parameters are missing
-    /// - The query fails
-    #[cfg(feature = "graph")]
-    pub async fn run_sparql_template(
-        &self,
-        template_name: &str,
-        params: std::collections::HashMap<String, String>,
-        timeout_ms: Option<u64>,
-        limit: Option<usize>,
-        format: Option<&str>,
-    ) -> Result<String> {
-        use crate::persistence::sparql::{templates, OutputFormat, QueryOptions, SparqlEngine};
-        use std::str::FromStr;
-
-        let graph = self
-            .knowledge_graph
-            .as_ref()
-            .ok_or_else(|| anyhow!("Knowledge graph not enabled. Start with --graph flag."))?;
-
-        let template = templates::get(template_name)
-            .ok_or_else(|| anyhow!("Template not found: {}", template_name))?;
-
-        let output_format = format
-            .map(OutputFormat::from_str)
-            .transpose()?
-            .unwrap_or_default();
-
-        let options = QueryOptions::default()
-            .with_timeout_ms(timeout_ms.unwrap_or(30_000))
-            .with_limit(limit.unwrap_or(1000))
-            .with_format(output_format);
-
-        let engine = SparqlEngine::new(graph);
-        let result = engine.query_template(template, &params, &options)?;
-
-        let mut output = String::new();
-        output.push_str(&format!("# Template: `{}`\n\n", template_name));
-        output.push_str(&format!("{}\n\n", template.description));
-        output.push_str("---\n\n");
-        output.push_str(&SparqlEngine::format_result(&result, output_format)?);
-
-        Ok(output)
-    }
-
-    // ========================================================================
-    // Code Context Graph (CCG) Methods
-    // ========================================================================
-
-    /// Get CCG manifest (Layer 0) for a repository.
-    ///
-    /// Returns a JSON-LD manifest with repository identity, symbol counts,
-    /// security summary, and layer URIs.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - Repository name
-    /// * `include_security` - Whether to include security summary
-    /// * `base_url` - Base URL for layer URIs
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The repository is not found
-    /// - The graph feature is not enabled
-    #[cfg(feature = "graph")]
-    pub async fn get_ccg_manifest(
-        &self,
-        repo: &str,
-        include_security: bool,
-        base_url: Option<&str>,
-    ) -> Result<String> {
-        use crate::ccg::{CcgGenerator, CcgOptions, Layer};
-
-        let input = self.build_ccg_input(repo).await?;
-
-        let mut options = CcgOptions::default();
-        if !include_security {
-            options = options.without_security_summary();
-        }
-        if let Some(url) = base_url {
-            options = options.with_base_url(url);
-        }
-
-        let generator = CcgGenerator::new();
-        let output = generator.generate_layer(Layer::Manifest, &input, &options)?;
-
-        Ok(output.content)
-    }
-
-    /// Export CCG manifest (Layer 0) to a file.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - Repository name
-    /// * `include_security` - Whether to include security summary
-    /// * `base_url` - Base URL for layer URIs
-    /// * `output_path` - Optional output file path
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file writing fails.
-    #[cfg(feature = "graph")]
-    pub async fn export_ccg_manifest(
-        &self,
-        repo: &str,
-        include_security: bool,
-        base_url: Option<&str>,
-        output_path: Option<&str>,
-    ) -> Result<String> {
-        let content = self
-            .get_ccg_manifest(repo, include_security, base_url)
-            .await?;
-
-        if let Some(path) = output_path {
-            std::fs::write(path, &content)?;
-            Ok(format!(
-                "Manifest exported to: {}\nSize: {} bytes",
-                path,
-                content.len()
-            ))
-        } else {
-            Ok(content)
-        }
-    }
-
-    /// Export CCG architecture (Layer 1) for a repository.
-    #[cfg(feature = "graph")]
-    pub async fn export_ccg_architecture(
-        &self,
-        repo: &str,
-        output_path: Option<&str>,
-    ) -> Result<String> {
-        use crate::ccg::{CcgGenerator, CcgOptions, Layer};
-
-        let input = self.build_ccg_input(repo).await?;
-        let options = CcgOptions::default();
-
-        let generator = CcgGenerator::new();
-        let output = generator.generate_layer(Layer::Architecture, &input, &options)?;
-
-        if let Some(path) = output_path {
-            std::fs::write(path, &output.content)?;
-            Ok(format!(
-                "Architecture exported to: {}\nSize: {} bytes",
-                path, output.size_bytes
-            ))
-        } else {
-            Ok(output.content)
-        }
-    }
-
-    /// Export CCG symbol index (Layer 2) for a repository.
-    #[cfg(feature = "graph")]
-    pub async fn export_ccg_index(&self, repo: &str, output_path: Option<&str>) -> Result<String> {
-        use crate::ccg::{CcgGenerator, CcgOptions, Layer};
-
-        let input = self.build_ccg_input(repo).await?;
-        let options = CcgOptions::default();
-
-        let generator = CcgGenerator::new();
-        let output = generator.generate_layer(Layer::SymbolIndex, &input, &options)?;
-
-        if let Some(path) = output_path {
-            // Write base64-encoded gzipped content
-            std::fs::write(path, &output.content)?;
-            Ok(format!(
-                "Symbol index exported to: {}\nCompressed size: {} bytes\nSymbol count: {}",
-                path,
-                output.size_bytes,
-                output
-                    .metadata
-                    .get("symbol_count")
-                    .unwrap_or(&serde_json::json!(0))
-            ))
-        } else {
-            // Return metadata summary since content is binary
-            Ok(format!(
-                "# CCG Symbol Index (Layer 2)\n\nCompressed size: {} bytes\nSymbol count: {}\nCall edges: {}\n\n*Content is gzip-compressed and base64-encoded*",
-                output.size_bytes,
-                output.metadata.get("symbol_count").unwrap_or(&serde_json::json!(0)),
-                output.metadata.get("call_edge_count").unwrap_or(&serde_json::json!(0))
-            ))
-        }
-    }
-
-    /// Export CCG full detail (Layer 3) for a repository.
-    #[cfg(feature = "graph")]
-    pub async fn export_ccg_full(&self, repo: &str, output_path: Option<&str>) -> Result<String> {
-        use crate::ccg::{CcgGenerator, CcgOptions, Layer};
-
-        let input = self.build_ccg_input(repo).await?;
-        let options = CcgOptions::default();
-
-        let generator = CcgGenerator::new();
-        let output = generator.generate_layer(Layer::FullDetail, &input, &options)?;
-
-        if let Some(path) = output_path {
-            std::fs::write(path, &output.content)?;
-            Ok(format!(
-                "Full detail exported to: {}\nCompressed size: {} bytes",
-                path, output.size_bytes
-            ))
-        } else {
-            Ok(format!(
-                "# CCG Full Detail (Layer 3)\n\nCompressed size: {} bytes\nSymbol count: {}\nCall edges: {}\nImport edges: {}\nFindings: {}\n\n*Content is gzip-compressed and base64-encoded*",
-                output.size_bytes,
-                output.metadata.get("symbol_count").unwrap_or(&serde_json::json!(0)),
-                output.metadata.get("call_edge_count").unwrap_or(&serde_json::json!(0)),
-                output.metadata.get("import_edge_count").unwrap_or(&serde_json::json!(0)),
-                output.metadata.get("finding_count").unwrap_or(&serde_json::json!(0))
-            ))
-        }
-    }
-
-    /// Export all CCG layers bundled to a directory.
-    #[cfg(feature = "graph")]
-    pub async fn export_ccg(
-        &self,
-        repo: &str,
-        output_dir: Option<&str>,
-        base_url: Option<&str>,
-        include_security: bool,
-    ) -> Result<String> {
-        use crate::ccg::{CcgGenerator, CcgOptions};
-
-        let input = self.build_ccg_input(repo).await?;
-
-        let mut options = CcgOptions::default();
-        if !include_security {
-            options = options.without_security_summary();
-        }
-        if let Some(url) = base_url {
-            options = options.with_base_url(url);
-        }
-
-        let generator = CcgGenerator::new();
-        let bundle = generator.generate_bundle(&input, &options)?;
-
-        if let Some(dir) = output_dir {
-            std::fs::create_dir_all(dir)?;
-
-            // Write each layer
-            for (layer, output) in &bundle.layers {
-                let filename = match layer {
-                    crate::ccg::Layer::Manifest => "manifest.json",
-                    crate::ccg::Layer::Architecture => "architecture.json",
-                    crate::ccg::Layer::SymbolIndex => "symbol-index.nq.gz.b64",
-                    crate::ccg::Layer::FullDetail => "full-detail.nq.gz.b64",
-                };
-                let path = format!("{}/{}", dir, filename);
-                std::fs::write(&path, &output.content)?;
-            }
-
-            Ok(format!(
-                "# CCG Bundle Exported\n\nDirectory: {}\nTotal size: {} bytes\nLayers: {}\nL0+L1 within budget: {}",
-                dir,
-                bundle.total_size_bytes,
-                bundle.layers.len(),
-                bundle.manifest_layers_within_budget()
-            ))
-        } else {
-            Ok(format!(
-                "# CCG Bundle Summary\n\nRepository: {}\nTotal size: {} bytes\nLayers: {}\nL0+L1 within budget: {}\nGenerated at: {}",
-                bundle.repo,
-                bundle.total_size_bytes,
-                bundle.layers.len(),
-                bundle.manifest_layers_within_budget(),
-                bundle.generated_at
-            ))
-        }
-    }
-
-    /// Query CCG Layer 3 using SPARQL.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - Repository name (reserved for repo-specific CCG querying)
-    /// * `query` - SPARQL query string
-    /// * `timeout_ms` - Optional query timeout in milliseconds
-    /// * `limit` - Optional result limit
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the SPARQL query fails.
-    #[cfg(feature = "graph")]
-    pub async fn query_ccg(
-        &self,
-        _repo: &str,
-        query: &str,
-        timeout_ms: Option<u64>,
-        limit: Option<usize>,
-    ) -> Result<String> {
-        // For now, delegate to sparql_query since L3 is stored in the knowledge graph.
-        // The _repo parameter is reserved for repo-specific CCG querying in the future.
-        self.sparql_query(query, timeout_ms, limit, None, Some("markdown"))
-            .await
-    }
-
-    /// Build CCG input from repository data.
-    #[cfg(feature = "graph")]
-    async fn build_ccg_input(&self, repo: &str) -> Result<crate::ccg::CcgInput> {
-        use crate::ccg::{
-            CallEdgeInfo, CcgInput, FileInfo, ImportEdgeInfo, SecurityFindingInfo, SymbolInfo,
-        };
-
-        // Get repo metadata
-        let repo_meta = self
-            .repos
-            .get(repo)
-            .ok_or_else(|| anyhow!("Repository not found: {}", repo))?;
-
-        // Build file info from file cache, filtered by repo path
-        let repo_path = repo_meta.path.clone();
-        drop(repo_meta); // Release the borrow before iterating file_cache
-
-        let files: Vec<FileInfo> = self
-            .file_cache
-            .iter()
-            .filter(|entry| entry.key().starts_with(&repo_path))
-            .map(|entry| {
-                let path = entry.key();
-                let path_str = path.to_string_lossy().to_string();
-                let relative_path = path
-                    .strip_prefix(&repo_path)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path_str.clone());
-                let language = detect_language_from_path(&path_str);
-                let size_bytes = entry.value().len();
-                FileInfo {
-                    path: relative_path,
-                    language,
-                    size_bytes,
-                }
-            })
-            .collect();
-
-        // Build symbol info
-        let symbols: Vec<SymbolInfo> = self
-            .symbols
-            .get(repo)
-            .map(|s| {
-                s.iter()
-                    .map(|sym| SymbolInfo {
-                        name: sym.name.clone(),
-                        kind: format!("{:?}", sym.kind),
-                        file: sym.file_path.clone(),
-                        start_line: sym.start_line,
-                        end_line: sym.end_line,
-                        signature: sym.signature.clone(),
-                        doc_comment: sym.doc_comment.clone(),
-                        is_public: true, // Would need visibility analysis
-                        complexity: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Build call edges from call graph (if available)
-        let call_edges: Vec<CallEdgeInfo> = self
-            .call_graphs
-            .get(repo)
-            .map(|cg| {
-                cg.iter_nodes()
-                    .flat_map(|node| {
-                        let node = node.value();
-                        node.calls
-                            .iter()
-                            .map(|edge| CallEdgeInfo {
-                                caller: node.name.clone(),
-                                caller_file: node.file_path.clone(),
-                                callee: edge.target.clone(),
-                                callee_file: edge.file_path.clone(),
-                                line: edge.line,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Build import edges - for now empty, would need import graph
-        let import_edges: Vec<ImportEdgeInfo> = Vec::new();
-
-        // Get security findings
-        let security_findings: Vec<SecurityFindingInfo> = Vec::new();
-        // Would need to run security scan and cache results
-
-        Ok(CcgInput {
-            repo_name: repo.to_string(),
-            repo_url: None,
-            files,
-            symbols,
-            call_edges,
-            import_edges,
-            security_findings,
         })
     }
 }

@@ -45,12 +45,6 @@ tools:
       enabled: true
       description: "LSP integration"
 
-    # Remote repository support (3 tools, requires --remote)
-    Remote:
-      enabled: true
-      description: "Remote repository support"
-      required_flags: ["remote"]
-
     # Security vulnerability scanning (9 tools)
     Security:
       enabled: true
@@ -74,13 +68,6 @@ tools:
   # Individual tool overrides
   # Use this section to disable specific tools or override their settings
   overrides: {}
-    # Example: Disable neural search
-    # neural_search:
-    #   enabled: false
-    #   reason: "Too slow for interactive use"
-    #   performance_impact: "high"
-    #   requires_api_key: true
-    #
     # Example: Disable SBOM generation
     # generate_sbom:
     #   enabled: false

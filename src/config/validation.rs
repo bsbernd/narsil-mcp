@@ -59,7 +59,6 @@ fn validate_categories(config: &ToolConfig) -> Result<()> {
         "CallGraph",
         "Git",
         "LSP",
-        "Remote",
         "Security",
         "SupplyChain",
         "Analysis",

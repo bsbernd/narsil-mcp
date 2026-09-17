@@ -9,11 +9,11 @@ use std::collections::HashSet;
 
 #[test]
 fn test_tool_metadata_complete() {
-    // All 91 tools should have metadata
+    // All 72 tools should have metadata
     assert_eq!(
         TOOL_METADATA.len(),
-        91,
-        "Expected 91 tools to have metadata"
+        72,
+        "Expected 72 tools to have metadata"
     );
 
     // Each tool should have complete, valid metadata
@@ -65,7 +65,6 @@ fn test_tool_categories_complete() {
     assert!(categories.contains(&ToolCategory::CallGraph));
     assert!(categories.contains(&ToolCategory::Git));
     assert!(categories.contains(&ToolCategory::Lsp));
-    assert!(categories.contains(&ToolCategory::Remote));
     assert!(categories.contains(&ToolCategory::Security));
     assert!(categories.contains(&ToolCategory::SupplyChain));
     assert!(categories.contains(&ToolCategory::Analysis));
@@ -229,8 +228,8 @@ fn test_category_counts() {
 
     assert_eq!(
         count_by_category(ToolCategory::Repository),
-        10,
-        "Repository category should have 10 tools"
+        11,
+        "Repository category should have 11 tools"
     );
     assert_eq!(
         count_by_category(ToolCategory::Symbols),
@@ -239,8 +238,8 @@ fn test_category_counts() {
     );
     assert_eq!(
         count_by_category(ToolCategory::Search),
-        12,
-        "Search category should have 12 tools"
+        9,
+        "Search category should have 9 tools"
     );
     assert_eq!(
         count_by_category(ToolCategory::CallGraph),
@@ -258,11 +257,6 @@ fn test_category_counts() {
         "LSP category should have 3 tools"
     );
     assert_eq!(
-        count_by_category(ToolCategory::Remote),
-        3,
-        "Remote category should have 3 tools"
-    );
-    assert_eq!(
         count_by_category(ToolCategory::Security),
         10,
         "Security category should have 10 tools"
@@ -277,10 +271,9 @@ fn test_category_counts() {
         12,
         "Analysis category should have 12 tools"
     );
-    // Graph category has 15 tools (1 visualization + 3 SPARQL + 11 CCG)
     assert_eq!(
         count_by_category(ToolCategory::Graph),
-        15,
-        "Graph category should have 15 tools"
+        1,
+        "Graph category should have 1 tool"
     );
 }

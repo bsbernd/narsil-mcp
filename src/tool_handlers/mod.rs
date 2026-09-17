@@ -13,15 +13,12 @@ use crate::index::{CodeIntelEngine, IndexBusy};
 
 mod analysis;
 mod callgraph;
-mod ccg;
 mod git;
 pub mod graph;
 mod lsp;
-mod remote;
 mod repo;
 mod search;
 mod security;
-mod sparql;
 mod supply_chain;
 mod symbols;
 
@@ -85,13 +82,10 @@ impl ToolRegistry {
         registry.register(Box::new(search::SearchCodeHandler));
         registry.register(Box::new(search::SemanticSearchHandler));
         registry.register(Box::new(search::HybridSearchHandler));
-        registry.register(Box::new(search::NeuralSearchHandler));
         registry.register(Box::new(search::SearchChunksHandler));
         registry.register(Box::new(search::FindSimilarCodeHandler));
         registry.register(Box::new(search::FindSimilarToSymbolHandler));
-        registry.register(Box::new(search::FindSemanticClonesHandler));
         registry.register(Box::new(search::GetEmbeddingStatsHandler));
-        registry.register(Box::new(search::GetNeuralStatsHandler));
         registry.register(Box::new(search::GetChunkStatsHandler));
         registry.register(Box::new(search::GetChunksHandler));
 
@@ -118,11 +112,6 @@ impl ToolRegistry {
         registry.register(Box::new(lsp::GetHoverInfoHandler));
         registry.register(Box::new(lsp::GetTypeInfoHandler));
         registry.register(Box::new(lsp::GoToDefinitionHandler));
-
-        // Register remote handlers
-        registry.register(Box::new(remote::AddRemoteRepoHandler));
-        registry.register(Box::new(remote::ListRemoteFilesHandler));
-        registry.register(Box::new(remote::GetRemoteFileHandler));
 
         // Register security handlers
         registry.register(Box::new(security::ScanSecurityHandler));
@@ -158,24 +147,6 @@ impl ToolRegistry {
 
         // Register graph visualization handler
         registry.register(Box::new(graph::GetCodeGraphHandler));
-
-        // Register SPARQL handlers
-        registry.register(Box::new(sparql::SparqlQueryHandler));
-        registry.register(Box::new(sparql::ListSparqlTemplatesHandler));
-        registry.register(Box::new(sparql::RunSparqlTemplateHandler));
-
-        // Register CCG handlers
-        registry.register(Box::new(ccg::GetCcgManifestHandler));
-        registry.register(Box::new(ccg::ExportCcgManifestHandler));
-        registry.register(Box::new(ccg::ExportCcgArchitectureHandler));
-        registry.register(Box::new(ccg::ExportCcgIndexHandler));
-        registry.register(Box::new(ccg::ExportCcgFullHandler));
-        registry.register(Box::new(ccg::ExportCcgHandler));
-        registry.register(Box::new(ccg::QueryCcgHandler));
-        registry.register(Box::new(ccg::GetCcgAclHandler));
-        registry.register(Box::new(ccg::GetCcgAccessInfoHandler));
-        registry.register(Box::new(ccg::ImportCcgHandler));
-        registry.register(Box::new(ccg::ImportCcgFromRegistryHandler));
 
         registry
     }
@@ -230,15 +201,13 @@ impl Default for ToolRegistry {
 }
 
 /// Whether a tool answers from the in-memory index. Base tools address repos
-/// and repair the index, git tools answer from git itself, remote tools from
-/// GitHub; everything else — including the ungrouped ccg/sparql/neural tools —
+/// and repair the index, git tools answer from git itself; everything else
 /// reads the index and must not answer from one being rebuilt.
 fn reads_index(tool: &str) -> bool {
-    const REMOTE_TOOLS: [&str; 3] = ["add_remote_repo", "list_remote_files", "get_remote_file"];
     !matches!(
         ExposeGroup::of(tool),
         Some(ExposeGroup::Base) | Some(ExposeGroup::Git)
-    ) && !REMOTE_TOOLS.contains(&tool)
+    )
 }
 
 /// Read leases to hold for the duration of an index-backed tool call. Empty for
@@ -538,12 +507,9 @@ mod tests {
         assert!(reads_index("find_symbols"));
         assert!(reads_index("get_callers"));
         assert!(reads_index("scan_security"));
-        // Ungrouped tools default to index-backed.
-        assert!(reads_index("query_ccg"));
         assert!(!reads_index("get_index_status"));
         assert!(!reads_index("reindex"));
         assert!(!reads_index("get_blame"));
-        assert!(!reads_index("get_remote_file"));
     }
 
     #[test]
