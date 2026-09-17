@@ -36,9 +36,6 @@ tools:
     LSP:
       enabled: true
       description: "LSP integration (enhanced with --lsp)"
-    Security:
-      enabled: true
-      description: "Security vulnerability scanning"
     Analysis:
       enabled: true
       description: "Code analysis tools"

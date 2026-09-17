@@ -45,11 +45,6 @@ tools:
       enabled: true
       description: "LSP integration"
 
-    # Security vulnerability scanning (9 tools)
-    Security:
-      enabled: true
-      description: "Security vulnerability scanning"
-
     # Code analysis tools (11 tools)
     Analysis:
       enabled: true
@@ -64,7 +59,7 @@ tools:
   # Use this section to disable specific tools or override their settings
   overrides: {}
     # Example: Disable a tool
-    # scan_security:
+    # get_complexity:
     #   enabled: false
     #   reason: "Not needed for this project"
 

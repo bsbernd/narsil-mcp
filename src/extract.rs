@@ -353,6 +353,97 @@ pub(crate) fn is_double_encoded(text: &str) -> bool {
     text.chars().any(|ch| ('\u{c0}'..='\u{ff}').contains(&ch))
 }
 
+/// Check if a file path appears to be a test file.
+///
+/// Used by the `exclude_tests` search and symbol options.
+///
+/// # Examples
+/// ```
+/// use narsil_mcp::extract::is_test_file;
+/// assert!(is_test_file("tests/integration_tests.rs"));
+/// assert!(is_test_file("src/foo_test.rs"));
+/// assert!(!is_test_file("src/main.rs"));
+/// ```
+pub fn is_test_file(path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+
+    // Directory patterns that indicate test code
+    if path_lower.contains("/tests/")
+        || path_lower.contains("/test/")
+        || path_lower.contains("/__tests__/")
+        || path_lower.contains("/fixtures/")
+        || path_lower.contains("/testdata/")
+        || path_lower.contains("/test_data/")
+        || path_lower.contains("/mocks/")
+        || path_lower.contains("/__mocks__/")
+        || path_lower.contains("/spec/")
+        // Also catch test-fixtures at start of path or after a slash
+        || path_lower.starts_with("test-fixtures/")
+        || path_lower.contains("/test-fixtures/")
+        // Security test sample directories
+        || path_lower.contains("/security/vulnerable")
+        || path_lower.contains("/vulnerable/")
+    {
+        return true;
+    }
+
+    // File name patterns
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Rust test files
+    if file_name.ends_with("_test.rs") || file_name.ends_with("_tests.rs") {
+        return true;
+    }
+
+    // JavaScript/TypeScript test files
+    if file_name.ends_with(".test.js")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.jsx")
+        || file_name.ends_with(".test.tsx")
+        || file_name.ends_with(".spec.js")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.jsx")
+        || file_name.ends_with(".spec.tsx")
+    {
+        return true;
+    }
+
+    // Python test files
+    if file_name.starts_with("test_") || file_name.ends_with("_test.py") {
+        return true;
+    }
+
+    // Go test files
+    if file_name.ends_with("_test.go") {
+        return true;
+    }
+
+    // Java test files
+    if file_name.ends_with("test.java") && file_name != "test.java" {
+        return true;
+    }
+
+    // Files explicitly named as vulnerable samples
+    if file_name.starts_with("vulnerable.") || file_name.starts_with("insecure.") {
+        return true;
+    }
+
+    false
+}
+
+pub(crate) fn is_comment_only_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//")
+        || trimmed.starts_with("///")
+        || trimmed.starts_with("//!")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+}
+
 /// Calculate relevance score based on match density
 fn calculate_relevance(matches: &[usize], start: usize, end: usize) -> f32 {
     let range_size = (end - start).max(1) as f32;
@@ -496,5 +587,91 @@ fn main() {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].0, 0);
         assert_eq!(merged[0].1, 10);
+    }
+
+    #[test]
+    fn test_is_test_file_directories() {
+        // Test directory patterns (must have slash before directory name)
+        assert!(is_test_file("project/tests/integration_tests.rs"));
+        assert!(is_test_file("src/test/java/MyTest.java"));
+        assert!(is_test_file("src/__tests__/Component.test.js"));
+        assert!(is_test_file("project/fixtures/sample_data.py"));
+        assert!(is_test_file("project/testdata/input.json"));
+        assert!(is_test_file("project/test_data/expected.txt"));
+        assert!(is_test_file("src/mocks/api.js"));
+        assert!(is_test_file("src/__mocks__/fs.js"));
+        assert!(is_test_file("project/spec/helpers/test_helper.rb"));
+    }
+
+    #[test]
+    fn test_is_test_file_rust() {
+        assert!(is_test_file("src/foo_test.rs"));
+        assert!(is_test_file("src/integration_tests.rs"));
+        assert!(!is_test_file("src/main.rs"));
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(!is_test_file("src/testing.rs")); // Contains "test" but not a test file
+    }
+
+    #[test]
+    fn test_is_test_file_javascript() {
+        assert!(is_test_file("component.test.js"));
+        assert!(is_test_file("utils.test.ts"));
+        assert!(is_test_file("component.spec.js"));
+        assert!(is_test_file("utils.spec.ts"));
+        assert!(is_test_file("App.test.tsx"));
+        assert!(is_test_file("App.spec.jsx"));
+        assert!(!is_test_file("src/index.js"));
+        assert!(!is_test_file("src/contest.js")); // Contains "test" substring
+    }
+
+    #[test]
+    fn test_is_test_file_python() {
+        assert!(is_test_file("test_utils.py"));
+        assert!(is_test_file("test_api.py"));
+        assert!(is_test_file("utils_test.py"));
+        assert!(!is_test_file("src/main.py"));
+        assert!(!is_test_file("contest.py")); // Starts with "con", ends with "test"
+    }
+
+    #[test]
+    fn test_is_test_file_go() {
+        assert!(is_test_file("main_test.go"));
+        assert!(is_test_file("utils_test.go"));
+        assert!(!is_test_file("main.go"));
+    }
+
+    #[test]
+    fn test_is_test_file_java() {
+        assert!(is_test_file("UserServiceTest.java"));
+        assert!(is_test_file("ApiTest.java"));
+        assert!(!is_test_file("Test.java")); // Just "Test.java" is often a valid class
+        assert!(!is_test_file("Main.java"));
+    }
+
+    #[test]
+    fn test_is_test_file_negative_cases() {
+        // Should NOT match these
+        assert!(!is_test_file("src/main.rs"));
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(!is_test_file("src/testing_utils.rs")); // Contains "testing" but not test file pattern
+        assert!(!is_test_file("app/contest.js")); // Contains "test" substring
+        assert!(!is_test_file("src/latest_results.py")); // Contains "test" substring
+    }
+
+    #[test]
+    fn test_is_test_file_test_fixtures() {
+        // Test new test-fixtures patterns
+        assert!(is_test_file("test-fixtures/security/vulnerable.php"));
+        assert!(is_test_file("test-fixtures/sample.rs"));
+        assert!(is_test_file("/path/to/test-fixtures/vulnerable.go"));
+        assert!(is_test_file("project/test-fixtures/data.json"));
+        // Security test sample directories
+        assert!(is_test_file("src/security/vulnerable.ts"));
+        assert!(is_test_file("project/vulnerable/sample.py"));
+        // Files named vulnerable.*
+        assert!(is_test_file("vulnerable.php"));
+        assert!(is_test_file("src/vulnerable.java"));
+        assert!(is_test_file("insecure.go"));
+        assert!(is_test_file("path/to/insecure.rb"));
     }
 }

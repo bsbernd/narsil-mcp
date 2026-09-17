@@ -100,7 +100,7 @@ fn test_filter_by_feature_flags_all_enabled() {
     let enabled = filter.get_enabled_tools();
 
     // Should include tools from all categories
-    assert!(enabled.len() >= 50, "Most tools should be enabled");
+    assert!(enabled.len() >= 35, "Most tools should be enabled");
     assert!(enabled.contains(&"get_blame"));
     assert!(enabled.contains(&"get_call_graph"));
 }
@@ -388,7 +388,7 @@ fn test_empty_config_with_all_flags_enabled() {
 
     // Should get most tools; some still depend on compile-time or runtime flags.
     assert!(
-        enabled.len() >= 50,
+        enabled.len() >= 35,
         "Should have most tools enabled with all flags"
     );
 }
@@ -427,14 +427,13 @@ fn test_security_focused_preset() {
 
     // Should have ~32 tools as defined in preset.rs
     assert!(
-        enabled.len() >= 18 && enabled.len() <= 25,
-        "Security-focused preset should have 18-25 tools, got {}",
+        enabled.len() >= 10 && enabled.len() <= 16,
+        "Security-focused preset should have 10-16 tools, got {}",
         enabled.len()
     );
 
-    // Should include security tools
-    assert!(enabled.contains(&"scan_security"));
-    assert!(enabled.contains(&"check_owasp_top10"));
+    // Should include analysis tools
+    assert!(enabled.contains(&"get_control_flow"));
 }
 
 /// All feature flags on, so nothing below is filtered out by a missing flag.
@@ -462,7 +461,6 @@ fn test_expose_narrows_to_selected_groups() {
     assert!(enabled.contains(&"get_blame"), "git group");
     assert!(enabled.contains(&"list_repos"), "base is always folded in");
 
-    assert!(!enabled.contains(&"scan_security"), "security not selected");
     assert!(
         !enabled.contains(&"get_complexity"),
         "analysis not selected"
@@ -515,7 +513,7 @@ fn test_config_expose_applies_without_the_flag() {
 
     assert!(enabled.contains(&"find_symbols"));
     assert!(enabled.contains(&"get_blame"));
-    assert!(!enabled.contains(&"scan_security"));
+    assert!(!enabled.contains(&"get_complexity"));
 }
 
 #[test]
@@ -526,10 +524,10 @@ fn test_cli_expose_overrides_config_expose() {
     };
 
     let enabled = ToolFilter::new(config, &all_features_enabled(), None)
-        .with_expose(&[ExposeGroup::Security])
+        .with_expose(&[ExposeGroup::Analysis])
         .get_enabled_tools();
 
-    assert!(enabled.contains(&"scan_security"), "CLI groups win");
+    assert!(enabled.contains(&"get_complexity"), "CLI groups win");
     assert!(
         !enabled.contains(&"get_blame"),
         "config groups are replaced"

@@ -50,9 +50,6 @@ pub struct GraphNode {
     pub metrics: Option<NodeMetrics>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub security: Option<NodeSecurity>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
 }
 
@@ -64,16 +61,6 @@ pub struct NodeMetrics {
     pub cognitive: usize,
     pub call_count: usize,
     pub caller_count: usize,
-}
-
-/// Security information for a node
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeSecurity {
-    pub has_vulnerabilities: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub severity: Option<String>,
-    pub taint_source: bool,
-    pub taint_sink: bool,
 }
 
 /// An edge in the visualization graph
@@ -173,7 +160,6 @@ impl ToolHandler for GetCodeGraphHandler {
         let depth = args.get_u64_or("depth", 3) as usize;
         let direction = args.get_str("direction").unwrap_or("both");
         let include_metrics = args.get_bool_or("include_metrics", true);
-        let include_security = args.get_bool_or("include_security", false);
         let include_excerpts = args.get_bool_or("include_excerpts", false);
         let cluster_by = args.get_str("cluster_by").unwrap_or("none");
 
@@ -212,12 +198,7 @@ impl ToolHandler for GetCodeGraphHandler {
             ViewType::Flow => self.build_flow_graph(engine, &options).await?,
         };
 
-        // Optionally overlay security information
-        let mut graph = if include_security {
-            self.add_security_overlay(engine, repo, graph).await?
-        } else {
-            graph
-        };
+        let mut graph = graph;
 
         // Truncate if exceeding max_nodes
         let total_nodes = graph.nodes.len();
@@ -331,7 +312,6 @@ impl GetCodeGraphHandler {
                     } else {
                         None
                     },
-                    security: None,
                     excerpt: if options.include_excerpts {
                         engine
                             .get_excerpt_for_viz(options.repo, &node.file_path, node.line, 5)
@@ -445,7 +425,6 @@ impl GetCodeGraphHandler {
                     file_path: file_str.clone(),
                     line: 1,
                     metrics: None,
-                    security: None,
                     excerpt: None,
                 });
             }
@@ -479,7 +458,6 @@ impl GetCodeGraphHandler {
                         file_path: import.clone(),
                         line: 1,
                         metrics: None,
-                        security: None,
                         excerpt: None,
                     });
                 }
@@ -537,7 +515,6 @@ impl GetCodeGraphHandler {
             file_path: symbol_data.definition.file_path.clone(),
             line: symbol_data.definition.line,
             metrics: None,
-            security: None,
             excerpt: None,
         });
 
@@ -551,7 +528,6 @@ impl GetCodeGraphHandler {
                 file_path: reference.file_path.clone(),
                 line: reference.line,
                 metrics: None,
-                security: None,
                 excerpt: None,
             });
 
@@ -683,7 +659,6 @@ impl GetCodeGraphHandler {
                 file_path: cfg_data.file_path.clone(),
                 line: block.start_line,
                 metrics: None,
-                security: None,
                 excerpt: Some(block.code.clone()),
             });
         }
@@ -716,95 +691,6 @@ impl GetCodeGraphHandler {
             clusters: None,
         })
     }
-
-    // ========================================================================
-    // Security Overlay
-    // ========================================================================
-
-    async fn add_security_overlay(
-        &self,
-        engine: &CodeIntelEngine,
-        repo: &str,
-        mut graph: CodeGraph,
-    ) -> Result<CodeGraph> {
-        // Extract unique file paths from graph nodes - only scan files that are in the graph
-        let file_paths: Vec<String> = graph
-            .nodes
-            .iter()
-            .map(|n| n.file_path.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Get security summary from engine - only for files in the graph
-        if let Ok(security_data) = engine.get_security_for_viz(repo, &file_paths).await {
-            // Build a map with multiple key variants for each vulnerability
-            // This handles absolute vs relative path mismatches
-            let mut vuln_map: HashMap<String, (bool, Option<String>)> = HashMap::new();
-            for vuln in &security_data.vulnerabilities {
-                // Generate multiple keys for the same vulnerability
-                for key in normalize_path_key(&vuln.file_path, vuln.line) {
-                    vuln_map.insert(key, (true, Some(vuln.severity.clone())));
-                }
-                // Also map by function name if available
-                if let Some(func) = &vuln.function {
-                    vuln_map.insert(func.clone(), (true, Some(vuln.severity.clone())));
-                }
-            }
-
-            // Build taint source/sink sets with normalized keys
-            let mut taint_sources: HashSet<String> = HashSet::new();
-            for source in &security_data.taint_sources {
-                taint_sources.insert(source.clone());
-                // Add filename-only variant
-                if let Some(colon_idx) = source.rfind(':') {
-                    let path = &source[..colon_idx];
-                    let line = &source[colon_idx + 1..];
-                    if let Some(fname) = std::path::Path::new(path).file_name() {
-                        taint_sources.insert(format!("{}:{}", fname.to_string_lossy(), line));
-                    }
-                }
-            }
-            let mut taint_sinks: HashSet<String> = HashSet::new();
-            for sink in &security_data.taint_sinks {
-                taint_sinks.insert(sink.clone());
-                // Add filename-only variant
-                if let Some(colon_idx) = sink.rfind(':') {
-                    let path = &sink[..colon_idx];
-                    let line = &sink[colon_idx + 1..];
-                    if let Some(fname) = std::path::Path::new(path).file_name() {
-                        taint_sinks.insert(format!("{}:{}", fname.to_string_lossy(), line));
-                    }
-                }
-            }
-
-            // Update nodes with security info
-            for node in &mut graph.nodes {
-                // Try multiple key variants for matching
-                let node_keys = normalize_path_key(&node.file_path, node.line);
-                let has_vuln = node_keys
-                    .iter()
-                    .find_map(|key| vuln_map.get(key))
-                    .or_else(|| vuln_map.get(&node.id));
-
-                let is_taint_source = node_keys.iter().any(|key| taint_sources.contains(key))
-                    || taint_sources.contains(&node.id);
-                let is_taint_sink = node_keys.iter().any(|key| taint_sinks.contains(key))
-                    || taint_sinks.contains(&node.id);
-
-                if has_vuln.is_some() || is_taint_source || is_taint_sink {
-                    node.security = Some(NodeSecurity {
-                        has_vulnerabilities: has_vuln.map(|v| v.0).unwrap_or(false),
-                        severity: has_vuln.and_then(|v| v.1.clone()),
-                        taint_source: is_taint_source,
-                        taint_sink: is_taint_sink,
-                    });
-                }
-            }
-        }
-
-        Ok(graph)
-    }
 }
 
 // ============================================================================
@@ -826,37 +712,6 @@ fn file_name(path: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string())
-}
-
-/// Normalize a file path for comparison - extract just the filename:line for matching
-fn normalize_path_key(path: &str, line: usize) -> Vec<String> {
-    let mut keys = Vec::new();
-
-    // Full path key
-    keys.push(format!("{}:{}", path, line));
-
-    // Filename only key (for cross-path matching)
-    if let Some(fname) = std::path::Path::new(path).file_name() {
-        keys.push(format!("{}:{}", fname.to_string_lossy(), line));
-    }
-
-    // Try to extract relative path by finding common patterns like src/, lib/, etc.
-    for prefix in &[
-        "src/",
-        "lib/",
-        "test/",
-        "tests/",
-        "pkg/",
-        "cmd/",
-        "internal/",
-        "app/",
-    ] {
-        if let Some(idx) = path.find(prefix) {
-            keys.push(format!("{}:{}", &path[idx..], line));
-        }
-    }
-
-    keys
 }
 
 /// Convert CallType to string
@@ -992,23 +847,6 @@ pub struct CfgData {
     pub edges: Vec<CfgEdge>,
 }
 
-/// Security data for visualization
-#[derive(Debug, Clone)]
-pub struct SecurityVizData {
-    pub vulnerabilities: Vec<VulnInfo>,
-    pub taint_sources: Vec<String>,
-    pub taint_sinks: Vec<String>,
-}
-
-/// Vulnerability info
-#[derive(Debug, Clone)]
-pub struct VulnInfo {
-    pub file_path: String,
-    pub line: usize,
-    pub severity: String,
-    pub function: Option<String>,
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1069,7 +907,6 @@ mod tests {
                     call_count: 0,
                     caller_count: 0,
                 }),
-                security: None,
                 excerpt: None,
             }],
             edges: vec![],
@@ -1092,7 +929,6 @@ mod tests {
                 file_path: "src/lib.rs".to_string(),
                 line: 10,
                 metrics: None,
-                security: None,
                 excerpt: None,
             },
             GraphNode {
@@ -1102,7 +938,6 @@ mod tests {
                 file_path: "src/lib.rs".to_string(),
                 line: 20,
                 metrics: None,
-                security: None,
                 excerpt: None,
             },
             GraphNode {
@@ -1112,7 +947,6 @@ mod tests {
                 file_path: "src/main.rs".to_string(),
                 line: 1,
                 metrics: None,
-                security: None,
                 excerpt: None,
             },
         ];
@@ -1125,29 +959,5 @@ mod tests {
         assert_eq!(lib_cluster.nodes.len(), 2);
         assert!(lib_cluster.nodes.contains(&"func1".to_string()));
         assert!(lib_cluster.nodes.contains(&"func2".to_string()));
-    }
-
-    #[test]
-    fn test_security_node_serialization() {
-        let node = GraphNode {
-            id: "vulnerable_func".to_string(),
-            label: "vulnerable_func".to_string(),
-            kind: "function".to_string(),
-            file_path: "src/unsafe.rs".to_string(),
-            line: 42,
-            metrics: None,
-            security: Some(NodeSecurity {
-                has_vulnerabilities: true,
-                severity: Some("high".to_string()),
-                taint_source: false,
-                taint_sink: true,
-            }),
-            excerpt: None,
-        };
-
-        let json = serde_json::to_string(&node).unwrap();
-        assert!(json.contains("\"has_vulnerabilities\":true"));
-        assert!(json.contains("\"severity\":\"high\""));
-        assert!(json.contains("\"taint_sink\":true"));
     }
 }

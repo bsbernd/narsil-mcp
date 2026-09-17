@@ -9,11 +9,11 @@ use std::collections::HashSet;
 
 #[test]
 fn test_tool_metadata_complete() {
-    // All 52 tools should have metadata
+    // All 42 tools should have metadata
     assert_eq!(
         TOOL_METADATA.len(),
-        52,
-        "Expected 52 tools to have metadata"
+        42,
+        "Expected 42 tools to have metadata"
     );
 
     // Each tool should have complete, valid metadata
@@ -65,7 +65,6 @@ fn test_tool_categories_complete() {
     assert!(categories.contains(&ToolCategory::CallGraph));
     assert!(categories.contains(&ToolCategory::Git));
     assert!(categories.contains(&ToolCategory::Lsp));
-    assert!(categories.contains(&ToolCategory::Security));
     assert!(categories.contains(&ToolCategory::Analysis));
 }
 
@@ -163,7 +162,7 @@ fn test_stability_levels() {
 
     // Most tools should be stable
     assert!(
-        stable_count >= 45,
+        stable_count >= 35,
         "Most tools should be stable, got {}",
         stable_count
     );
@@ -254,11 +253,6 @@ fn test_category_counts() {
         count_by_category(ToolCategory::Lsp),
         3,
         "LSP category should have 3 tools"
-    );
-    assert_eq!(
-        count_by_category(ToolCategory::Security),
-        10,
-        "Security category should have 10 tools"
     );
     assert_eq!(
         count_by_category(ToolCategory::Analysis),

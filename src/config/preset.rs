@@ -66,13 +66,7 @@ impl Preset {
     /// by category or feature flags.
     pub fn get_disabled_tools(&self) -> HashSet<&'static str> {
         match self {
-            Preset::Minimal => {
-                // Disable slow/advanced tools
-                ["scan_security", "check_owasp_top10", "check_cwe_top25"]
-                    .iter()
-                    .copied()
-                    .collect()
-            }
+            Preset::Minimal => HashSet::new(),
             Preset::Balanced => HashSet::new(),
             Preset::Full => HashSet::new(), // Nothing disabled
             Preset::SecurityFocused => ["get_call_graph"].iter().copied().collect(),
@@ -141,9 +135,6 @@ impl Preset {
             "get_function_hotspots",
         ]);
 
-        // Add security essentials
-        tools.extend(["scan_security", "find_injection_vulnerabilities"]);
-
         // Add code analysis basics
         tools.extend(["get_control_flow", "get_data_flow"]);
 
@@ -172,16 +163,6 @@ impl Preset {
             "find_references",
             // Search
             "search_code",
-            // Security tools (9)
-            "scan_security",
-            "check_owasp_top10",
-            "check_cwe_top25",
-            "find_injection_vulnerabilities",
-            "trace_taint",
-            "get_taint_sources",
-            "get_security_summary",
-            "explain_vulnerability",
-            "suggest_fix",
             // Code analysis (useful for security)
             "get_control_flow",
             "get_data_flow",
@@ -219,18 +200,15 @@ pub enum ExposeGroup {
     /// flow. Off by default — a model holding the source can work these out,
     /// so the schemas cost context to restate what is already in front of it.
     Analysis,
-    /// Vulnerability scanning and taint tracking.
-    Security,
 }
 
 impl ExposeGroup {
     /// Every group, in the order they are printed in `--help` and the docs.
-    pub const ALL: [ExposeGroup; 5] = [
+    pub const ALL: [ExposeGroup; 4] = [
         ExposeGroup::Base,
         ExposeGroup::Code,
         ExposeGroup::Git,
         ExposeGroup::Analysis,
-        ExposeGroup::Security,
     ];
 
     /// The CLI spelling of this group.
@@ -240,7 +218,6 @@ impl ExposeGroup {
             ExposeGroup::Code => "code",
             ExposeGroup::Git => "git",
             ExposeGroup::Analysis => "analysis",
-            ExposeGroup::Security => "security",
         }
     }
 
@@ -260,7 +237,6 @@ impl ExposeGroup {
             ExposeGroup::Code => Self::code_tools(),
             ExposeGroup::Git => Self::git_tools(),
             ExposeGroup::Analysis => Self::analysis_tools(),
-            ExposeGroup::Security => Self::security_tools(),
         }
     }
 
@@ -372,24 +348,6 @@ impl ExposeGroup {
         .copied()
         .collect()
     }
-
-    fn security_tools() -> HashSet<&'static str> {
-        [
-            "scan_security",
-            "security_audit",
-            "get_security_summary",
-            "check_owasp_top10",
-            "check_cwe_top25",
-            "find_injection_vulnerabilities",
-            "trace_taint",
-            "get_taint_sources",
-            "explain_vulnerability",
-            "suggest_fix",
-        ]
-        .iter()
-        .copied()
-        .collect()
-    }
 }
 
 #[cfg(test)]
@@ -410,8 +368,8 @@ mod tests {
     fn test_balanced_preset_size() {
         let tools = Preset::Balanced.get_enabled_tools();
         assert!(
-            tools.len() >= 40 && tools.len() <= 60,
-            "Balanced preset should have 40-60 tools, got {}",
+            tools.len() >= 30 && tools.len() <= 45,
+            "Balanced preset should have 30-45 tools, got {}",
             tools.len()
         );
     }
@@ -422,12 +380,6 @@ mod tests {
         assert!(tools.contains(&"list_repos"));
         assert!(tools.contains(&"find_symbols"));
         assert!(tools.contains(&"search_code"));
-    }
-
-    #[test]
-    fn test_minimal_excludes_advanced() {
-        let disabled = Preset::Minimal.get_disabled_tools();
-        assert!(disabled.contains(&"scan_security"));
     }
 
     #[test]
@@ -448,13 +400,6 @@ mod tests {
     fn test_full_no_disabled() {
         let disabled = Preset::Full.get_disabled_tools();
         assert!(disabled.is_empty());
-    }
-
-    #[test]
-    fn test_security_includes_security_tools() {
-        let tools = Preset::SecurityFocused.get_enabled_tools();
-        assert!(tools.contains(&"scan_security"));
-        assert!(tools.contains(&"check_owasp_top10"));
     }
 
     #[test]

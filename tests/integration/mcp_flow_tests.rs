@@ -73,9 +73,6 @@ fn test_full_mcp_flow_zed() {
 
     // Git tools excluded (not in minimal)
     assert!(!enabled_tools.contains(&"get_blame"));
-
-    // Security tools excluded
-    assert!(!enabled_tools.contains(&"scan_security"));
 }
 
 /// Test that the full MCP flow works correctly with Claude Desktop
@@ -94,7 +91,7 @@ fn test_full_mcp_flow_claude_desktop() {
 
     // Claude Desktop should get full preset (50-60 tools without feature flags)
     assert!(
-        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
+        enabled_tools.len() >= 22 && enabled_tools.len() <= 30,
         "Claude Desktop should get 50-60 tools in full preset (without flags), got {}",
         enabled_tools.len()
     );
@@ -104,7 +101,6 @@ fn test_full_mcp_flow_claude_desktop() {
     assert!(enabled_tools.contains(&"find_symbols"));
     assert!(enabled_tools.contains(&"search_code"));
     assert!(enabled_tools.contains(&"semantic_search"));
-    assert!(enabled_tools.contains(&"scan_security"));
 }
 
 /// Test that feature flags still work with presets
@@ -171,7 +167,7 @@ fn test_mcp_flow_no_client_info() {
 
     // Should default to full preset (50-60 tools without flags)
     assert!(
-        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
+        enabled_tools.len() >= 22 && enabled_tools.len() <= 30,
         "No client info should default to full preset, got {}",
         enabled_tools.len()
     );
@@ -187,8 +183,8 @@ fn test_all_tools_have_metadata() {
 
     // Verify we have a reasonable number of tools
     assert!(
-        TOOL_METADATA.len() >= 50,
-        "Should have at least 50 tools in metadata"
+        TOOL_METADATA.len() >= 40,
+        "Should have at least 40 tools in metadata"
     );
 }
 
@@ -205,7 +201,7 @@ fn test_full_preset_bypasses_performance_budget() {
     };
 
     let mut config = ToolConfig::default();
-    config.performance.max_tool_count = 30; // would otherwise truncate
+    config.performance.max_tool_count = 20; // would otherwise truncate
 
     let options = EngineOptions::default();
     let filter = ToolFilter::new(config, &options, Some(client_info));
@@ -213,7 +209,7 @@ fn test_full_preset_bypasses_performance_budget() {
 
     // Full preset must surface more than the cap would allow.
     assert!(
-        enabled_tools.len() > 30,
+        enabled_tools.len() > 20,
         "Full preset should bypass max_tool_count, got {} tools",
         enabled_tools.len()
     );
@@ -351,7 +347,7 @@ fn test_cli_preset_overrides_editor_detection() {
 
     // Should get full preset (50-60 tools), NOT minimal preset (20-30)
     assert!(
-        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
+        enabled_tools.len() >= 22 && enabled_tools.len() <= 30,
         "CLI preset=full should override Zed's default minimal preset, got {} tools",
         enabled_tools.len()
     );
@@ -398,8 +394,8 @@ fn test_cli_preset_all_values() {
     let filter = ToolFilter::new(config, &options, None);
     let full_tools = filter.get_enabled_tools();
     assert!(
-        full_tools.len() >= 35 && full_tools.len() <= 45,
-        "full preset should have 35-45 tools, got {}",
+        full_tools.len() >= 22 && full_tools.len() <= 30,
+        "full preset should have 22-30 tools, got {}",
         full_tools.len()
     );
 
@@ -411,8 +407,8 @@ fn test_cli_preset_all_values() {
     let filter = ToolFilter::new(config, &options, None);
     let security_tools = filter.get_enabled_tools();
     assert!(
-        security_tools.len() >= 18 && security_tools.len() <= 25,
-        "security-focused preset should have 18-25 tools, got {}",
+        security_tools.len() >= 10 && security_tools.len() <= 16,
+        "security-focused preset should have 10-16 tools, got {}",
         security_tools.len()
     );
 }
@@ -433,7 +429,7 @@ fn test_cli_preset_invalid_value_fallback() {
 
     // Invalid preset should fall back to Full
     assert!(
-        enabled_tools.len() >= 35 && enabled_tools.len() <= 45,
+        enabled_tools.len() >= 22 && enabled_tools.len() <= 30,
         "Invalid preset should fall back to Full, got {} tools",
         enabled_tools.len()
     );

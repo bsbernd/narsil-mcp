@@ -2714,34 +2714,6 @@ fn test_go_to_definition_error_missing_path() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_trace_taint_error_missing_path() -> Result<()> {
-    let (_repo, server, repo_name) = require_arg_test_server()?;
-
-    let response = server.call_tool("trace_taint", json!({"repo": repo_name}))?;
-
-    assert!(response["error"].is_object());
-    let error_msg = response["error"]["message"].as_str().unwrap();
-    assert!(error_msg.contains("trace_taint"));
-    assert!(error_msg.contains("path"));
-
-    Ok(())
-}
-
-#[test]
-fn test_suggest_fix_error_missing_path() -> Result<()> {
-    let (_repo, server, repo_name) = require_arg_test_server()?;
-
-    let response = server.call_tool("suggest_fix", json!({"repo": repo_name}))?;
-
-    assert!(response["error"].is_object());
-    let error_msg = response["error"]["message"].as_str().unwrap();
-    assert!(error_msg.contains("suggest_fix"));
-    assert!(error_msg.contains("path"));
-
-    Ok(())
-}
-
 // Security tests module
 mod security_tests {
     use super::*;

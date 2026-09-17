@@ -18,7 +18,6 @@ pub mod graph;
 mod lsp;
 mod repo;
 mod search;
-mod security;
 mod symbols;
 
 /// Trait for implementing tool handlers
@@ -104,18 +103,6 @@ impl ToolRegistry {
         registry.register(Box::new(lsp::GetHoverInfoHandler));
         registry.register(Box::new(lsp::GetTypeInfoHandler));
         registry.register(Box::new(lsp::GoToDefinitionHandler));
-
-        // Register security handlers
-        registry.register(Box::new(security::ScanSecurityHandler));
-        registry.register(Box::new(security::SecurityAuditHandler));
-        registry.register(Box::new(security::CheckOwaspTop10Handler));
-        registry.register(Box::new(security::CheckCweTop25Handler));
-        registry.register(Box::new(security::FindInjectionVulnerabilitiesHandler));
-        registry.register(Box::new(security::TraceTaintHandler));
-        registry.register(Box::new(security::GetTaintSourcesHandler));
-        registry.register(Box::new(security::GetSecuritySummaryHandler));
-        registry.register(Box::new(security::ExplainVulnerabilityHandler));
-        registry.register(Box::new(security::SuggestFixHandler));
 
         // Register analysis handlers
         registry.register(Box::new(analysis::GetControlFlowHandler));
@@ -483,7 +470,6 @@ mod tests {
     fn non_index_tools_take_no_lease() {
         assert!(reads_index("find_symbols"));
         assert!(reads_index("get_callers"));
-        assert!(reads_index("scan_security"));
         assert!(!reads_index("get_index_status"));
         assert!(!reads_index("reindex"));
         assert!(!reads_index("get_blame"));

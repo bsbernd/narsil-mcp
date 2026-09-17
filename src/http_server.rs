@@ -585,9 +585,6 @@ pub struct GraphQuery {
     /// Include complexity metrics
     #[serde(default = "default_true")]
     include_metrics: bool,
-    /// Include security overlay
-    #[serde(default)]
-    include_security: bool,
     /// Include code excerpts
     #[serde(default)]
     include_excerpts: bool,
@@ -692,7 +689,6 @@ async fn get_graph(
         "depth": depth,
         "direction": query.direction,
         "include_metrics": query.include_metrics,
-        "include_security": query.include_security,
         "include_excerpts": query.include_excerpts,
         "cluster_by": query.cluster_by,
     });
@@ -831,7 +827,6 @@ mod tests {
         assert_eq!(query.depth, 3);
         assert_eq!(query.direction, "both");
         assert!(query.include_metrics);
-        assert!(!query.include_security);
         assert!(!query.include_excerpts);
         assert_eq!(query.max_nodes, None);
     }

@@ -75,8 +75,8 @@ async fn test_backwards_compatibility_cli_only() -> Result<()> {
 
     // Should have most tools enabled (excluding call graph tools since call_graph_enabled=false)
     assert!(
-        enabled_tools.len() > 40,
-        "Expected >40 tools enabled, got {}",
+        enabled_tools.len() > 30,
+        "Expected >30 tools enabled, got {}",
         enabled_tools.len()
     );
 
@@ -184,7 +184,7 @@ async fn test_minimal_preset_filters_tools() -> Result<()> {
     assert!(enabled_tools.contains(&"search_code"));
 
     // Slow/advanced tools should be disabled
-    assert!(!enabled_tools.contains(&"scan_security"));
+    assert!(!enabled_tools.contains(&"get_complexity"));
 
     Ok(())
 }
@@ -224,9 +224,6 @@ async fn test_balanced_preset() -> Result<()> {
     // Git should be enabled
     assert!(enabled_tools.contains(&"get_blame"));
 
-    // Security should be enabled
-    assert!(enabled_tools.contains(&"scan_security"));
-
     // Neural search should still be disabled (too slow)
     assert!(!enabled_tools.contains(&"neural_search"));
 
@@ -256,8 +253,8 @@ async fn test_full_preset() -> Result<()> {
 
     // Full preset should have most/all tools, minus ones requiring unavailable flags.
     assert!(
-        enabled_tools.len() >= 50,
-        "Full preset should have 50+ tools, got {}",
+        enabled_tools.len() >= 40,
+        "Full preset should have 40+ tools, got {}",
         enabled_tools.len()
     );
 
@@ -266,7 +263,6 @@ async fn test_full_preset() -> Result<()> {
     assert!(enabled_tools.contains(&"find_symbols"));
     assert!(enabled_tools.contains(&"get_blame"));
     assert!(enabled_tools.contains(&"get_call_graph"));
-    assert!(enabled_tools.contains(&"scan_security"));
 
     Ok(())
 }
@@ -288,17 +284,12 @@ async fn test_security_focused_preset() -> Result<()> {
     let filter = ToolFilter::new(config, &options, None);
     let enabled_tools = filter.get_enabled_tools();
 
-    // Security preset should have ~21 tools
+    // Security preset should have ~12 tools
     assert!(
-        enabled_tools.len() >= 18 && enabled_tools.len() <= 24,
-        "Security preset should have 18-24 tools, got {}",
+        enabled_tools.len() >= 10 && enabled_tools.len() <= 16,
+        "Security preset should have 10-16 tools, got {}",
         enabled_tools.len()
     );
-
-    // Security tools should be enabled
-    assert!(enabled_tools.contains(&"scan_security"));
-    assert!(enabled_tools.contains(&"check_owasp_top10"));
-    assert!(enabled_tools.contains(&"find_injection_vulnerabilities"));
 
     // Analysis tools should be enabled
     assert!(enabled_tools.contains(&"get_control_flow"));
@@ -527,7 +518,7 @@ async fn test_feature_flag_validation() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_completeness() -> Result<()> {
     // Verify all tools in TOOL_METADATA have required fields
-    assert_eq!(TOOL_METADATA.len(), 52, "Expected 52 tools in metadata");
+    assert_eq!(TOOL_METADATA.len(), 42, "Expected 42 tools in metadata");
 
     for (name, meta) in TOOL_METADATA.iter() {
         // Name should match key
@@ -583,7 +574,6 @@ async fn test_all_categories_represented() -> Result<()> {
         ToolCategory::CallGraph,
         ToolCategory::Git,
         ToolCategory::Lsp,
-        ToolCategory::Security,
         ToolCategory::Analysis,
         ToolCategory::Graph,
     ];

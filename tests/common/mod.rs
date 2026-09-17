@@ -140,7 +140,10 @@ impl TestMcpServer {
     pub fn start_with_features(repo_path: &Path, features: &[&str]) -> Result<Self> {
         let binary_path = get_binary_path();
 
-        let mut args = vec!["--repos".to_string(), repo_path.to_string_lossy().to_string()];
+        let mut args = vec![
+            "--repos".to_string(),
+            repo_path.to_string_lossy().to_string(),
+        ];
 
         for feature in features {
             args.push(format!("--{}", feature));
@@ -262,9 +265,6 @@ impl TestRepo {
                 repo.add_rust_basic()?;
                 repo.add_python_basic()?;
                 repo.add_typescript_basic()?;
-            }
-            "security_samples" => {
-                repo.add_security_samples()?;
             }
             "call_graph_samples" => {
                 repo.add_call_graph_samples()?;
@@ -571,102 +571,6 @@ export class UserService {
         Ok(())
     }
 
-    fn add_security_samples(&mut self) -> Result<()> {
-        // SQL Injection sample
-        self.add_file(
-            "src/vulnerable_sql.py",
-            r#"""Vulnerable SQL examples for testing."""
-
-def search_users_unsafe(conn, name):
-    """VULNERABLE: Direct string interpolation in SQL."""
-    query = f"SELECT * FROM users WHERE name = '{name}'"
-    return conn.execute(query)
-
-
-def search_users_safe(conn, name):
-    """SAFE: Parameterized query."""
-    query = "SELECT * FROM users WHERE name = ?"
-    return conn.execute(query, (name,))
-"#,
-        )?;
-
-        // XSS sample
-        self.add_file(
-            "src/vulnerable_xss.js",
-            r#"/**
- * XSS vulnerability examples.
- */
-
-// VULNERABLE: Direct insertion of user input
-function displayMessage(userInput) {
-    document.getElementById('output').innerHTML = userInput;
-}
-
-// SAFE: Using textContent
-function displayMessageSafe(userInput) {
-    document.getElementById('output').textContent = userInput;
-}
-
-// VULNERABLE: Template literal XSS
-app.get('/search', (req, res) => {
-    res.send(`<h1>Results for: ${req.query.q}</h1>`);
-});
-
-// SAFE: Escaped output
-const escape = require('escape-html');
-app.get('/search-safe', (req, res) => {
-    res.send(`<h1>Results for: ${escape(req.query.q)}</h1>`);
-});
-"#,
-        )?;
-
-        // Command injection sample
-        self.add_file(
-            "src/vulnerable_command.rs",
-            r#"//! Command injection examples.
-
-use std::process::Command;
-
-/// VULNERABLE: Direct command interpolation
-fn run_ping_unsafe(host: &str) {
-    let cmd = format!("ping -c 1 {}", host);
-    Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .spawn()
-        .expect("failed");
-}
-
-/// SAFE: Argument passing
-fn run_ping_safe(host: &str) {
-    Command::new("ping")
-        .args(["-c", "1", host])
-        .spawn()
-        .expect("failed");
-}
-"#,
-        )?;
-
-        // Hardcoded secrets
-        self.add_file(
-            "src/secrets.py",
-            r#"""Hardcoded secrets examples."""
-
-# VULNERABLE: Hardcoded API key
-API_KEY = "sk-1234567890abcdef"
-
-# VULNERABLE: Hardcoded password
-DATABASE_PASSWORD = "super_secret_password"
-
-# SAFE: Environment variable
-import os
-SAFE_API_KEY = os.environ.get("API_KEY")
-"#,
-        )?;
-
-        Ok(())
-    }
-
     fn add_call_graph_samples(&mut self) -> Result<()> {
         self.add_file(
             "src/call_chain.rs",
@@ -773,10 +677,7 @@ impl TestMetrics {
 
     fn record_call(&self, tool: &str, duration: Duration) {
         let mut calls = self.calls.lock().unwrap();
-        calls
-            .entry(tool.to_string())
-            .or_default()
-            .push(duration);
+        calls.entry(tool.to_string()).or_default().push(duration);
     }
 
     /// Get average duration for a tool

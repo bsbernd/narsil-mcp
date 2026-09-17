@@ -128,12 +128,6 @@ fn test_zed_gets_minimal_preset() {
         !enabled.contains(&"get_blame"),
         "Minimal preset should exclude git tools"
     );
-
-    // Should NOT include security tools
-    assert!(
-        !enabled.contains(&"scan_security"),
-        "Minimal preset should exclude security tools"
-    );
 }
 
 #[test]
@@ -153,7 +147,7 @@ fn test_claude_desktop_gets_full_preset() {
     // (All tools that don't require Git, CallGraph, Neural flags)
     // With all flags enabled, would be 70+ tools
     assert!(
-        enabled.len() >= 35 && enabled.len() <= 45,
+        enabled.len() >= 22 && enabled.len() <= 30,
         "Claude Desktop should get full preset (50-60 tools without flags), got {}",
         enabled.len()
     );
@@ -166,9 +160,6 @@ fn test_claude_desktop_gets_full_preset() {
     // Should include advanced tools
     assert!(enabled.contains(&"semantic_search"));
     assert!(enabled.contains(&"hybrid_search"));
-
-    // Should include security tools
-    assert!(enabled.contains(&"scan_security"));
 }
 
 #[test]
@@ -186,7 +177,7 @@ fn test_claude_alternate_name() {
 
     // "claude" should also map to full preset (without flags)
     assert!(
-        enabled.len() >= 35 && enabled.len() <= 45,
+        enabled.len() >= 22 && enabled.len() <= 30,
         "'claude' editor should map to full preset, got {} tools",
         enabled.len()
     );
@@ -207,7 +198,7 @@ fn test_unknown_editor_gets_full_preset() {
 
     // Unknown editors should get all tools (full preset, without flags = 50-60)
     assert!(
-        enabled.len() >= 35 && enabled.len() <= 45,
+        enabled.len() >= 22 && enabled.len() <= 30,
         "Unknown editor should get full preset by default, got {}",
         enabled.len()
     );
@@ -223,23 +214,10 @@ fn test_no_client_info_gets_full_preset() {
 
     // No client info = full preset (without flags = 50-60)
     assert!(
-        enabled.len() >= 35 && enabled.len() <= 45,
+        enabled.len() >= 22 && enabled.len() <= 30,
         "No client info should get full preset, got {}",
         enabled.len()
     );
-}
-
-#[test]
-fn test_security_focused_preset() {
-    // This will be applied via config, not editor detection
-    // For now, test that security tools exist in metadata
-    use narsil_mcp::tool_metadata::TOOL_METADATA;
-
-    assert!(TOOL_METADATA.contains_key("scan_security"));
-    assert!(TOOL_METADATA.contains_key("check_owasp_top10"));
-    assert!(TOOL_METADATA.contains_key("check_cwe_top25"));
-
-    // When we implement security-focused preset, it should enable these
 }
 
 #[test]

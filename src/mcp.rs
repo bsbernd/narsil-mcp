@@ -845,11 +845,11 @@ mod tests {
 
     #[test]
     fn test_expose_rejection_names_the_group_and_says_not_to_retry() {
-        let msg = expose_rejection(&[ExposeGroup::Code, ExposeGroup::Git], "scan_security")
-            .expect("a security tool must be refused when only code+git are exposed");
+        let msg = expose_rejection(&[ExposeGroup::Code, ExposeGroup::Git], "get_complexity")
+            .expect("an analysis tool must be refused when only code+git are exposed");
 
-        assert!(msg.contains("scan_security"), "names the tool: {msg}");
-        assert!(msg.contains("'security'"), "names the group: {msg}");
+        assert!(msg.contains("get_complexity"), "names the tool: {msg}");
+        assert!(msg.contains("'analysis'"), "names the group: {msg}");
         assert!(
             msg.contains("do not retry"),
             "tells the caller to stop: {msg}"
@@ -870,7 +870,7 @@ mod tests {
     /// the registry knows stays callable.
     #[test]
     fn test_expose_rejection_is_inert_when_no_groups_selected() {
-        assert!(expose_rejection(&[], "scan_security").is_none());
+        assert!(expose_rejection(&[], "get_complexity").is_none());
     }
 
     /// An unknown name is the registry's error to report, with its own wording.

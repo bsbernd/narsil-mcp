@@ -91,7 +91,6 @@ regex = "1.10"    # Regular expression support
 
 # Configuration and rules
 serde-saphyr = "0.0"  # YAML parsing for security rules (panic-free, actively maintained)
-toml = "0.8"        # TOML parsing for config
 
 # Utilities
 anyhow = "1.0"
