@@ -33,9 +33,6 @@ export interface ControlsProps {
   showMetrics: boolean;
   onShowMetricsChange: (show: boolean) => void;
 
-  showSecurity: boolean;
-  onShowSecurityChange: (show: boolean) => void;
-
   clustered: boolean;
   onClusteredChange: (clustered: boolean) => void;
 
@@ -64,8 +61,6 @@ export function Controls({
   onMaxNodesChange,
   showMetrics,
   onShowMetricsChange,
-  showSecurity,
-  onShowSecurityChange,
   clustered,
   onClusteredChange,
   layout,
@@ -187,12 +182,6 @@ export function Controls({
             onChange={onShowMetricsChange}
             label="Metrics"
             color="blue"
-          />
-          <Toggle
-            checked={showSecurity}
-            onChange={onShowSecurityChange}
-            label="Security"
-            color="red"
           />
           <Toggle
             checked={clustered}

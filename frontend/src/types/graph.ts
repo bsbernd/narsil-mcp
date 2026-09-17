@@ -16,13 +16,6 @@ export interface NodeMetrics {
   caller_count: number;
 }
 
-export interface NodeSecurity {
-  has_vulnerabilities: boolean;
-  severity?: 'critical' | 'high' | 'medium' | 'low';
-  taint_source: boolean;
-  taint_sink: boolean;
-}
-
 export interface GraphNode {
   id: string;
   label: string;
@@ -30,7 +23,6 @@ export interface GraphNode {
   file_path: string;
   line: number;
   metrics?: NodeMetrics;
-  security?: NodeSecurity;
   excerpt?: string;
 }
 
@@ -73,7 +65,6 @@ export interface GraphRequest {
   depth?: number;
   direction?: 'callers' | 'callees' | 'both';
   include_metrics?: boolean;
-  include_security?: boolean;
   include_excerpts?: boolean;
   cluster_by?: 'none' | 'file' | 'module';
   max_nodes?: number;
@@ -110,7 +101,6 @@ export interface GraphState {
   view: ViewType;
   depth: number;
   showMetrics: boolean;
-  showSecurity: boolean;
   clustered: boolean;
 }
 
@@ -124,7 +114,6 @@ export interface CytoscapeNode {
     file_path: string;
     line: number;
     metrics?: NodeMetrics;
-    security?: NodeSecurity;
     parent?: string;
   };
   classes?: string;
@@ -151,16 +140,6 @@ export type CytoscapeElement = CytoscapeNode | CytoscapeEdge;
 export function nodeToCytoscape(node: GraphNode, cluster?: string): CytoscapeNode {
   const classes: string[] = [node.kind];
 
-  if (node.security?.has_vulnerabilities) {
-    classes.push('vulnerable');
-    if (node.security.severity) {
-      classes.push(`severity-${node.security.severity}`);
-    }
-  }
-
-  if (node.security?.taint_source) classes.push('taint-source');
-  if (node.security?.taint_sink) classes.push('taint-sink');
-
   if (node.metrics) {
     const cc = node.metrics.cyclomatic;
     if (cc > 20) classes.push('complexity-critical');
@@ -178,7 +157,6 @@ export function nodeToCytoscape(node: GraphNode, cluster?: string): CytoscapeNod
       file_path: node.file_path,
       line: node.line,
       metrics: node.metrics,
-      security: node.security,
       parent: cluster,
     },
     classes: classes.join(' '),

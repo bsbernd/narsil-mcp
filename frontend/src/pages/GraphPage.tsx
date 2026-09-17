@@ -25,7 +25,6 @@ export function GraphPage() {
   const direction = (searchParams.get('direction') ?? 'both') as DirectionType;
   const maxNodes = parseInt(searchParams.get('maxNodes') ?? '100', 10);
   const showMetrics = searchParams.get('metrics') === 'true';
-  const showSecurity = searchParams.get('security') === 'true';
   const clustered = searchParams.get('clustered') === 'true';
   const layout = (searchParams.get('layout') ?? 'dagre') as LayoutType;
 
@@ -63,7 +62,6 @@ export function GraphPage() {
       root,
       direction: view === 'call' ? direction : undefined,
       include_metrics: showMetrics,
-      include_security: showSecurity,
       cluster_by: clustered ? 'file' : 'none',
       max_nodes: maxNodes,
     },
@@ -103,8 +101,6 @@ export function GraphPage() {
           onMaxNodesChange={(n) => setParam('maxNodes', String(n))}
           showMetrics={showMetrics}
           onShowMetricsChange={(v) => setParam('metrics', v ? 'true' : undefined)}
-          showSecurity={showSecurity}
-          onShowSecurityChange={(v) => setParam('security', v ? 'true' : undefined)}
           clustered={clustered}
           onClusteredChange={(v) => setParam('clustered', v ? 'true' : undefined)}
           layout={layout}

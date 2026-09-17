@@ -89,47 +89,6 @@ export function NodeDetails({ node, onClose, onNavigate }: NodeDetailsProps) {
         </Section>
       )}
 
-      {/* Security */}
-      {node.security && (
-        <Section title="Security">
-          <div className="space-y-2">
-            {node.security.has_vulnerabilities && (
-              <SecurityBadge
-                icon={
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
-                }
-                label={`Vulnerability: ${node.security.severity?.toUpperCase() ?? 'Unknown'}`}
-                severity={node.security.severity}
-              />
-            )}
-            {node.security.taint_source && (
-              <SecurityBadge
-                icon={
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                }
-                label="Taint Source"
-                severity="warning"
-              />
-            )}
-            {node.security.taint_sink && (
-              <SecurityBadge
-                icon={
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
-                  </svg>
-                }
-                label="Taint Sink"
-                severity="critical"
-              />
-            )}
-          </div>
-        </Section>
-      )}
-
       {/* Code Excerpt */}
       {node.excerpt && (
         <Section title="Code">
@@ -177,37 +136,6 @@ function MetricCard({ label, value, color }: MetricCardProps) {
     <div className={`rounded-lg px-3 py-2 ${colorClasses[color]}`}>
       <div className="text-[10px] opacity-70 uppercase tracking-wide">{label}</div>
       <div className="text-lg font-semibold leading-tight">{value}</div>
-    </div>
-  );
-}
-
-interface SecurityBadgeProps {
-  icon: React.ReactNode;
-  label: string;
-  severity?: string;
-}
-
-function SecurityBadge({ icon, label, severity }: SecurityBadgeProps) {
-  const getSeverityClasses = (sev?: string): string => {
-    switch (sev) {
-      case 'critical':
-        return 'bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-400 border-red-200 dark:border-red-900';
-      case 'high':
-        return 'bg-orange-50 dark:bg-orange-950/30 text-orange-700 dark:text-orange-400 border-orange-200 dark:border-orange-900';
-      case 'medium':
-      case 'warning':
-        return 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-900';
-      case 'low':
-        return 'bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-900';
-      default:
-        return 'bg-slate-50 dark:bg-slate-800/50 text-slate-700 dark:text-slate-400 border-slate-200 dark:border-slate-700';
-    }
-  };
-
-  return (
-    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${getSeverityClasses(severity)}`}>
-      {icon}
-      <span className="text-xs font-medium">{label}</span>
     </div>
   );
 }

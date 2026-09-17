@@ -107,7 +107,6 @@ export function useGraphVisualization(initialRepo: string = '') {
   const [depth, setDepth] = useState(3);
   const [root, setRoot] = useState<string | undefined>();
   const [showMetrics, setShowMetrics] = useState(true);
-  const [showSecurity, setShowSecurity] = useState(false);
   const [clustered, setClustered] = useState(false);
 
   const request: GraphRequest = {
@@ -116,7 +115,6 @@ export function useGraphVisualization(initialRepo: string = '') {
     depth,
     root,
     include_metrics: showMetrics,
-    include_security: showSecurity,
     cluster_by: clustered ? 'file' : 'none',
   };
 
@@ -129,7 +127,6 @@ export function useGraphVisualization(initialRepo: string = '') {
     depth,
     root,
     showMetrics,
-    showSecurity,
     clustered,
 
     // Setters
@@ -138,7 +135,6 @@ export function useGraphVisualization(initialRepo: string = '') {
     setDepth,
     setRoot,
     setShowMetrics,
-    setShowSecurity,
     setClustered,
 
     // Query results

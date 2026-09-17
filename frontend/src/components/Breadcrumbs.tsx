@@ -37,8 +37,6 @@ export function Breadcrumbs() {
       crumbs.push({ label: parts[2], path: `/${repo}/symbol/${parts[2]}` });
     } else if (section === 'function' && parts[2]) {
       crumbs.push({ label: `${parts[2]}()`, path: `/${repo}/function/${parts[2]}` });
-    } else if (section === 'security') {
-      crumbs.push({ label: 'Security', path: `/${repo}/security` });
     } else if (section === 'search') {
       crumbs.push({ label: 'Search', path: `/${repo}/search${location.search}` });
     }

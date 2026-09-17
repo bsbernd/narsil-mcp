@@ -33,13 +33,6 @@ export function Legend() {
           <LegendItem color="#6366f1" shape="dashed" label="Async" />
           <LegendItem color="#8b5cf6" shape="dotted" label="Closure" />
         </LegendGroup>
-
-        {/* Security */}
-        <LegendGroup title="Security">
-          <LegendItem color="#dc2626" border="#7f1d1d" label="Vuln" />
-          <LegendItem color="#64748b" border="#fbbf24" borderStyle="dashed" label="Source" />
-          <LegendItem color="#64748b" border="#ef4444" borderStyle="dashed" label="Sink" />
-        </LegendGroup>
       </div>
     </div>
   );

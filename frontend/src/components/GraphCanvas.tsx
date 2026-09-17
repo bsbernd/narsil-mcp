@@ -160,52 +160,6 @@ const cytoscapeStyles: any[] = [
       'border-width': 0,
     },
   },
-  // Security: vulnerable nodes override complexity colors
-  {
-    selector: 'node.vulnerable',
-    style: {
-      'background-color': '#dc2626',
-      'border-width': 3,
-      'border-color': '#7f1d1d',
-      'border-style': 'double',
-      'color': '#ffffff',
-    },
-  },
-  {
-    selector: 'node.severity-critical',
-    style: {
-      'background-color': '#991b1b',
-      'border-width': 3,
-      'border-color': '#450a0a',
-      'color': '#ffffff',
-    },
-  },
-  {
-    selector: 'node.severity-high',
-    style: {
-      'background-color': '#c2410c',
-      'border-width': 3,
-      'border-color': '#7c2d12',
-      'color': '#ffffff',
-    },
-  },
-  // Taint source/sink
-  {
-    selector: 'node.taint-source',
-    style: {
-      'border-style': 'dashed',
-      'border-width': 3,
-      'border-color': '#fbbf24',
-    },
-  },
-  {
-    selector: 'node.taint-sink',
-    style: {
-      'border-style': 'dashed',
-      'border-width': 3,
-      'border-color': '#ef4444',
-    },
-  },
   // Hover state
   {
     selector: 'node:active',
@@ -470,7 +424,6 @@ export function GraphCanvas({
           file_path: data.file_path,
           line: data.line,
           metrics: data.metrics,
-          security: data.security,
         });
       }
     },
@@ -495,7 +448,6 @@ export function GraphCanvas({
           file_path: data.file_path,
           line: data.line,
           metrics: data.metrics,
-          security: data.security,
         });
       }
     },

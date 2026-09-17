@@ -76,8 +76,6 @@ export class CodeIntelClient {
     if (request.direction) params.set('direction', request.direction);
     if (request.include_metrics !== undefined)
       params.set('include_metrics', request.include_metrics.toString());
-    if (request.include_security !== undefined)
-      params.set('include_security', request.include_security.toString());
     if (request.include_excerpts !== undefined)
       params.set('include_excerpts', request.include_excerpts.toString());
     if (request.cluster_by) params.set('cluster_by', request.cluster_by);
@@ -107,7 +105,6 @@ export class CodeIntelClient {
         depth: request.depth ?? 3,
         direction: request.direction ?? 'both',
         include_metrics: request.include_metrics ?? true,
-        include_security: request.include_security ?? false,
         include_excerpts: request.include_excerpts ?? false,
         cluster_by: request.cluster_by ?? 'none',
         max_nodes: request.max_nodes,

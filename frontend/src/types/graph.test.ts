@@ -70,31 +70,10 @@ describe('nodeToCytoscape', () => {
     expect(result.classes).toContain('complexity-critical');
   });
 
-  it('adds vulnerable class for nodes with security findings', () => {
-    const node: GraphNode = {
-      ...baseNode,
-      security: { has_vulnerabilities: true, severity: 'high', taint_source: false, taint_sink: false },
-    };
-    const result = nodeToCytoscape(node);
-    expect(result.classes).toContain('vulnerable');
-    expect(result.classes).toContain('severity-high');
-  });
-
-  it('adds taint classes for taint source and sink', () => {
-    const node: GraphNode = {
-      ...baseNode,
-      security: { has_vulnerabilities: false, taint_source: true, taint_sink: true },
-    };
-    const result = nodeToCytoscape(node);
-    expect(result.classes).toContain('taint-source');
-    expect(result.classes).toContain('taint-sink');
-  });
-
-  it('handles node with no metrics or security', () => {
+  it('handles node with no metrics', () => {
     const result = nodeToCytoscape(baseNode);
     expect(result.classes).toBe('function');
     expect(result.data.metrics).toBeUndefined();
-    expect(result.data.security).toBeUndefined();
   });
 });
 
