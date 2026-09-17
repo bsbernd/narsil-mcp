@@ -184,8 +184,7 @@ async fn test_minimal_preset_filters_tools() -> Result<()> {
     assert!(enabled_tools.contains(&"search_code"));
 
     // Slow/advanced tools should be disabled
-    assert!(!enabled_tools.contains(&"neural_search"));
-    assert!(!enabled_tools.contains(&"generate_sbom"));
+    assert!(!enabled_tools.contains(&"scan_security"));
 
     Ok(())
 }
@@ -289,11 +288,10 @@ async fn test_security_focused_preset() -> Result<()> {
     let filter = ToolFilter::new(config, &options, None);
     let enabled_tools = filter.get_enabled_tools();
 
-    // Security preset should have ~28 tools
-    // Security (9) + SupplyChain (4) + Analysis (11) + Repository basics (4)
+    // Security preset should have ~21 tools
     assert!(
-        enabled_tools.len() >= 22 && enabled_tools.len() <= 28,
-        "Security preset should have 22-28 tools, got {}",
+        enabled_tools.len() >= 18 && enabled_tools.len() <= 24,
+        "Security preset should have 18-24 tools, got {}",
         enabled_tools.len()
     );
 
@@ -301,10 +299,6 @@ async fn test_security_focused_preset() -> Result<()> {
     assert!(enabled_tools.contains(&"scan_security"));
     assert!(enabled_tools.contains(&"check_owasp_top10"));
     assert!(enabled_tools.contains(&"find_injection_vulnerabilities"));
-
-    // Supply chain tools should be enabled
-    assert!(enabled_tools.contains(&"generate_sbom"));
-    assert!(enabled_tools.contains(&"check_dependencies"));
 
     // Analysis tools should be enabled
     assert!(enabled_tools.contains(&"get_control_flow"));
@@ -533,7 +527,7 @@ async fn test_feature_flag_validation() -> Result<()> {
 #[tokio::test]
 async fn test_metadata_completeness() -> Result<()> {
     // Verify all tools in TOOL_METADATA have required fields
-    assert_eq!(TOOL_METADATA.len(), 56, "Expected 56 tools in metadata");
+    assert_eq!(TOOL_METADATA.len(), 52, "Expected 52 tools in metadata");
 
     for (name, meta) in TOOL_METADATA.iter() {
         // Name should match key
@@ -590,7 +584,6 @@ async fn test_all_categories_represented() -> Result<()> {
         ToolCategory::Git,
         ToolCategory::Lsp,
         ToolCategory::Security,
-        ToolCategory::SupplyChain,
         ToolCategory::Analysis,
         ToolCategory::Graph,
     ];

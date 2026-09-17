@@ -9,11 +9,11 @@ use std::collections::HashSet;
 
 #[test]
 fn test_tool_metadata_complete() {
-    // All 56 tools should have metadata
+    // All 52 tools should have metadata
     assert_eq!(
         TOOL_METADATA.len(),
-        56,
-        "Expected 56 tools to have metadata"
+        52,
+        "Expected 52 tools to have metadata"
     );
 
     // Each tool should have complete, valid metadata
@@ -66,7 +66,6 @@ fn test_tool_categories_complete() {
     assert!(categories.contains(&ToolCategory::Git));
     assert!(categories.contains(&ToolCategory::Lsp));
     assert!(categories.contains(&ToolCategory::Security));
-    assert!(categories.contains(&ToolCategory::SupplyChain));
     assert!(categories.contains(&ToolCategory::Analysis));
 }
 
@@ -260,11 +259,6 @@ fn test_category_counts() {
         count_by_category(ToolCategory::Security),
         10,
         "Security category should have 10 tools"
-    );
-    assert_eq!(
-        count_by_category(ToolCategory::SupplyChain),
-        4,
-        "SupplyChain category should have 4 tools"
     );
     assert_eq!(
         count_by_category(ToolCategory::Analysis),

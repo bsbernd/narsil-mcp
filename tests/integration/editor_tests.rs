@@ -238,8 +238,6 @@ fn test_security_focused_preset() {
     assert!(TOOL_METADATA.contains_key("scan_security"));
     assert!(TOOL_METADATA.contains_key("check_owasp_top10"));
     assert!(TOOL_METADATA.contains_key("check_cwe_top25"));
-    assert!(TOOL_METADATA.contains_key("generate_sbom"));
-    assert!(TOOL_METADATA.contains_key("check_dependencies"));
 
     // When we implement security-focused preset, it should enable these
 }

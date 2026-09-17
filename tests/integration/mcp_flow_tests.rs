@@ -411,8 +411,8 @@ fn test_cli_preset_all_values() {
     let filter = ToolFilter::new(config, &options, None);
     let security_tools = filter.get_enabled_tools();
     assert!(
-        security_tools.len() >= 25 && security_tools.len() <= 40,
-        "security-focused preset should have 25-40 tools, got {}",
+        security_tools.len() >= 18 && security_tools.len() <= 25,
+        "security-focused preset should have 18-25 tools, got {}",
         security_tools.len()
     );
 }

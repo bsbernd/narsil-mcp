@@ -19,7 +19,6 @@ mod lsp;
 mod repo;
 mod search;
 mod security;
-mod supply_chain;
 mod symbols;
 
 /// Trait for implementing tool handlers
@@ -117,12 +116,6 @@ impl ToolRegistry {
         registry.register(Box::new(security::GetSecuritySummaryHandler));
         registry.register(Box::new(security::ExplainVulnerabilityHandler));
         registry.register(Box::new(security::SuggestFixHandler));
-
-        // Register supply chain handlers
-        registry.register(Box::new(supply_chain::GenerateSbomHandler));
-        registry.register(Box::new(supply_chain::CheckDependenciesHandler));
-        registry.register(Box::new(supply_chain::CheckLicensesHandler));
-        registry.register(Box::new(supply_chain::FindUpgradePathHandler));
 
         // Register analysis handlers
         registry.register(Box::new(analysis::GetControlFlowHandler));

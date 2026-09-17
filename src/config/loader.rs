@@ -39,9 +39,6 @@ tools:
     Security:
       enabled: true
       description: "Security vulnerability scanning"
-    SupplyChain:
-      enabled: true
-      description: "Supply chain analysis"
     Analysis:
       enabled: true
       description: "Code analysis tools"

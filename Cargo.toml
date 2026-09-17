@@ -108,7 +108,7 @@ fs4 = "0.13"  # Cross-platform advisory file locking for the global stats file
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
 uuid = { version = "1.0", features = ["v4"] }  # For generating unique streaming tokens
-chrono = "0.4"  # Date/time handling for SBOM generation
+chrono = "0.4"  # Date/time handling
 
 tempfile = { version = "3.8", optional = true }
 

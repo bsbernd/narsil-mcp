@@ -50,7 +50,6 @@ pub enum ToolCategory {
     Git,
     Lsp,
     Security,
-    SupplyChain,
     Analysis,
     Graph,
 }
@@ -65,7 +64,6 @@ impl std::fmt::Display for ToolCategory {
             ToolCategory::Git => write!(f, "Git"),
             ToolCategory::Lsp => write!(f, "LSP"),
             ToolCategory::Security => write!(f, "Security"),
-            ToolCategory::SupplyChain => write!(f, "SupplyChain"),
             ToolCategory::Analysis => write!(f, "Analysis"),
             ToolCategory::Graph => write!(f, "Graph"),
         }
@@ -419,7 +417,7 @@ lazy_static! {
 
         map.insert("get_dependencies", ToolMetadata {
             name: "get_dependencies",
-            description: "Imports and module dependencies of one source file. For package manifests and their CVEs use check_dependencies instead.",
+            description: "Imports and module dependencies of one source file.",
             category: ToolCategory::Symbols,
             tags: ["dependencies", "imports", "module", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -1164,91 +1162,6 @@ lazy_static! {
             }),
             requires_api_key: false,
             aliases: vec!["fix", "remediation"],
-        });
-
-        // ===== Supply Chain Tools (4) =====
-
-        map.insert("generate_sbom", ToolMetadata {
-            name: "generate_sbom",
-            description: "Generate a Software Bill of Materials (SBOM) for a project. Supports CycloneDX and SPDX formats. Parses Cargo.toml, package.json, requirements.txt, and go.mod.",
-            category: ToolCategory::SupplyChain,
-            tags: ["sbom", "dependencies", "supply-chain", "bom"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "format": {"type": "string", "enum": ["cyclonedx", "spdx", "json"], "description": "Output format (default: cyclonedx)"},
-                    "compact": {"type": "boolean", "description": "Output minified JSON without whitespace (default: false)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["sbom", "bom", "dependencies_list"],
-        });
-
-        map.insert("check_dependencies", ToolMetadata {
-            name: "check_dependencies",
-            description: "Check project dependencies for known vulnerabilities using the OSV (Open Source Vulnerabilities) database. Returns CVE/GHSA IDs and recommended upgrades.",
-            category: ToolCategory::SupplyChain,
-            tags: ["dependencies", "vulnerabilities", "osv", "cve", "supply-chain"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "severity_threshold": {"type": "string", "enum": ["critical", "high", "medium", "low"], "description": "Minimum severity level to report (default: low)"},
-                    "include_dev": {"type": "boolean", "description": "Include dev dependencies (default: true)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["check_deps", "dependency_scan"],
-        });
-
-        map.insert("check_licenses", ToolMetadata {
-            name: "check_licenses",
-            description: "Analyze dependency licenses for compliance issues. Detects copyleft licenses, unknown licenses, and license compatibility problems.",
-            category: ToolCategory::SupplyChain,
-            tags: ["licenses", "compliance", "legal", "supply-chain"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::Medium,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "project_license": {"type": "string", "description": "SPDX identifier for your project's license (e.g., MIT, Apache-2.0)"},
-                    "fail_on_copyleft": {"type": "boolean", "description": "Treat copyleft licenses as issues (default: false)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["licenses", "license_check"],
-        });
-
-        map.insert("find_upgrade_path", ToolMetadata {
-            name: "find_upgrade_path",
-            description: "Find safe upgrade paths for vulnerable dependencies. Shows which versions fix known vulnerabilities and whether upgrades have breaking changes.",
-            category: ToolCategory::SupplyChain,
-            tags: ["upgrade", "dependencies", "vulnerabilities", "fix"].iter().copied().collect(),
-            stability: StabilityLevel::Stable,
-            performance: PerformanceImpact::High,
-            required_flags: HashSet::new(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string"},
-                    "dependency": {"type": "string", "description": "Optional: specific dependency to check (checks all vulnerable deps if omitted)"}
-                },
-                "required": ["repo"]
-            }),
-            requires_api_key: false,
-            aliases: vec!["upgrade_path", "upgrade"],
         });
 
         // ===== Analysis Tools (3) =====

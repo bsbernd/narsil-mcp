@@ -68,17 +68,10 @@ impl Preset {
         match self {
             Preset::Minimal => {
                 // Disable slow/advanced tools
-                [
-                    "generate_sbom",
-                    "check_dependencies",
-                    "check_licenses",
-                    "scan_security",
-                    "check_owasp_top10",
-                    "check_cwe_top25",
-                ]
-                .iter()
-                .copied()
-                .collect()
+                ["scan_security", "check_owasp_top10", "check_cwe_top25"]
+                    .iter()
+                    .copied()
+                    .collect()
             }
             Preset::Balanced => HashSet::new(),
             Preset::Full => HashSet::new(), // Nothing disabled
@@ -189,11 +182,6 @@ impl Preset {
             "get_security_summary",
             "explain_vulnerability",
             "suggest_fix",
-            // Supply chain (4)
-            "generate_sbom",
-            "check_dependencies",
-            "check_licenses",
-            "find_upgrade_path",
             // Code analysis (useful for security)
             "get_control_flow",
             "get_data_flow",
@@ -233,19 +221,16 @@ pub enum ExposeGroup {
     Analysis,
     /// Vulnerability scanning and taint tracking.
     Security,
-    /// SBOM, licences, dependency and upgrade checks.
-    SupplyChain,
 }
 
 impl ExposeGroup {
     /// Every group, in the order they are printed in `--help` and the docs.
-    pub const ALL: [ExposeGroup; 6] = [
+    pub const ALL: [ExposeGroup; 5] = [
         ExposeGroup::Base,
         ExposeGroup::Code,
         ExposeGroup::Git,
         ExposeGroup::Analysis,
         ExposeGroup::Security,
-        ExposeGroup::SupplyChain,
     ];
 
     /// The CLI spelling of this group.
@@ -256,7 +241,6 @@ impl ExposeGroup {
             ExposeGroup::Git => "git",
             ExposeGroup::Analysis => "analysis",
             ExposeGroup::Security => "security",
-            ExposeGroup::SupplyChain => "supply-chain",
         }
     }
 
@@ -277,7 +261,6 @@ impl ExposeGroup {
             ExposeGroup::Git => Self::git_tools(),
             ExposeGroup::Analysis => Self::analysis_tools(),
             ExposeGroup::Security => Self::security_tools(),
-            ExposeGroup::SupplyChain => Self::supply_chain_tools(),
         }
     }
 
@@ -407,18 +390,6 @@ impl ExposeGroup {
         .copied()
         .collect()
     }
-
-    fn supply_chain_tools() -> HashSet<&'static str> {
-        [
-            "generate_sbom",
-            "check_dependencies",
-            "check_licenses",
-            "find_upgrade_path",
-        ]
-        .iter()
-        .copied()
-        .collect()
-    }
 }
 
 #[cfg(test)]
@@ -456,7 +427,7 @@ mod tests {
     #[test]
     fn test_minimal_excludes_advanced() {
         let disabled = Preset::Minimal.get_disabled_tools();
-        assert!(disabled.contains(&"generate_sbom"));
+        assert!(disabled.contains(&"scan_security"));
     }
 
     #[test]
@@ -484,8 +455,6 @@ mod tests {
         let tools = Preset::SecurityFocused.get_enabled_tools();
         assert!(tools.contains(&"scan_security"));
         assert!(tools.contains(&"check_owasp_top10"));
-        assert!(tools.contains(&"generate_sbom"));
-        assert!(tools.contains(&"check_dependencies"));
     }
 
     #[test]
@@ -532,14 +501,6 @@ mod tests {
     fn test_expose_parse() {
         assert_eq!(ExposeGroup::parse("code"), Some(ExposeGroup::Code));
         assert_eq!(ExposeGroup::parse("CODE"), Some(ExposeGroup::Code));
-        assert_eq!(
-            ExposeGroup::parse("supply-chain"),
-            Some(ExposeGroup::SupplyChain)
-        );
-        assert_eq!(
-            ExposeGroup::parse("supply_chain"),
-            Some(ExposeGroup::SupplyChain)
-        );
         assert_eq!(ExposeGroup::parse("analysis"), Some(ExposeGroup::Analysis));
         assert_eq!(ExposeGroup::parse("structure"), None);
     }

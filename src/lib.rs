@@ -22,7 +22,6 @@ pub mod search;
 pub mod security_config;
 pub mod security_rules;
 pub mod stats_cli;
-pub mod supply_chain;
 pub mod symbols;
 pub mod syscall;
 pub mod taint;

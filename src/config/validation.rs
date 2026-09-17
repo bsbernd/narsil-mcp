@@ -60,7 +60,6 @@ fn validate_categories(config: &ToolConfig) -> Result<()> {
         "Git",
         "LSP",
         "Security",
-        "SupplyChain",
         "Analysis",
         "Graph",
     ]

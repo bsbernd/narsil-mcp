@@ -50,11 +50,6 @@ tools:
       enabled: true
       description: "Security vulnerability scanning"
 
-    # Supply chain analysis (4 tools)
-    SupplyChain:
-      enabled: true
-      description: "Supply chain analysis"
-
     # Code analysis tools (11 tools)
     Analysis:
       enabled: true
@@ -68,8 +63,8 @@ tools:
   # Individual tool overrides
   # Use this section to disable specific tools or override their settings
   overrides: {}
-    # Example: Disable SBOM generation
-    # generate_sbom:
+    # Example: Disable a tool
+    # scan_security:
     #   enabled: false
     #   reason: "Not needed for this project"
 

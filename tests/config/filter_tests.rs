@@ -427,15 +427,14 @@ fn test_security_focused_preset() {
 
     // Should have ~32 tools as defined in preset.rs
     assert!(
-        enabled.len() >= 25 && enabled.len() <= 40,
-        "Security-focused preset should have 25-40 tools, got {}",
+        enabled.len() >= 18 && enabled.len() <= 25,
+        "Security-focused preset should have 18-25 tools, got {}",
         enabled.len()
     );
 
     // Should include security tools
     assert!(enabled.contains(&"scan_security"));
     assert!(enabled.contains(&"check_owasp_top10"));
-    assert!(enabled.contains(&"generate_sbom"));
 }
 
 /// All feature flags on, so nothing below is filtered out by a missing flag.
@@ -465,11 +464,9 @@ fn test_expose_narrows_to_selected_groups() {
 
     assert!(!enabled.contains(&"scan_security"), "security not selected");
     assert!(
-        !enabled.contains(&"generate_sbom"),
-        "supply-chain not selected"
+        !enabled.contains(&"get_complexity"),
+        "analysis not selected"
     );
-    assert!(!enabled.contains(&"find_dead_stores"), "lint not selected");
-    assert!(!enabled.contains(&"get_chunks"), "retrieval not selected");
 }
 
 /// Without the flag the filter must behave exactly as before.
