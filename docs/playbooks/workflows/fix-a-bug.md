@@ -70,7 +70,6 @@ The control flow shows there are 4 paths that can raise 'Invalid token'..."
 ```
 get_callers(repo: "myproject", function: "verify_token")
 get_data_flow(repo: "myproject", path: "src/api/auth.py", function: "verify_token")
-trace_taint(repo: "myproject", path: "src/api/middleware.py", line: 23)
 ```
 
 **Result:** Claude traces from HTTP header → middleware → verify_token
@@ -78,7 +77,6 @@ trace_taint(repo: "myproject", path: "src/api/middleware.py", line: 23)
 **Claude responds:** "Token flow:
 1. Extracted from `Authorization` header in `middleware.py:23`
 2. Passed to `verify_token()` at `middleware.py:31`
-3. The token value is tainted from user input
 
 I see a potential issue - the token is extracted with `split(' ')[1]` which could fail if the header format is wrong..."
 
@@ -158,7 +156,6 @@ Cognitive complexity: 12
 | `get_symbol_definition` | Get full function/class source |
 | `get_control_flow` | See branches, loops, and conditions |
 | `get_data_flow` | Track variable definitions and uses |
-| `trace_taint` | Follow data from user input through the code |
 | `get_callers` | Find what calls a function |
 | `get_symbol_history` | See git history for a specific function |
 | `get_blame` | See who changed each line and when |
@@ -168,7 +165,7 @@ Cognitive complexity: 12
 
 ### "Error shows up randomly"
 ```
-trace_taint → find race conditions or unhandled edge cases
+get_data_flow → find unhandled edge cases
 get_control_flow → identify all code paths
 ```
 
@@ -206,5 +203,4 @@ get_hotspots → find files with high churn and complexity
 ## Related Workflows
 
 - [Understand a Codebase](understand-codebase.md) - Get context first
-- [Security Audit](security-audit.md) - Check if bug has security implications
 - [Code Review](code-review.md) - Review your fix before merging

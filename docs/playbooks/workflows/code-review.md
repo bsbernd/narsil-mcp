@@ -93,30 +93,6 @@ Call path:
 
 ---
 
-### Step 4: Review for security
-
-**You:** "Are there any security concerns with the new code?"
-
-**Claude calls:**
-```
-scan_security(repo: "myproject", path: "src/services/refund.py")
-trace_taint(repo: "myproject", path: "src/services/refund.py", line: 45)
-```
-
-**Result:**
-```
-No critical/high findings in refund.py
-
-Taint analysis:
-  refund_amount flows from request.json['amount'] (user input)
-  → validated by validate_refund()
-  → bounded by original order amount
-```
-
-**Claude responds:** "Security looks good. User input (refund amount) is validated and bounded by the original order amount before processing."
-
----
-
 ### Step 5: Check the diff
 
 **You:** "What exactly changed in the payment service?"
@@ -196,27 +172,6 @@ get_order callers:
 
 ---
 
-### Step 8: Check code quality
-
-**You:** "Any code quality issues?"
-
-**Claude calls:**
-```
-find_dead_code(repo: "myproject", path: "src/services/refund.py")
-check_type_errors(repo: "myproject", path: "src/services/refund.py")
-find_dead_stores(repo: "myproject", path: "src/services/refund.py")
-```
-
-**Result:**
-```
-Dead code: None found
-Type errors: None detected
-Dead stores:
-  - Line 67: `old_status` assigned but never read
-```
-
-**Claude responds:** "Minor issue: Line 67 has an unused variable `old_status`. Either remove it or use it for logging."
-
 ## Tools Used in This Workflow
 
 | Tool | Purpose |
@@ -228,10 +183,6 @@ Dead stores:
 | `find_symbols` | Understand new code structure |
 | `get_complexity` | Assess code complexity |
 | `get_callers` / `get_callees` | Understand integration points |
-| `scan_security` | Check for security issues |
-| `trace_taint` | Verify input validation |
-| `find_dead_code` | Identify unreachable code |
-| `check_type_errors` | Find potential type issues |
 
 ## Review Checklist
 
@@ -261,4 +212,3 @@ Claude can help verify:
 
 - [Understand a Codebase](understand-codebase.md) - Get context before reviewing
 - [Fix a Bug](fix-a-bug.md) - Debug issues found in review
-- [Security Audit](security-audit.md) - Deep security review

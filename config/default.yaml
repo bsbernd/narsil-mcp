@@ -1,6 +1,6 @@
 # Default configuration for narsil-mcp
 #
-# This configuration enables all tool categories by default.
+# Every registered tool is exposed unless `expose:` narrows the groups.
 # Individual tools can be disabled using the 'overrides' section.
 #
 # To customize, copy this file to:
@@ -9,52 +9,12 @@
 
 version: "1.0"
 
+# Tool groups to expose (base is always included): code, git, analysis.
+# Empty exposes every tool.
+# expose: [code, git]
+
 # Tool configuration
 tools:
-  # Category-level configuration
-  categories:
-    # Repository and file operations (10 tools)
-    Repository:
-      enabled: true
-      description: "Repository and file operations"
-
-    # Symbol search and navigation (7 tools)
-    Symbols:
-      enabled: true
-      description: "Symbol search and navigation"
-
-    # Code search capabilities (12 tools)
-    Search:
-      enabled: true
-      description: "Code search capabilities"
-
-    # Call graph analysis (6 tools, requires --call-graph)
-    CallGraph:
-      enabled: true
-      description: "Call graph analysis"
-      required_flags: ["call_graph"]
-
-    # Git integration (9 tools, requires --git)
-    Git:
-      enabled: true
-      description: "Git integration"
-      required_flags: ["git"]
-
-    # LSP integration (3 tools, enhanced with --lsp)
-    LSP:
-      enabled: true
-      description: "LSP integration"
-
-    # Code analysis tools (11 tools)
-    Analysis:
-      enabled: true
-      description: "Code analysis tools"
-
-    # Graph visualization (1 tool)
-    Graph:
-      enabled: true
-      description: "Graph visualization"
-
   # Individual tool overrides
   # Use this section to disable specific tools or override their settings
   overrides: {}
@@ -62,29 +22,3 @@ tools:
     # get_complexity:
     #   enabled: false
     #   reason: "Not needed for this project"
-
-# Performance budgets and limits
-performance:
-  # Maximum number of tools to expose
-  max_tool_count: 76
-
-  # Maximum acceptable startup latency in milliseconds
-  startup_latency_ms: 10
-
-  # Maximum acceptable filtering latency in milliseconds
-  filtering_latency_ms: 1
-
-# Editor-specific configurations (optional)
-editors: {}
-  # Example: VS Code configuration
-  # vscode:
-  #   preset: "balanced"
-  #   max_tools: 50
-  #
-  # Example: Zed configuration
-  # zed:
-  #   preset: "minimal"
-  #   max_tools: 30
-
-# Feature requirements (optional)
-feature_requirements: {}

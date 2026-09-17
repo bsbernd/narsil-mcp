@@ -38,8 +38,7 @@ Step-by-step guides for common development tasks:
 | Workflow | Description | Key Tools Used |
 |----------|-------------|----------------|
 | [Understand a Codebase](workflows/understand-codebase.md) | Explore an unfamiliar project | `get_project_structure`, `find_symbols`, `search_code`, `get_dependencies` |
-| [Fix a Bug](workflows/fix-a-bug.md) | Debug and trace issues | `search_code`, `get_callers`, `get_control_flow`, `trace_taint` |
-| [Security Audit](workflows/security-audit.md) | Find vulnerabilities | `scan_security`, `check_owasp_top10`, `trace_taint`, `check_dependencies` |
+| [Fix a Bug](workflows/fix-a-bug.md) | Debug and trace issues | `search_code`, `get_callers`, `get_control_flow`, `get_data_flow` |
 | [Code Review](workflows/code-review.md) | Review changes effectively | `get_modified_files`, `get_blame`, `get_callers`, `get_complexity` |
 
 ### Tool Chains
@@ -49,7 +48,6 @@ See exactly which tools Claude calls for different tasks:
 |------|------------|
 | "What does this function do?" | `find_symbols` → `get_symbol_definition` → `get_callers` |
 | "Find where X is used" | `find_references` → `find_symbol_usages` → `get_excerpt` |
-| "Is this code secure?" | `scan_security` → `trace_taint` → `suggest_fix` |
 | "Who wrote this?" | `get_blame` → `get_symbol_history` → `get_contributors` |
 
 ### Integrations
@@ -75,15 +73,13 @@ Claude decides when to use tools based on your questions. Examples:
 | "What functions are in auth.py?" | `find_symbols` |
 | "Find all SQL queries" | `search_code` |
 | "What calls this function?" | `get_callers` |
-| "Is there any XSS risk?" | `check_owasp_top10`, `trace_taint` |
 | "Show me the git history" | `get_file_history`, `get_blame` |
 
 ### "Do I need to tell Claude to use specific tools?"
 
 No. Claude automatically picks the right tools based on context. But you can be specific if you want:
 - "Use the call graph to show what calls `handleAuth`"
-- "Run an OWASP scan on the API routes"
-- "Generate an SBOM for this project"
+- "Show me the complexity of the API routes"
 
 ### "What makes this different from just reading files?"
 
@@ -94,7 +90,6 @@ narsil-mcp gives Claude **semantic understanding**:
 | Claude reads raw text | Claude understands symbols, types, relationships |
 | "grep for function name" | Cross-reference aware symbol search |
 | No call graph awareness | "What calls X?" / "What does X call?" |
-| Manual security review | Automated OWASP/CWE scanning with taint analysis |
 | Limited git context | Blame, history, hotspots, contributor analysis |
 
 ## Next Steps

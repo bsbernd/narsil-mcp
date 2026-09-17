@@ -8,11 +8,9 @@ A Claude Code plugin that provides code intelligence capabilities through the na
 
 | Command | Description |
 |---------|-------------|
-| `/narsil:security-scan [repo]` | Run a comprehensive security audit |
 | `/narsil:explore [repo]` | Explore and understand an unfamiliar codebase |
 | `/narsil:analyze-function <function>` | Deep dive analysis of a specific function |
 | `/narsil:find-feature <description>` | Find where a feature is implemented |
-| `/narsil:supply-chain [repo]` | Analyze supply chain security |
 
 ### Skill
 
@@ -111,24 +109,16 @@ cp -r narsil-mcp/narsil-plugin/* ~/.claude/plugins/narsil/
 
 ```shell
 /narsil:explore
-/narsil:security-scan
 /narsil:find-feature authentication
 ```
 
 Or just ask:
 ```
 Search for where authentication is implemented
-Run a security scan on this codebase
 Show me what calls the process_payment function
 ```
 
 ### Example Workflows
-
-**Security Audit:**
-```shell
-/narsil:security-scan myproject
-```
-Runs OWASP Top 10, CWE Top 25, dependency checks, and license compliance.
 
 **Understand a New Codebase:**
 ```shell
@@ -148,12 +138,6 @@ Semantically searches for where authentication is implemented.
 ```
 Shows callers, callees, complexity metrics, and refactoring suggestions.
 
-**Supply Chain Analysis:**
-```shell
-/narsil:supply-chain
-```
-Generates SBOM, checks for CVEs, and audits licenses.
-
 ## Configuration
 
 ### Customize MCP Server Options
@@ -169,13 +153,9 @@ Edit `.mcp.json` in the plugin directory to change server options:
         "--repos", "~/projects/myrepo",
         "--git",
         "--call-graph",
-        "--neural",
         "--persist",
         "--watch"
-      ],
-      "env": {
-        "VOYAGE_API_KEY": "your-key-here"
-      }
+      ]
     }
   }
 }
@@ -189,7 +169,6 @@ Edit `.mcp.json` in the plugin directory to change server options:
 | `--git` | Enable git blame/history tools |
 | `--call-graph` | Enable call graph analysis |
 | `--lsp` | Enable LSP integration |
-| `--neural` | Enable neural embeddings (requires API key) |
 | `--persist` | Save index to disk |
 | `--watch` | Auto-reindex on file changes |
 
@@ -237,11 +216,9 @@ narsil-plugin/
 ├── .claude-plugin/
 │   └── plugin.json         # Plugin manifest
 ├── commands/
-│   ├── security-scan.md    # /narsil:security-scan
 │   ├── explore.md          # /narsil:explore
 │   ├── analyze-function.md # /narsil:analyze-function
-│   ├── find-feature.md     # /narsil:find-feature
-│   └── supply-chain.md     # /narsil:supply-chain
+│   └── find-feature.md     # /narsil:find-feature
 ├── skills/
 │   └── narsil/
 │       ├── SKILL.md        # Main skill

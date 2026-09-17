@@ -20,17 +20,12 @@ Execute the following steps:
    - Use `find_symbols` with `symbol_type="class"` to find main data structures
    - Use `find_symbols` with `symbol_type="function"` and `pattern="*main*"` to find entry points
 
-5. **Understand dependencies**: Use `get_import_graph` to show how modules connect
+5. **Understand dependencies**: Use `get_dependencies` on the main files to show how modules connect
 
-6. **Check for issues**: Use `find_circular_imports` to identify potential architectural problems
-
-7. **Optional graph manifest** (only if `get_index_status` shows `--graph` enabled): Use `get_ccg_manifest` for a compact AI-context-friendly summary of repository identity, symbol counts, and security posture.
-
-8. **Summarize**: Provide a clear summary of:
+6. **Summarize**: Provide a clear summary of:
    - Project structure and organization
    - Key modules and their purposes
    - Entry points
-   - Any architectural concerns (circular deps, etc.)
 
 ## Arguments
 

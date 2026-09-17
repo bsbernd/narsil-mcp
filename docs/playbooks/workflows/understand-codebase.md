@@ -88,18 +88,16 @@ get_callers(repo: "myproject", function: "authenticate")
 
 ### Step 4: Map dependencies
 
-**You:** "What external libraries does this use? Are there any dependency issues?"
+**You:** "What external libraries does this use?"
 
 **Claude calls:**
 ```
 get_dependencies(repo: "myproject", path: "requirements.txt")
-check_dependencies(repo: "myproject")
-get_import_graph(repo: "myproject")
 ```
 
-**Result:** Claude sees all dependencies and their relationships.
+**Result:** Claude sees all dependencies.
 
-**Claude responds:** "The project uses Flask, SQLAlchemy, PyJWT, and Redis. I found one vulnerability in an older version of cryptography..."
+**Claude responds:** "The project uses Flask, SQLAlchemy, PyJWT, and Redis..."
 
 ---
 
@@ -131,7 +129,6 @@ find_call_path(repo: "myproject", from: "handle_order", to: "db_session.commit")
 | `search_code` | Full-text search across the codebase |
 | `get_file` | Read specific source files |
 | `get_dependencies` | Analyze imports and requirements |
-| `get_import_graph` | Visualize module dependencies |
 | `get_callers` | Find what calls a function |
 | `get_callees` | Find what a function calls |
 | `find_call_path` | Trace path between two functions |
@@ -162,5 +159,4 @@ find_call_path(repo: "myproject", from: "handle_order", to: "db_session.commit")
 ## Related Workflows
 
 - [Fix a Bug](fix-a-bug.md) - Now that you understand the code, debug an issue
-- [Security Audit](security-audit.md) - Check for vulnerabilities
 - [Code Review](code-review.md) - Review changes effectively

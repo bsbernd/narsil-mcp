@@ -12,7 +12,7 @@ Help locate where a specific feature or concept is implemented in the codebase.
 
 2. **Semantic search**: Use `hybrid_search` with the feature description to find semantically relevant code (combines BM25 + TF-IDF via Reciprocal Rank Fusion)
 
-3. **Symbol search**: Use `workspace_symbol_search` with key terms from the feature to find related symbols
+3. **Symbol search**: Use `find_symbols` with a glob pattern built from key terms of the feature to find related symbols
 
 4. **For promising candidates**:
    - Use `find_symbol_usages` to see how widely each candidate is used

@@ -16,7 +16,7 @@ The user should provide a function name. Parse $ARGUMENTS to extract:
 - Repository name (if provided)
 - Function name (required)
 
-1. **Find the function**: Use `workspace_symbol_search` to locate the function if the exact location is unknown
+1. **Find the function**: Use `find_symbols` to locate the function if the exact location is unknown
 
 2. **Get the source**: Use `get_symbol_definition` to read the function code
 

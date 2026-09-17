@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Everything outside the code, git and analysis tool groups.** This branch
+  is a plain code-indexing server: the security scanner and taint analysis,
+  supply-chain analysis (SBOM, licences, dependency and upgrade checks), the
+  CCG export and RDF/SPARQL knowledge graph, neural embeddings, remote GitHub
+  repositories, the WASM build, the lint tools (dead code, dead stores,
+  uninitialized variables, type inference and checking), the import-graph
+  tools and the chunk/similarity retrieval tools are gone, with the crates
+  and cargo features that served them. 42 tools remain.
+- **Tool presets and editor detection.** Tool selection is `--expose` /
+  `expose:` groups (`base`, `code`, `git`, `analysis`) intersected with the
+  engine's feature flags and per-tool `overrides:`. `NARSIL_PRESET`,
+  `preset:` in config files, the `config init` and `config preset`
+  subcommands, the neural setup wizard, the per-category `categories:`
+  section and the `performance:` tool cap are removed. `--preset` is still
+  accepted on the command line and ignored, so old launch configs still start.
+- **The `neural` slot of the heap report.** The lifetime stats file moves to
+  format v4; v3 files are migrated on load.
+
 ### Added
 
 - **Per-repo and per-group backend tuning in profiles**. A repo entry in a
@@ -547,11 +567,11 @@ narsil-mcp v1.1.0 introduces an intelligent tool selection and configuration sys
 
 Real-world impact on context window usage:
 
-| Preset | Tools | JSON Size | Tokens | Reduction |
-|--------|-------|-----------|--------|-----------|
-| Minimal | 26 | 18.3 KB | ~4,686 | **61% fewer** |
-| Balanced | 51 | 35.0 KB | ~8,948 | **25% fewer** |
-| Full | 69 | 46.9 KB | ~12,001 | baseline |
+| Preset   | Tools | JSON Size | Tokens  | Reduction     |
+|----------|-------|-----------|---------|---------------|
+| Minimal  | 26    | 18.3 KB   | ~4,686  | **61% fewer** |
+| Balanced | 51    | 35.0 KB   | ~8,948  | **25% fewer** |
+| Full     | 69    | 46.9 KB   | ~12,001 | baseline      |
 
 **Example:** Using Zed with Minimal preset saves **7,315 tokens** (61%) compared to Full preset!
 

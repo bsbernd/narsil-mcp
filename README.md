@@ -14,21 +14,13 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 | Feature | narsil-mcp | XRAY | Serena | GitHub MCP |
 |---------|------------|------|--------|------------|
 | **Languages** | 32 | 4 | 30+ (LSP) | N/A |
-| **Neural Search** | Yes | No | No | No |
-| **Taint Analysis** | Yes | No | No | No |
-| **SBOM/Licenses** | Yes | No | No | Partial |
 | **Offline/Local** | Yes | Yes | Yes | No |
-| **WASM/Browser** | Yes | No | No | No |
 | **Call Graphs** | Yes | Partial | No | No |
-| **Type Inference** | Yes | No | No | No |
 
 ## Key Features
 
 - **Code Intelligence** - Symbol extraction, semantic search, call graph analysis
-- **Neural Semantic Search** - Find similar code using embeddings (Voyage AI, OpenAI)
-- **Security Analysis** - Taint analysis, vulnerability scanning, OWASP/CWE coverage
-- **Supply Chain Security** - SBOM generation, dependency auditing, license compliance
-- **Advanced Analysis** - Control flow graphs, data flow analysis, dead code detection
+- **Analysis** - Control flow graphs, data flow analysis, complexity and hotspots
 
 ### Why Choose narsil-mcp?
 
@@ -39,9 +31,6 @@ A Rust-powered MCP (Model Context Protocol) server providing AI assistants with 
 - **Privacy-first** - Fully local, no data leaves your machine
 - **Parallel indexing** - Uses all cores via Rayon
 - **Smart excerpts** - Expands to complete syntactic scopes
-- **Security-first** - Built-in vulnerability detection and taint analysis
-- **Neural embeddings** - Optional semantic search with Voyage AI or OpenAI
-- **WASM support** - Run in browser with WebAssembly build
 - **Real-time streaming** - Results as indexing progresses for large repos
 
 ## Supported Languages
@@ -169,35 +158,14 @@ narsil-mcp supports different feature sets for different use cases:
 # Default build - native MCP server (~30MB)
 cargo build --release
 
-# With RDF knowledge graph and CCG tools (~35MB) - SPARQL queries, Code Context Graph
-cargo build --release --features graph
-
-# With neural vector search (~32MB) - adds TF-IDF similarity
-cargo build --release --features neural
-
-# With ONNX model support (~50MB) - adds local neural embeddings
-cargo build --release --features neural-onnx
-
 # With embedded visualization frontend (~31MB)
 cargo build --release --features frontend
-
-# Full-featured build with graph + frontend (~40MB)
-cargo build --release --features graph,frontend
-
-# For browser/WASM usage
-cargo build --release --target wasm32-unknown-unknown --features wasm
 ```
 
 | Feature | Description | Size |
 |---------|-------------|------|
 | `native` (default) | Full MCP server with all tools | ~30MB |
-| `graph` | + RDF knowledge graph, SPARQL, CCG tools | ~35MB |
 | `frontend` | + Embedded visualization web UI | ~31MB |
-| `neural` | + TF-IDF vector search, API embeddings | ~32MB |
-| `neural-onnx` | + Local ONNX model inference | ~50MB |
-| `wasm` | Browser build (no file system, git) | ~3MB |
-
-> **Important:** The `--graph` CLI flag requires the binary to be built with `--features graph`. If you pass `--graph` to a binary built without this feature, you'll see a warning and SPARQL/CCG tools won't be available. See [Troubleshooting](#graph-feature-not-working) below.
 
 > **For detailed installation instructions, troubleshooting, and platform-specific guides**, see [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -245,39 +213,8 @@ narsil-mcp \
   --persist \       # Save index to disk for fast startup
   --watch \         # Auto-reindex on file changes
   --lsp \           # Enable LSP for hover, go-to-definition
-  --streaming \     # Stream large result sets
-  --remote \        # Enable GitHub remote repo support
-  --neural \        # Enable neural semantic embeddings
-  --neural-backend api \  # Backend: "api" (Voyage/OpenAI) or "onnx"
-  --neural-model voyage-code-2 \  # Model to use
-  --neural-dimension 3072 \  # Override embedding dimensions (auto-detected per model)
-  --graph           # Enable SPARQL/RDF knowledge graph and CCG tools (requires --features graph build)
+  --streaming       # Stream large result sets
 ```
-
-> **Note about `--graph`:** This flag enables SPARQL queries and Code Context Graph (CCG) tools, but **only if the binary was built with `--features graph`**. The default binary does not include this feature. If you need SPARQL/CCG capabilities, build from source with:
-> ```bash
-> cargo build --release --features graph
-> ```
-> If you pass `--graph` to a binary without the feature, you'll see a warning at startup and the server will continue without SPARQL/CCG tools.
-
-**Note:** Neural embeddings require an API key (or custom endpoint). The easiest way to set this up is with the interactive wizard:
-
-```bash
-# Run the neural API key setup wizard
-narsil-mcp config init --neural
-```
-
-The wizard will:
-- Detect your editor (Claude Desktop, Claude Code, Zed, VS Code, JetBrains)
-- Prompt for your API provider (Voyage AI, OpenAI, or custom)
-- Validate your API key
-- Automatically add it to your editor's MCP config
-
-Alternatively, you can manually set one of these environment variables:
-- `EMBEDDING_API_KEY` - Generic API key for any provider
-- `VOYAGE_API_KEY` - Voyage AI specific API key
-- `OPENAI_API_KEY` - OpenAI specific API key
-- `EMBEDDING_SERVER_ENDPOINT` - Custom embedding API endpoint URL (optional, allows using self-hosted models)
 
 ### Configuration
 
@@ -286,46 +223,11 @@ Alternatively, you can manually set one of these environment variables:
 #### Quick Start
 
 ```bash
-# Generate default config interactively
-narsil-mcp config init
-
 # List available tools
 narsil-mcp tools list
 
-# Apply a preset via CLI
-narsil-mcp --repos ~/project --preset minimal
-```
-
-#### Automatic Editor Detection
-
-narsil-mcp detects your editor and applies an optimal preset automatically:
-
-| Editor | Preset | Tools | Context Tokens | Why |
-|--------|--------|-------|----------------|-----|
-| **Zed** | Minimal | 26 | ~4,686 | Fast startup, minimal context |
-| **VS Code** | Balanced | 51 | ~8,948 | Good feature balance |
-| **Claude Desktop** | Full | 90 | ~12,001 | Maximum capabilities |
-
-**Token Savings:**
-- **Minimal preset:** 61% fewer tokens vs Full
-- **Balanced preset:** 25% fewer tokens vs Full
-
-#### Presets
-
-Choose a preset based on your use case:
-
-```bash
-# Minimal - Fast, lightweight (Zed, Cursor)
-narsil-mcp --repos ~/project --preset minimal
-
-# Balanced - Good defaults (VS Code, IntelliJ)
-narsil-mcp --repos ~/project --preset balanced --git --call-graph
-
-# Full - All features (Claude Desktop, comprehensive analysis)
-narsil-mcp --repos ~/project --preset full --git --call-graph
-
-# Security-focused - Security and supply chain tools
-narsil-mcp --repos ~/project --preset security-focused
+# Expose only the code and git tool groups
+narsil-mcp --repos ~/project --expose code,git
 ```
 
 #### Configuration Files
@@ -334,31 +236,21 @@ narsil-mcp --repos ~/project --preset security-focused
 
 ```yaml
 version: "1.0"
-preset: "balanced"
+expose: [code, git]
 
 tools:
   # Disable slow tools
   overrides:
-    neural_search:
+    semantic_search:
       enabled: false
       reason: "Too slow for interactive use"
-
-performance:
-  max_tool_count: 50  # Limit total tools
 ```
 
 **Project config** (`.narsil.yaml` in repo root):
 
 ```yaml
 version: "1.0"
-preset: "security-focused"  # Override user preset
-
-tools:
-  categories:
-    Security:
-      enabled: true
-    SupplyChain:
-      enabled: true
+expose: [code, git, analysis]  # Override the user config's groups
 ```
 
 **Named repository profiles** are useful for multi-repo workspaces:
@@ -373,7 +265,7 @@ profiles:
     git: true
     call_graph: true
     persist: true
-    preset: balanced
+    expose: [code, git]
 ```
 
 ```bash
@@ -390,14 +282,11 @@ narsil-mcp config profiles
 export NARSIL_REPOS=~/src/api,~/src/web
 export NARSIL_PROFILE=platform
 
-# Apply preset
-export NARSIL_PRESET=minimal
-
-# Enable specific categories
-export NARSIL_ENABLED_CATEGORIES=Repository,Symbols,Search
+# Expose only these tool groups
+export NARSIL_EXPOSE=code,git
 
 # Disable specific tools
-export NARSIL_DISABLED_TOOLS=neural_search,generate_sbom
+export NARSIL_DISABLED_TOOLS=semantic_search,get_call_graph
 ```
 
 #### CLI Commands
@@ -453,7 +342,6 @@ narsil-mcp --repos ~/project --http --call-graph
 **Features:**
 - Interactive Cytoscape.js graphs with drag, zoom, and double-click drill-down
 - Complexity metrics overlay with color coding (green/yellow/orange/red)
-- Security vulnerability overlay highlighting taint sources and sinks
 - Six layout algorithms (dagre, force-directed, breadthfirst, concentric, circle, grid)
 - File tree sidebar with syntax-highlighted code viewer
 - URL-driven state (shareable links, browser back/forward)
@@ -461,40 +349,6 @@ narsil-mcp --repos ~/project --http --call-graph
 - Node detail panel with code excerpts and navigation to source
 
 > **Full documentation:** See [docs/frontend.md](docs/frontend.md) for setup, API endpoints, and development mode.
-
-### Neural Semantic Search
-
-Find similar code using neural embeddings - even when variable names and structure differ.
-
-```bash
-# Quick setup with wizard
-narsil-mcp config init --neural
-
-# Or manually with Voyage AI
-export VOYAGE_API_KEY="your-key"
-narsil-mcp --repos ~/project --neural --neural-model voyage-code-2
-```
-
-Supports Voyage AI, OpenAI, custom endpoints, and local ONNX models.
-
-> **Full documentation:** See [docs/neural-search.md](docs/neural-search.md) for setup, backends, and use cases.
-
-### Type Inference
-
-Built-in type inference for Python, JavaScript, and TypeScript - no mypy or tsc required.
-
-| Tool | Description |
-|------|-------------|
-| `infer_types` | Get inferred types for all variables in a function |
-| `check_type_errors` | Find potential type mismatches |
-| `get_typed_taint_flow` | Enhanced security analysis with type info |
-
-```python
-def process(data):
-    result = data.split(",")  # result: list[str]
-    count = len(result)       # count: int
-    return count * 2          # returns: int
-```
 
 ### Forgemax Integration (Experimental)
 
@@ -640,41 +494,13 @@ For **Claude Code** users, we provide a plugin with slash commands and a skill f
 
 | Component | Description |
 |-----------|-------------|
-| `/narsil:security-scan` | Run comprehensive security audits |
 | `/narsil:explore` | Explore unfamiliar codebases |
 | `/narsil:analyze-function` | Deep dive on specific functions |
 | `/narsil:find-feature` | Find where features are implemented |
-| `/narsil:supply-chain` | Analyze supply chain security |
-| **Skill** | Guides Claude on using 90 tools effectively |
+| **Skill** | Guides Claude on using the tools effectively |
 | **MCP Config** | Auto-starts narsil-mcp with sensible defaults |
 
 See [narsil-plugin/README.md](narsil-plugin/README.md) for full documentation.
-
-### Ralph Automation Integration
-
-[Ralph](https://github.com/postrv/ralphing-la-vida-locum) is a Claude Code automation suite for autonomous code development. When narsil-mcp is available, Ralph gains enhanced code intelligence capabilities:
-
-| Feature | Without narsil-mcp | With narsil-mcp |
-|---------|-------------------|-----------------|
-| Security scanning | Basic (clippy) | OWASP/CWE vulnerability detection |
-| Code understanding | File-based | Call graphs, symbol references |
-| Architecture analysis | Manual | CCG L0/L1/L2 automatic layers |
-| Dependency analysis | cargo tree | Import graphs, circular detection |
-
-**Setup:**
-```bash
-# Install narsil-mcp (Ralph auto-detects it)
-cargo install narsil-mcp
-
-# Ralph's quality gates use these tools:
-narsil-mcp scan_security --repo <name>
-narsil-mcp check_type_errors --repo <name> --path src
-narsil-mcp find_injection_vulnerabilities --repo <name>
-```
-
-Ralph gracefully degrades when narsil-mcp is unavailable - all core automation features work without it.
-
-> **Documentation:** See [Ralph README](https://github.com/postrv/ralphing-la-vida-locum) for full integration details.
 
 ### Playbooks & Tutorials
 
@@ -684,32 +510,12 @@ See **[docs/playbooks](docs/playbooks/)** for practical usage guides:
 |-------|-------------|
 | [Getting Started](docs/playbooks/getting-started.md) | Quick setup and first tool calls |
 | [Understand a Codebase](docs/playbooks/workflows/understand-codebase.md) | Explore unfamiliar projects |
-| [Fix a Bug](docs/playbooks/workflows/fix-a-bug.md) | Debug with call graphs and taint analysis |
-| [Security Audit](docs/playbooks/workflows/security-audit.md) | Find vulnerabilities with OWASP/CWE scanning |
+| [Fix a Bug](docs/playbooks/workflows/fix-a-bug.md) | Debug with call graphs |
 | [Code Review](docs/playbooks/workflows/code-review.md) | Review changes effectively |
 
 Each playbook shows the exact tool chains Claude uses to answer your questions.
 
-### WebAssembly (Browser) Usage
-
-narsil-mcp can run entirely in the browser via WebAssembly - perfect for browser-based IDEs, code review tools, or educational platforms.
-
-```bash
-npm install @narsil-mcp/wasm
-```
-
-```typescript
-import { CodeIntelClient } from '@narsil-mcp/wasm';
-
-const client = new CodeIntelClient();
-await client.init();
-client.indexFile('src/main.rs', rustSourceCode);
-const symbols = client.findSymbols('Handler');
-```
-
-> **Full documentation:** See [docs/wasm.md](docs/wasm.md) for build instructions, React examples, and API reference.
-
-## Available Tools (90)
+## Available Tools (42)
 
 ### Repository & File Management
 
@@ -732,7 +538,6 @@ const symbols = client.findSymbols('Handler');
 | `get_symbol_definition` | Get symbol source with surrounding context |
 | `find_references` | Find all references to a symbol |
 | `get_dependencies` | Analyze imports and dependents |
-| `workspace_symbol_search` | Fuzzy search symbols across workspace |
 | `find_symbol_usages` | Cross-file symbol usage with imports |
 | `get_export_map` | Get exported symbols from a file/module |
 
@@ -743,25 +548,6 @@ const symbols = client.findSymbols('Handler');
 | `search_code` | Keyword search with relevance ranking |
 | `semantic_search` | BM25-ranked semantic search |
 | `hybrid_search` | Combined BM25 + TF-IDF with rank fusion |
-| `search_chunks` | Search over AST-aware code chunks |
-| `find_similar_code` | Find code similar to a snippet (TF-IDF) |
-| `find_similar_to_symbol` | Find code similar to a symbol |
-
-### AST-Aware Chunking
-
-| Tool | Description |
-|------|-------------|
-| `get_chunks` | Get AST-aware chunks for a file |
-| `get_chunk_stats` | Statistics about code chunks |
-| `get_embedding_stats` | Embedding index statistics |
-
-### Neural Semantic Search (requires `--neural`)
-
-| Tool | Description |
-|------|-------------|
-| `neural_search` | Semantic search using neural embeddings (finds similar code even with different names) |
-| `find_semantic_clones` | Find Type-3/4 semantic clones of a function |
-| `get_neural_stats` | Neural embedding index statistics |
 
 ### Call Graph Analysis (requires `--call-graph`)
 
@@ -779,7 +565,6 @@ const symbols = client.findSymbols('Handler');
 | Tool | Description |
 |------|-------------|
 | `get_control_flow` | Get CFG showing basic blocks and branches |
-| `find_dead_code` | Find unreachable code blocks |
 
 ### Data Flow Analysis
 
@@ -787,52 +572,6 @@ const symbols = client.findSymbols('Handler');
 |------|-------------|
 | `get_data_flow` | Variable definitions and uses |
 | `get_reaching_definitions` | Which assignments reach each point |
-| `find_uninitialized` | Variables used before initialization |
-| `find_dead_stores` | Assignments that are never read |
-
-### Type Inference (Python/JavaScript/TypeScript)
-
-| Tool | Description |
-|------|-------------|
-| `infer_types` | Infer types for variables in a function without external type checkers |
-| `check_type_errors` | Find potential type errors without running mypy/tsc |
-| `get_typed_taint_flow` | Enhanced taint analysis combining data flow with type inference |
-
-### Import/Dependency Graph
-
-| Tool | Description |
-|------|-------------|
-| `get_import_graph` | Build and analyze import graph |
-| `find_circular_imports` | Detect circular dependencies |
-| `get_incremental_status` | Merkle tree and change statistics |
-
-### Security Analysis - Taint Tracking
-
-| Tool | Description |
-|------|-------------|
-| `find_injection_vulnerabilities` | Find SQL injection, XSS, command injection, path traversal |
-| `trace_taint` | Trace tainted data flow from a source |
-| `get_taint_sources` | List taint sources (user input, files, network) |
-| `get_security_summary` | Comprehensive security risk assessment |
-
-### Security Analysis - Rules Engine
-
-| Tool | Description |
-|------|-------------|
-| `scan_security` | Scan with security rules (OWASP, CWE, crypto, secrets) |
-| `check_owasp_top10` | Scan for OWASP Top 10 2021 vulnerabilities |
-| `check_cwe_top25` | Scan for CWE Top 25 weaknesses |
-| `explain_vulnerability` | Get detailed vulnerability explanation |
-| `suggest_fix` | Get remediation suggestions for findings |
-
-### Supply Chain Security
-
-| Tool | Description |
-|------|-------------|
-| `generate_sbom` | Generate SBOM (CycloneDX/SPDX/JSON) |
-| `check_dependencies` | Check for known vulnerabilities (OSV database) |
-| `check_licenses` | Analyze licenses for compliance issues |
-| `find_upgrade_path` | Find safe upgrade paths for vulnerable deps |
 
 ### Git Integration (requires `--git`)
 
@@ -856,70 +595,11 @@ const symbols = client.findSymbols('Handler');
 | `get_type_info` | Precise type information |
 | `go_to_definition` | Find definition location |
 
-### Remote Repository Support (requires `--remote`)
-
-| Tool | Description |
-|------|-------------|
-| `add_remote_repo` | Clone and index GitHub repository |
-| `list_remote_files` | List files via GitHub API |
-| `get_remote_file` | Fetch file via GitHub API |
-
 ### Metrics
 
 | Tool | Description |
 |------|-------------|
 | `get_metrics` | Performance stats and timing |
-
-### SPARQL / Knowledge Graph (requires `--graph`)
-
-| Tool | Description |
-|------|-------------|
-| `sparql_query` | Execute SPARQL query against RDF knowledge graph |
-| `list_sparql_templates` | List available SPARQL query templates |
-| `run_sparql_template` | Execute predefined SPARQL template with parameters |
-
-### Code Context Graph (CCG) (requires `--graph`)
-
-CCG provides standardized, AI-consumable representations of codebases in tiered layers.
-
-| Tool | Description |
-|------|-------------|
-| `get_ccg_manifest` | Layer 0 manifest (~1-2KB JSON-LD) - repo identity, counts |
-| `export_ccg_manifest` | Export Layer 0 manifest to file |
-| `export_ccg_architecture` | Layer 1 architecture (~10-50KB JSON-LD) - modules, API |
-| `export_ccg_index` | Layer 2 symbol index (~100-500KB N-Quads gzipped) |
-| `export_ccg_full` | Layer 3 full detail (~1-20MB N-Quads gzipped) |
-| `export_ccg` | Export all CCG layers as a bundle |
-| `query_ccg` | Query CCG using SPARQL |
-| `get_ccg_acl` | Generate WebACL access control for CCG layers |
-| `get_ccg_access_info` | Get CCG access tier information |
-| `import_ccg` | Import CCG layer from URL or file |
-| `import_ccg_from_registry` | Import CCG from codecontextgraph.com registry |
-
-## Security Rules
-
-narsil-mcp includes built-in security rules in `rules/`:
-
-**Core Rulesets:**
-- **`owasp-top10.yaml`** - OWASP Top 10 2021 vulnerability patterns
-- **`cwe-top25.yaml`** - CWE Top 25 Most Dangerous Weaknesses
-- **`crypto.yaml`** - Cryptographic issues (weak algorithms, hardcoded keys)
-- **`secrets.yaml`** - Secret detection (API keys, passwords, tokens)
-
-**Language-Specific Rules:**
-- **`rust.yaml`** - Rust security patterns (unsafe transmute, FFI boundaries, command injection, TOCTOU)
-- **`elixir.yaml`** - Elixir/BEAM patterns (atom exhaustion, binary_to_term, Code.eval, Ecto SQL injection)
-- **`go.yaml`** - Go security patterns (SQL injection, TLS, command injection)
-- **`java.yaml`** - Java vulnerabilities (XXE, deserialization, LDAP injection)
-- **`csharp.yaml`** - C# security issues (deserialization, XSS, path traversal)
-- **`kotlin.yaml`** - Kotlin/Android patterns (WebView, intents, secrets)
-- **`bash.yaml`** - Shell script vulnerabilities (command injection, eval)
-
-**Infrastructure & Configuration:**
-- **`iac.yaml`** - Infrastructure as Code (Terraform, CloudFormation, Kubernetes)
-- **`config.yaml`** - Configuration file security (hardcoded credentials, insecure settings)
-
-Custom rules can be loaded with `scan_security --ruleset /path/to/rules.yaml`.
 
 ## Architecture
 
@@ -937,10 +617,10 @@ Custom rules can be loaded with `scan_security --ruleset /path/to/rules.yaml`.
 |  |  |  Index     | |   Cache    | |  (Tantivy + TF-IDF)    |  |  |
 |  |  | (DashMap)  | | (DashMap)  | +------------------------+  |  |
 |  |  +------------+ +------------+                              |  |
-|  |  +------------+ +------------+ +------------------------+  |  |
-|  |  | Call Graph | |  Taint     | |   Security Rules       |  |  |
-|  |  |  Analysis  | |  Tracker   | |   Engine               |  |  |
-|  |  +------------+ +------------+ +------------------------+  |  |
+|  |  +------------+ +------------+                              |  |
+|  |  | Call Graph | |  CFG/DFG   |                              |  |
+|  |  |  Analysis  | |  Analysis  |                              |  |
+|  |  +------------+ +------------+                              |  |
 |  +-----------------------------------------------------------+  |
 |                              |                                   |
 |  +---------------------------v-------------------------------+  |
@@ -1030,20 +710,6 @@ xcode-select --install
 
 # Ubuntu/Debian
 sudo apt install build-essential
-
-# For WASM builds
-brew install emscripten  # macOS
-```
-
-### Neural Search API Errors
-
-```bash
-# Check your API key is set
-echo $VOYAGE_API_KEY  # or $OPENAI_API_KEY
-
-# Common issue: wrong key format
-export VOYAGE_API_KEY="pa-..."  # Voyage keys start with "pa-"
-export OPENAI_API_KEY="sk-..."  # OpenAI keys start with "sk-"
 ```
 
 ### Index Not Finding Files
@@ -1065,33 +731,6 @@ RUST_MIN_STACK=8388608 narsil-mcp --repos /path/to/huge-repo
 # Or index specific subdirectories
 narsil-mcp --repos /path/to/repo/src --repos /path/to/repo/lib
 ```
-
-### Graph Feature Not Working
-
-If you pass `--graph` and see a warning like:
-```
-WARN: --graph flag was passed but the binary was built without the 'graph' feature.
-SPARQL and CCG tools will not be available.
-```
-
-This means you're using a binary that wasn't compiled with the `graph` feature. To fix:
-
-```bash
-# Build from source with the graph feature
-cargo build --release --features graph
-
-# Or with multiple features
-cargo build --release --features graph,frontend
-
-# Then run with --graph
-./target/release/narsil-mcp --repos ~/project --graph
-```
-
-**Why is this a separate feature?** The `graph` feature adds the Oxigraph RDF database (~5MB additional binary size) which isn't needed for most use cases. It's kept optional to keep the default binary smaller.
-
-**How to check if graph is enabled:** Look at the startup logs:
-- `graph=true` means the feature is compiled in AND enabled
-- `graph=false` means either the feature isn't compiled, OR `--graph` wasn't passed
 
 ## Roadmap
 

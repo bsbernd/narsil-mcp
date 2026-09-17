@@ -54,7 +54,6 @@ All configs support these command-line arguments:
 | `--call-graph` | Enable call graph analysis | Yes |
 | `--persist` | Save index to disk | For large repos |
 | `--watch` | Auto-reindex on file changes | For development |
-| `--neural` | Enable semantic embeddings | If API key available |
 | `--streaming` | Stream large results | For huge repos |
 
 ## Full-Featured Configuration
@@ -82,25 +81,6 @@ For maximum capability, use this configuration:
   }
 }
 ```
-
-## Neural Embeddings Setup
-
-To enable semantic code search with neural embeddings:
-
-1. Get an API key from [Voyage AI](https://www.voyageai.com/) or [OpenAI](https://platform.openai.com/)
-2. Add to your config's `env` section:
-
-```json
-{
-  "env": {
-    "VOYAGE_API_KEY": "your-voyage-key",
-    // OR
-    "OPENAI_API_KEY": "your-openai-key"
-  }
-}
-```
-
-3. Add `--neural` and `--neural-backend api` to args
 
 ## Troubleshooting
 

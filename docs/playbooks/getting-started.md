@@ -116,9 +116,6 @@ Now ask questions about your code:
 
 "Show me the git history for config.py"
 → Claude calls get_file_history
-
-"Are there any security vulnerabilities?"
-→ Claude calls scan_security
 ```
 
 ## Command-Line Flags
@@ -131,7 +128,6 @@ Enable features with flags:
 | `--call-graph` | Call graph analysis, callers/callees, complexity |
 | `--persist` | Save index to disk for faster startup |
 | `--watch` | Auto-reindex when files change |
-| `--neural` | Neural embeddings for semantic search (requires API key) |
 | `--lsp` | LSP integration for precise type info |
 
 Recommended starter config:
@@ -171,5 +167,4 @@ RUST_LOG=debug narsil-mcp --repos /path/to/project
 ## Next Steps
 
 - [Understand a Codebase](workflows/understand-codebase.md) - Explore an unfamiliar project
-- [Fix a Bug](workflows/fix-a-bug.md) - Debug with call graphs and taint analysis
-- [Security Audit](workflows/security-audit.md) - Find vulnerabilities
+- [Fix a Bug](workflows/fix-a-bug.md) - Debug with call graphs
