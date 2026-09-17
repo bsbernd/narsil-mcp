@@ -1,14 +1,21 @@
-narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
+narsil-mcp v1.7.0 (/home/bernd/src/mcp/narsil-mcp)
 ├── anyhow v1.0.102
+├── async-stream v0.3.6
+│   ├── async-stream-impl v0.3.6 (proc-macro)
+│   │   ├── proc-macro2 v1.0.106
+│   │   │   └── unicode-ident v1.0.24
+│   │   ├── quote v1.0.45
+│   │   │   └── proc-macro2 v1.0.106 (*)
+│   │   └── syn v2.0.117
+│   │       ├── proc-macro2 v1.0.106 (*)
+│   │       ├── quote v1.0.45 (*)
+│   │       └── unicode-ident v1.0.24
+│   ├── futures-core v0.3.32
+│   └── pin-project-lite v0.2.17
 ├── async-trait v0.1.89 (proc-macro)
-│   ├── proc-macro2 v1.0.106
-│   │   └── unicode-ident v1.0.24
-│   ├── quote v1.0.45
-│   │   └── proc-macro2 v1.0.106 (*)
-│   └── syn v2.0.117
-│       ├── proc-macro2 v1.0.106 (*)
-│       ├── quote v1.0.45 (*)
-│       └── unicode-ident v1.0.24
+│   ├── proc-macro2 v1.0.106 (*)
+│   ├── quote v1.0.45 (*)
+│   └── syn v2.0.117 (*)
 ├── axum v0.7.9
 │   ├── async-trait v0.1.89 (proc-macro) (*)
 │   ├── axum-core v0.4.5
@@ -150,27 +157,18 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   │   ├── pin-project-lite v0.2.17
 │   │   ├── sync_wrapper v1.0.2 (*)
 │   │   ├── tokio v1.52.3 (*)
-│   │   ├── tokio-util v0.7.18
-│   │   │   ├── bytes v1.11.1
-│   │   │   ├── futures-core v0.3.32
-│   │   │   ├── futures-sink v0.3.32
-│   │   │   ├── pin-project-lite v0.2.17
-│   │   │   └── tokio v1.52.3 (*)
 │   │   ├── tower-layer v0.3.3
 │   │   ├── tower-service v0.3.3
 │   │   └── tracing v0.1.44 (*)
 │   ├── tower-layer v0.3.3
 │   ├── tower-service v0.3.3
 │   └── tracing v0.1.44 (*)
-├── base64 v0.21.7
 ├── chrono v0.4.44
 │   ├── iana-time-zone v0.1.65
-│   │   └── core-foundation-sys v0.8.7
-│   ├── num-traits v0.2.19
-│   │   └── libm v0.2.16
-│   │   [build-dependencies]
-│   │   └── autocfg v1.5.0
-│   └── serde v1.0.228 (*)
+│   └── num-traits v0.2.19
+│       └── libm v0.2.16
+│       [build-dependencies]
+│       └── autocfg v1.5.0
 ├── clap v4.6.1
 │   ├── clap_builder v4.6.0
 │   │   ├── anstream v1.0.0
@@ -189,23 +187,6 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │       ├── proc-macro2 v1.0.106 (*)
 │       ├── quote v1.0.45 (*)
 │       └── syn v2.0.117 (*)
-├── console_error_panic_hook v0.1.7
-│   ├── cfg-if v1.0.4
-│   └── wasm-bindgen v0.2.121
-│       ├── cfg-if v1.0.4
-│       ├── once_cell v1.21.4
-│       ├── wasm-bindgen-macro v0.2.121 (proc-macro)
-│       │   ├── quote v1.0.45 (*)
-│       │   └── wasm-bindgen-macro-support v0.2.121
-│       │       ├── bumpalo v3.20.2
-│       │       ├── proc-macro2 v1.0.106 (*)
-│       │       ├── quote v1.0.45 (*)
-│       │       ├── syn v2.0.117 (*)
-│       │       └── wasm-bindgen-shared v0.2.121
-│       │           └── unicode-ident v1.0.24
-│       └── wasm-bindgen-shared v0.2.121 (*)
-│       [build-dependencies]
-│       └── rustversion v1.0.22 (proc-macro)
 ├── dashmap v6.1.0
 │   ├── cfg-if v1.0.4
 │   ├── crossbeam-utils v0.8.21
@@ -217,16 +198,35 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   └── dirs-sys v0.4.1
 │       ├── libc v0.2.186
 │       └── option-ext v0.2.0
-├── flate2 v1.1.9
-│   ├── crc32fast v1.5.0
-│   │   └── cfg-if v1.0.4
-│   └── miniz_oxide v0.8.9
-│       ├── adler2 v2.0.1
-│       └── simd-adler32 v0.3.9
-├── getrandom v0.2.17
-│   ├── cfg-if v1.0.4
-│   └── libc v0.2.186
+├── fs4 v0.13.1
+│   └── rustix v1.1.4
+│       ├── bitflags v2.11.1
+│       └── linux-raw-sys v0.12.1
+├── futures v0.3.32
+│   ├── futures-channel v0.3.32 (*)
+│   ├── futures-core v0.3.32
+│   ├── futures-executor v0.3.32
+│   │   ├── futures-core v0.3.32
+│   │   ├── futures-task v0.3.32
+│   │   └── futures-util v0.3.32 (*)
+│   ├── futures-io v0.3.32
+│   ├── futures-sink v0.3.32
+│   ├── futures-task v0.3.32
+│   └── futures-util v0.3.32 (*)
 ├── glob v0.3.3
+├── hdrhistogram v7.5.4
+│   ├── base64 v0.21.7
+│   ├── byteorder v1.5.0
+│   ├── flate2 v1.1.9
+│   │   ├── crc32fast v1.5.0
+│   │   │   └── cfg-if v1.0.4
+│   │   └── miniz_oxide v0.8.9
+│   │       ├── adler2 v2.0.1
+│   │       └── simd-adler32 v0.3.9
+│   ├── nom v7.1.3
+│   │   ├── memchr v2.8.0
+│   │   └── minimal-lexical v0.2.1
+│   └── num-traits v0.2.19 (*)
 ├── ignore v0.4.25
 │   ├── crossbeam-deque v0.8.6
 │   │   ├── crossbeam-epoch v0.9.18
@@ -249,11 +249,6 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── same-file v1.0.6
 │   └── walkdir v2.5.0
 │       └── same-file v1.0.6
-├── js-sys v0.3.98
-│   ├── cfg-if v1.0.4
-│   ├── futures-util v0.3.32 (*)
-│   ├── once_cell v1.21.4
-│   └── wasm-bindgen v0.2.121 (*)
 ├── lazy_static v1.5.0
 ├── lsp-server v0.7.9
 │   ├── crossbeam-channel v0.5.15
@@ -342,421 +337,43 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │       └── serde_derive v1.0.228 (proc-macro) (*)
 ├── memmap2 v0.9.10
 │   └── libc v0.2.186
-├── mime_guess v2.0.5
-│   ├── mime v0.3.17
-│   └── unicase v2.9.0
-│   [build-dependencies]
-│   └── unicase v2.9.0
-├── ndarray v0.17.2
-│   ├── matrixmultiply v0.3.10
-│   │   └── rawpointer v0.2.1
-│   │   [build-dependencies]
-│   │   └── autocfg v1.5.0
-│   ├── num-complex v0.4.6
-│   │   └── num-traits v0.2.19 (*)
-│   ├── num-integer v0.1.46
-│   │   └── num-traits v0.2.19 (*)
-│   ├── num-traits v0.2.19 (*)
-│   └── rawpointer v0.2.1
 ├── notify v6.1.1
-│   ├── bitflags v2.11.1
 │   ├── crossbeam-channel v0.5.15 (*)
 │   ├── filetime v0.2.28
 │   │   ├── cfg-if v1.0.4
 │   │   └── libc v0.2.186
-│   ├── fsevent-sys v4.1.0
+│   ├── inotify v0.9.6
+│   │   ├── bitflags v1.3.2
+│   │   ├── inotify-sys v0.1.5
+│   │   │   └── libc v0.2.186
 │   │   └── libc v0.2.186
 │   ├── libc v0.2.186
 │   ├── log v0.4.29
+│   ├── mio v0.8.11
+│   │   ├── libc v0.2.186
+│   │   └── log v0.4.29
 │   └── walkdir v2.5.0 (*)
-├── octocrab v0.50.0
-│   ├── arc-swap v1.9.1
-│   │   └── rustversion v1.0.22 (proc-macro)
-│   ├── async-trait v0.1.89 (proc-macro) (*)
-│   ├── base64 v0.22.1
-│   ├── bytes v1.11.1
-│   ├── cfg-if v1.0.4
-│   ├── chrono v0.4.44 (*)
-│   ├── futures v0.3.32
-│   │   ├── futures-channel v0.3.32 (*)
-│   │   ├── futures-core v0.3.32
-│   │   ├── futures-executor v0.3.32
-│   │   │   ├── futures-core v0.3.32
-│   │   │   ├── futures-task v0.3.32
-│   │   │   └── futures-util v0.3.32 (*)
-│   │   ├── futures-io v0.3.32
-│   │   ├── futures-sink v0.3.32
-│   │   ├── futures-task v0.3.32
-│   │   └── futures-util v0.3.32 (*)
-│   ├── futures-util v0.3.32 (*)
-│   ├── getrandom v0.2.17 (*)
-│   ├── http v1.4.0 (*)
-│   ├── http-body v1.0.1 (*)
-│   ├── http-body-util v0.1.3 (*)
-│   ├── hyper v1.9.0 (*)
-│   ├── hyper-rustls v0.27.9
-│   │   ├── http v1.4.0 (*)
-│   │   ├── hyper v1.9.0 (*)
-│   │   ├── hyper-util v0.1.20 (*)
-│   │   ├── log v0.4.29
-│   │   ├── rustls v0.23.40
-│   │   │   ├── log v0.4.29
-│   │   │   ├── once_cell v1.21.4
-│   │   │   ├── ring v0.17.14
-│   │   │   │   ├── cfg-if v1.0.4
-│   │   │   │   ├── getrandom v0.2.17 (*)
-│   │   │   │   ├── libc v0.2.186
-│   │   │   │   └── untrusted v0.9.0
-│   │   │   │   [build-dependencies]
-│   │   │   │   └── cc v1.2.62
-│   │   │   │       ├── find-msvc-tools v0.1.9
-│   │   │   │       ├── jobserver v0.1.34
-│   │   │   │       │   └── libc v0.2.186
-│   │   │   │       ├── libc v0.2.186
-│   │   │   │       └── shlex v1.3.0
-│   │   │   ├── rustls-pki-types v1.14.1
-│   │   │   │   └── zeroize v1.8.2
-│   │   │   │       └── zeroize_derive v1.4.3 (proc-macro)
-│   │   │   │           ├── proc-macro2 v1.0.106 (*)
-│   │   │   │           ├── quote v1.0.45 (*)
-│   │   │   │           └── syn v2.0.117 (*)
-│   │   │   ├── rustls-webpki v0.103.13
-│   │   │   │   ├── ring v0.17.14 (*)
-│   │   │   │   ├── rustls-pki-types v1.14.1 (*)
-│   │   │   │   └── untrusted v0.9.0
-│   │   │   ├── subtle v2.6.1
-│   │   │   └── zeroize v1.8.2 (*)
-│   │   ├── rustls-native-certs v0.8.3
-│   │   │   ├── rustls-pki-types v1.14.1 (*)
-│   │   │   └── security-framework v3.7.0
-│   │   │       ├── bitflags v2.11.1
-│   │   │       ├── core-foundation v0.10.1
-│   │   │       │   ├── core-foundation-sys v0.8.7
-│   │   │       │   └── libc v0.2.186
-│   │   │       ├── core-foundation-sys v0.8.7
-│   │   │       ├── libc v0.2.186
-│   │   │       └── security-framework-sys v2.17.0
-│   │   │           ├── core-foundation-sys v0.8.7
-│   │   │           └── libc v0.2.186
-│   │   ├── tokio v1.52.3 (*)
-│   │   ├── tokio-rustls v0.26.4
-│   │   │   ├── rustls v0.23.40 (*)
-│   │   │   └── tokio v1.52.3 (*)
-│   │   ├── tower-service v0.3.3
-│   │   └── webpki-roots v1.0.7
-│   │       └── rustls-pki-types v1.14.1 (*)
-│   ├── hyper-timeout v0.5.2
-│   │   ├── hyper v1.9.0 (*)
-│   │   ├── hyper-util v0.1.20 (*)
-│   │   ├── pin-project-lite v0.2.17
-│   │   ├── tokio v1.52.3 (*)
-│   │   └── tower-service v0.3.3
-│   ├── hyper-util v0.1.20 (*)
-│   ├── jsonwebtoken v10.4.0
-│   │   ├── aws-lc-rs v1.16.3
-│   │   │   ├── aws-lc-sys v0.40.0
-│   │   │   │   [build-dependencies]
-│   │   │   │   ├── cc v1.2.62 (*)
-│   │   │   │   ├── cmake v0.1.58
-│   │   │   │   │   └── cc v1.2.62 (*)
-│   │   │   │   ├── dunce v1.0.5
-│   │   │   │   └── fs_extra v1.3.0
-│   │   │   ├── untrusted v0.7.1
-│   │   │   └── zeroize v1.8.2 (*)
-│   │   ├── base64 v0.22.1
-│   │   ├── pem v3.0.6
-│   │   │   └── base64 v0.22.1
-│   │   ├── serde v1.0.228 (*)
-│   │   ├── serde_json v1.0.149 (*)
-│   │   ├── signature v2.2.0
-│   │   ├── simple_asn1 v0.6.4
-│   │   │   ├── num-bigint v0.4.6
-│   │   │   │   ├── num-integer v0.1.46 (*)
-│   │   │   │   └── num-traits v0.2.19 (*)
-│   │   │   ├── num-traits v0.2.19 (*)
-│   │   │   ├── thiserror v2.0.18
-│   │   │   │   └── thiserror-impl v2.0.18 (proc-macro)
-│   │   │   │       ├── proc-macro2 v1.0.106 (*)
-│   │   │   │       ├── quote v1.0.45 (*)
-│   │   │   │       └── syn v2.0.117 (*)
-│   │   │   └── time v0.3.47
-│   │   │       ├── deranged v0.5.8
-│   │   │       │   ├── powerfmt v0.2.0
-│   │   │       │   └── serde_core v1.0.228
-│   │   │       ├── itoa v1.0.18
-│   │   │       ├── num-conv v0.2.1
-│   │   │       ├── powerfmt v0.2.0
-│   │   │       ├── serde_core v1.0.228
-│   │   │       ├── time-core v0.1.8
-│   │   │       └── time-macros v0.2.27 (proc-macro)
-│   │   │           ├── num-conv v0.2.1
-│   │   │           └── time-core v0.1.8
-│   │   └── zeroize v1.8.2 (*)
-│   ├── once_cell v1.21.4
-│   ├── percent-encoding v2.3.2
-│   ├── pin-project v1.1.12
-│   │   └── pin-project-internal v1.1.12 (proc-macro)
-│   │       ├── proc-macro2 v1.0.106 (*)
-│   │       ├── quote v1.0.45 (*)
-│   │       └── syn v2.0.117 (*)
-│   ├── secrecy v0.10.3
-│   │   └── zeroize v1.8.2 (*)
-│   ├── serde v1.0.228 (*)
-│   ├── serde_json v1.0.149 (*)
-│   ├── serde_path_to_error v0.1.20 (*)
-│   ├── serde_urlencoded v0.7.1 (*)
-│   ├── snafu v0.8.9
-│   │   └── snafu-derive v0.8.9 (proc-macro)
-│   │       ├── heck v0.5.0
-│   │       ├── proc-macro2 v1.0.106 (*)
-│   │       ├── quote v1.0.45 (*)
-│   │       └── syn v2.0.117 (*)
-│   ├── tokio v1.52.3 (*)
-│   ├── tower v0.5.3 (*)
-│   ├── tower-http v0.6.10
-│   │   ├── bitflags v2.11.1
-│   │   ├── bytes v1.11.1
-│   │   ├── futures-util v0.3.32 (*)
-│   │   ├── http v1.4.0 (*)
-│   │   ├── http-body v1.0.1 (*)
-│   │   ├── pin-project-lite v0.2.17
-│   │   ├── tower v0.5.3 (*)
-│   │   ├── tower-layer v0.3.3
-│   │   ├── tower-service v0.3.3
-│   │   ├── tracing v0.1.44 (*)
-│   │   └── url v2.5.8 (*)
-│   ├── tracing v0.1.44 (*)
-│   ├── url v2.5.8 (*)
-│   └── web-time v1.1.0
-│   [build-dependencies]
-│   └── cargo_metadata v0.23.1
-│       ├── camino v1.2.2
-│       │   └── serde_core v1.0.228
-│       ├── cargo-platform v0.3.3
-│       │   └── serde_core v1.0.228
-│       ├── semver v1.0.28
-│       │   └── serde_core v1.0.228
-│       ├── serde v1.0.228
-│       │   ├── serde_core v1.0.228
-│       │   └── serde_derive v1.0.228 (proc-macro) (*)
-│       ├── serde_json v1.0.149
-│       │   ├── indexmap v2.14.0
-│       │   │   ├── equivalent v1.0.2
-│       │   │   └── hashbrown v0.17.1
-│       │   ├── itoa v1.0.18
-│       │   ├── memchr v2.8.0
-│       │   ├── serde_core v1.0.228
-│       │   └── zmij v1.0.21
-│       └── thiserror v2.0.18 (*)
-├── ort v2.0.0-rc.12
-│   ├── ndarray v0.17.2 (*)
-│   ├── ort-sys v2.0.0-rc.12
-│   │   [build-dependencies]
-│   │   ├── hmac-sha256 v1.1.14
-│   │   ├── lzma-rust2 v0.15.7
-│   │   └── ureq v3.3.0
-│   │       ├── base64 v0.22.1
-│   │       ├── der v0.8.0
-│   │       │   ├── pem-rfc7468 v1.0.0
-│   │       │   │   └── base64ct v1.8.3
-│   │       │   └── zeroize v1.8.2
-│   │       ├── log v0.4.29
-│   │       ├── native-tls v0.2.18
-│   │       │   ├── libc v0.2.186
-│   │       │   ├── security-framework v3.7.0 (*)
-│   │       │   ├── security-framework-sys v2.17.0 (*)
-│   │       │   └── tempfile v3.27.0
-│   │       │       ├── fastrand v2.4.1
-│   │       │       ├── getrandom v0.4.2
-│   │       │       │   ├── cfg-if v1.0.4
-│   │       │       │   └── libc v0.2.186
-│   │       │       ├── once_cell v1.21.4
-│   │       │       └── rustix v1.1.4
-│   │       │           ├── bitflags v2.11.1
-│   │       │           ├── errno v0.3.14
-│   │       │           │   └── libc v0.2.186
-│   │       │           └── libc v0.2.186
-│   │       ├── percent-encoding v2.3.2
-│   │       ├── rustls-pki-types v1.14.1
-│   │       │   └── zeroize v1.8.2
-│   │       ├── socks v0.3.4
-│   │       │   ├── byteorder v1.5.0
-│   │       │   └── libc v0.2.186
-│   │       ├── ureq-proto v0.6.0
-│   │       │   ├── base64 v0.22.1
-│   │       │   ├── http v1.4.0
-│   │       │   │   ├── bytes v1.11.1
-│   │       │   │   └── itoa v1.0.18
-│   │       │   ├── httparse v1.10.1
-│   │       │   └── log v0.4.29
-│   │       ├── utf8-zero v0.8.1
-│   │       └── webpki-root-certs v1.0.7
-│   │           └── rustls-pki-types v1.14.1 (*)
-│   ├── sha2 v0.10.9
-│   │   ├── cfg-if v1.0.4
-│   │   ├── cpufeatures v0.2.17
-│   │   │   └── libc v0.2.186
-│   │   └── digest v0.10.7
-│   │       ├── block-buffer v0.10.4
-│   │       │   └── generic-array v0.14.7
-│   │       │       └── typenum v1.20.0
-│   │       │       [build-dependencies]
-│   │       │       └── version_check v0.9.5
-│   │       └── crypto-common v0.1.7
-│   │           ├── generic-array v0.14.7 (*)
-│   │           └── typenum v1.20.0
-│   ├── smallvec v1.15.1
-│   ├── tracing v0.1.44 (*)
-│   └── ureq v3.3.0
-│       ├── base64 v0.22.1
-│       ├── der v0.8.0 (*)
-│       ├── log v0.4.29
-│       ├── native-tls v0.2.18 (*)
-│       ├── percent-encoding v2.3.2
-│       ├── rustls-pki-types v1.14.1 (*)
-│       ├── ureq-proto v0.6.0 (*)
-│       ├── utf8-zero v0.8.1
-│       └── webpki-root-certs v1.0.7 (*)
-├── oxigraph v0.5.8
-│   ├── dashmap v6.1.0 (*)
-│   ├── libc v0.2.186
-│   ├── oxiri v0.2.11
-│   ├── oxrdf v0.3.3
-│   │   ├── hex v0.4.3
-│   │   ├── oxilangtag v0.1.5
-│   │   ├── oxiri v0.2.11
-│   │   ├── oxsdatatypes v0.2.2
-│   │   │   └── thiserror v2.0.18 (*)
-│   │   ├── rand v0.9.4
-│   │   │   ├── rand_chacha v0.9.0
-│   │   │   │   ├── ppv-lite86 v0.2.21
-│   │   │   │   │   └── zerocopy v0.8.48
-│   │   │   │   │       └── zerocopy-derive v0.8.48 (proc-macro)
-│   │   │   │   │           ├── proc-macro2 v1.0.106 (*)
-│   │   │   │   │           ├── quote v1.0.45 (*)
-│   │   │   │   │           └── syn v2.0.117 (*)
-│   │   │   │   └── rand_core v0.9.5
-│   │   │   │       └── getrandom v0.3.4
-│   │   │   │           ├── cfg-if v1.0.4
-│   │   │   │           └── libc v0.2.186
-│   │   │   └── rand_core v0.9.5 (*)
-│   │   ├── sha2 v0.10.9 (*)
-│   │   └── thiserror v2.0.18 (*)
-│   ├── oxrdfio v0.2.5
-│   │   ├── oxjsonld v0.2.5
-│   │   │   ├── json-event-parser v0.2.3
-│   │   │   ├── oxiri v0.2.11
-│   │   │   ├── oxrdf v0.3.3 (*)
-│   │   │   ├── ryu-js v1.0.2
-│   │   │   └── thiserror v2.0.18 (*)
-│   │   ├── oxrdf v0.3.3 (*)
-│   │   ├── oxrdfxml v0.2.3
-│   │   │   ├── oxilangtag v0.1.5
-│   │   │   ├── oxiri v0.2.11
-│   │   │   ├── oxrdf v0.3.3 (*)
-│   │   │   ├── quick-xml v0.37.5
-│   │   │   │   └── memchr v2.8.0
-│   │   │   └── thiserror v2.0.18 (*)
-│   │   ├── oxttl v0.2.3
-│   │   │   ├── memchr v2.8.0
-│   │   │   ├── oxilangtag v0.1.5
-│   │   │   ├── oxiri v0.2.11
-│   │   │   ├── oxrdf v0.3.3 (*)
-│   │   │   └── thiserror v2.0.18 (*)
-│   │   └── thiserror v2.0.18 (*)
-│   ├── oxrocksdb-sys v0.5.8
-│   │   [build-dependencies]
-│   │   ├── bindgen v0.72.1
-│   │   │   ├── bitflags v2.11.1
-│   │   │   ├── cexpr v0.6.0
-│   │   │   │   └── nom v7.1.3
-│   │   │   │       ├── memchr v2.8.0
-│   │   │   │       └── minimal-lexical v0.2.1
-│   │   │   ├── clang-sys v1.8.1
-│   │   │   │   ├── glob v0.3.3
-│   │   │   │   ├── libc v0.2.186
-│   │   │   │   └── libloading v0.8.9
-│   │   │   │       └── cfg-if v1.0.4
-│   │   │   │   [build-dependencies]
-│   │   │   │   └── glob v0.3.3
-│   │   │   ├── itertools v0.13.0
-│   │   │   │   └── either v1.15.0
-│   │   │   ├── log v0.4.29
-│   │   │   ├── prettyplease v0.2.37
-│   │   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │   │   │   └── syn v2.0.117 (*)
-│   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │   │   ├── quote v1.0.45 (*)
-│   │   │   ├── regex v1.12.3
-│   │   │   │   ├── regex-automata v0.4.14
-│   │   │   │   │   └── regex-syntax v0.8.10
-│   │   │   │   └── regex-syntax v0.8.10
-│   │   │   ├── rustc-hash v2.1.2
-│   │   │   ├── shlex v1.3.0
-│   │   │   └── syn v2.0.117 (*)
-│   │   └── cc v1.2.62 (*)
-│   ├── oxsdatatypes v0.2.2 (*)
-│   ├── rand v0.9.4 (*)
-│   ├── rustc-hash v2.1.2
-│   ├── siphasher v1.0.3
-│   ├── sparesults v0.3.3
-│   │   ├── json-event-parser v0.2.3
-│   │   ├── memchr v2.8.0
-│   │   ├── oxrdf v0.3.3 (*)
-│   │   ├── quick-xml v0.37.5 (*)
-│   │   └── thiserror v2.0.18 (*)
-│   ├── spareval v0.2.6
-│   │   ├── hex v0.4.3
-│   │   ├── json-event-parser v0.2.3
-│   │   ├── md-5 v0.10.6
-│   │   │   ├── cfg-if v1.0.4
-│   │   │   └── digest v0.10.7 (*)
-│   │   ├── oxiri v0.2.11
-│   │   ├── oxrdf v0.3.3 (*)
-│   │   ├── oxsdatatypes v0.2.2 (*)
-│   │   ├── rand v0.9.4 (*)
-│   │   ├── regex v1.12.3
-│   │   │   ├── aho-corasick v1.1.4 (*)
-│   │   │   ├── memchr v2.8.0
-│   │   │   ├── regex-automata v0.4.14 (*)
-│   │   │   └── regex-syntax v0.8.10
-│   │   ├── rustc-hash v2.1.2
-│   │   ├── sha1 v0.10.6
-│   │   │   ├── cfg-if v1.0.4
-│   │   │   ├── cpufeatures v0.2.17 (*)
-│   │   │   └── digest v0.10.7 (*)
-│   │   ├── sha2 v0.10.9 (*)
-│   │   ├── sparesults v0.3.3 (*)
-│   │   ├── spargebra v0.4.6
-│   │   │   ├── oxilangtag v0.1.5
-│   │   │   ├── oxiri v0.2.11
-│   │   │   ├── oxrdf v0.3.3 (*)
-│   │   │   ├── peg v0.8.6
-│   │   │   │   ├── peg-macros v0.8.6 (proc-macro)
-│   │   │   │   │   ├── peg-runtime v0.8.6
-│   │   │   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │   │   │   │   └── quote v1.0.45 (*)
-│   │   │   │   └── peg-runtime v0.8.6
-│   │   │   ├── rand v0.9.4 (*)
-│   │   │   └── thiserror v2.0.18 (*)
-│   │   ├── sparopt v0.3.6
-│   │   │   ├── oxrdf v0.3.3 (*)
-│   │   │   ├── rand v0.9.4 (*)
-│   │   │   └── spargebra v0.4.6 (*)
-│   │   └── thiserror v2.0.18 (*)
-│   ├── spargebra v0.4.6 (*)
-│   └── thiserror v2.0.18 (*)
 ├── parking_lot v0.12.5 (*)
 ├── postcard v1.1.3
 │   ├── cobs v0.3.0
-│   │   └── thiserror v2.0.18 (*)
+│   │   └── thiserror v2.0.18
+│   │       └── thiserror-impl v2.0.18 (proc-macro)
+│   │           ├── proc-macro2 v1.0.106 (*)
+│   │           ├── quote v1.0.45 (*)
+│   │           └── syn v2.0.117 (*)
 │   └── serde v1.0.228 (*)
 ├── rayon v1.12.0
 │   ├── either v1.15.0
 │   └── rayon-core v1.13.0
 │       ├── crossbeam-deque v0.8.6 (*)
 │       └── crossbeam-utils v0.8.21
-├── regex v1.12.3 (*)
+├── redb v2.6.3
+│   └── libc v0.2.186
+├── regex v1.12.3
+│   ├── aho-corasick v1.1.4 (*)
+│   ├── memchr v2.8.0
+│   ├── regex-automata v0.4.14 (*)
+│   └── regex-syntax v0.8.10
 ├── reqwest v0.12.28
 │   ├── base64 v0.22.1
 │   ├── bytes v1.11.1
@@ -767,7 +384,40 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── http-body v1.0.1 (*)
 │   ├── http-body-util v0.1.3 (*)
 │   ├── hyper v1.9.0 (*)
-│   ├── hyper-rustls v0.27.9 (*)
+│   ├── hyper-rustls v0.27.9
+│   │   ├── http v1.4.0 (*)
+│   │   ├── hyper v1.9.0 (*)
+│   │   ├── hyper-util v0.1.20 (*)
+│   │   ├── rustls v0.23.40
+│   │   │   ├── once_cell v1.21.4
+│   │   │   ├── ring v0.17.14
+│   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   ├── getrandom v0.2.17
+│   │   │   │   │   ├── cfg-if v1.0.4
+│   │   │   │   │   └── libc v0.2.186
+│   │   │   │   └── untrusted v0.9.0
+│   │   │   │   [build-dependencies]
+│   │   │   │   └── cc v1.2.62
+│   │   │   │       ├── find-msvc-tools v0.1.9
+│   │   │   │       ├── jobserver v0.1.34
+│   │   │   │       │   └── libc v0.2.186
+│   │   │   │       ├── libc v0.2.186
+│   │   │   │       └── shlex v1.3.0
+│   │   │   ├── rustls-pki-types v1.14.1
+│   │   │   │   └── zeroize v1.8.2
+│   │   │   ├── rustls-webpki v0.103.13
+│   │   │   │   ├── ring v0.17.14 (*)
+│   │   │   │   ├── rustls-pki-types v1.14.1 (*)
+│   │   │   │   └── untrusted v0.9.0
+│   │   │   ├── subtle v2.6.1
+│   │   │   └── zeroize v1.8.2
+│   │   ├── tokio v1.52.3 (*)
+│   │   ├── tokio-rustls v0.26.4
+│   │   │   ├── rustls v0.23.40 (*)
+│   │   │   └── tokio v1.52.3 (*)
+│   │   ├── tower-service v0.3.3
+│   │   └── webpki-roots v1.0.7
+│   │       └── rustls-pki-types v1.14.1 (*)
 │   ├── hyper-util v0.1.20 (*)
 │   ├── log v0.4.29
 │   ├── percent-encoding v2.3.2
@@ -781,29 +431,33 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── tokio v1.52.3 (*)
 │   ├── tokio-rustls v0.26.4 (*)
 │   ├── tower v0.5.3 (*)
-│   ├── tower-http v0.6.10 (*)
+│   ├── tower-http v0.6.10
+│   │   ├── bitflags v2.11.1
+│   │   ├── bytes v1.11.1
+│   │   ├── futures-util v0.3.32 (*)
+│   │   ├── http v1.4.0 (*)
+│   │   ├── http-body v1.0.1 (*)
+│   │   ├── pin-project-lite v0.2.17
+│   │   ├── tower v0.5.3 (*)
+│   │   ├── tower-layer v0.3.3
+│   │   ├── tower-service v0.3.3
+│   │   └── url v2.5.8 (*)
 │   ├── tower-service v0.3.3
 │   ├── url v2.5.8 (*)
 │   └── webpki-roots v1.0.7 (*)
-├── rust-embed v8.11.0
-│   ├── rust-embed-impl v8.11.0 (proc-macro)
-│   │   ├── proc-macro2 v1.0.106 (*)
-│   │   ├── quote v1.0.45 (*)
-│   │   ├── rust-embed-utils v8.11.0
-│   │   │   ├── sha2 v0.10.9 (*)
-│   │   │   └── walkdir v2.5.0 (*)
-│   │   ├── syn v2.0.117 (*)
-│   │   └── walkdir v2.5.0 (*)
-│   ├── rust-embed-utils v8.11.0 (*)
-│   └── walkdir v2.5.0 (*)
 ├── serde v1.0.228 (*)
 ├── serde-saphyr v0.0.26
 │   ├── ahash v0.8.12
 │   │   ├── cfg-if v1.0.4
-│   │   ├── getrandom v0.3.4 (*)
+│   │   ├── getrandom v0.3.4
+│   │   │   ├── cfg-if v1.0.4
+│   │   │   └── libc v0.2.186
 │   │   ├── once_cell v1.21.4
-│   │   ├── serde v1.0.228 (*)
-│   │   └── zerocopy v0.8.48 (*)
+│   │   └── zerocopy v0.8.48
+│   │       └── zerocopy-derive v0.8.48 (proc-macro)
+│   │           ├── proc-macro2 v1.0.106 (*)
+│   │           ├── quote v1.0.45 (*)
+│   │           └── syn v2.0.117 (*)
 │   │   [build-dependencies]
 │   │   └── version_check v0.9.5
 │   ├── annotate-snippets v0.12.16
@@ -822,11 +476,23 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── smallvec v1.15.1
 │   └── zmij v1.0.21
 ├── serde_json v1.0.149 (*)
-├── sha2 v0.10.9 (*)
+├── sha2 v0.10.9
+│   ├── cfg-if v1.0.4
+│   ├── cpufeatures v0.2.17
+│   └── digest v0.10.7
+│       ├── block-buffer v0.10.4
+│       │   └── generic-array v0.14.7
+│       │       └── typenum v1.20.0
+│       │       [build-dependencies]
+│       │       └── version_check v0.9.5
+│       └── crypto-common v0.1.7
+│           ├── generic-array v0.14.7 (*)
+│           └── typenum v1.20.0
 ├── streaming-iterator v0.1.9
 ├── tantivy v0.22.1
 │   ├── aho-corasick v1.1.4 (*)
-│   ├── arc-swap v1.9.1 (*)
+│   ├── arc-swap v1.9.1
+│   │   └── rustversion v1.0.22 (proc-macro)
 │   ├── base64 v0.22.1
 │   ├── bitpacking v0.9.3
 │   │   └── crunchy v0.2.4
@@ -881,7 +547,15 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   │   │   ├── ownedbytes v0.7.0
 │   │   │   │   └── stable_deref_trait v1.2.1
 │   │   │   ├── serde v1.0.228 (*)
-│   │   │   └── time v0.3.47 (*)
+│   │   │   └── time v0.3.47
+│   │   │       ├── deranged v0.5.8
+│   │   │       │   ├── powerfmt v0.2.0
+│   │   │       │   └── serde_core v1.0.228
+│   │   │       ├── itoa v1.0.18
+│   │   │       ├── num-conv v0.2.1
+│   │   │       ├── powerfmt v0.2.0
+│   │   │       ├── serde_core v1.0.228
+│   │   │       └── time-core v0.1.8
 │   │   ├── tantivy-sstable v0.3.0
 │   │   │   ├── tantivy-bitpacker v0.6.0 (*)
 │   │   │   ├── tantivy-common v0.7.0 (*)
@@ -902,7 +576,8 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   │       │   └── rand v0.8.6
 │   │       │       ├── libc v0.2.186
 │   │       │       ├── rand_chacha v0.3.1
-│   │       │       │   ├── ppv-lite86 v0.2.21 (*)
+│   │       │       │   ├── ppv-lite86 v0.2.21
+│   │       │       │   │   └── zerocopy v0.8.48 (*)
 │   │       │       │   └── rand_core v0.6.4
 │   │       │       │       └── getrandom v0.2.17 (*)
 │   │       │       └── rand_core v0.6.4 (*)
@@ -910,9 +585,7 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── tantivy-common v0.7.0 (*)
 │   ├── tantivy-fst v0.5.0 (*)
 │   ├── tantivy-query-grammar v0.22.0
-│   │   └── nom v7.1.3
-│   │       ├── memchr v2.8.0
-│   │       └── minimal-lexical v0.2.1
+│   │   └── nom v7.1.3 (*)
 │   ├── tantivy-stacker v0.3.0 (*)
 │   ├── tantivy-tokenizer-api v0.3.0
 │   │   └── serde v1.0.228 (*)
@@ -923,99 +596,21 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   │       └── syn v2.0.117 (*)
 │   ├── time v0.3.47 (*)
 │   └── uuid v1.23.1
-│       ├── getrandom v0.4.2 (*)
+│       ├── getrandom v0.4.2
+│       │   ├── cfg-if v1.0.4
+│       │   └── libc v0.2.186
 │       └── serde_core v1.0.228
-├── tempfile v3.27.0 (*)
+├── tempfile v3.27.0
+│   ├── fastrand v2.4.1
+│   ├── getrandom v0.4.2 (*)
+│   ├── once_cell v1.21.4
+│   └── rustix v1.1.4 (*)
 ├── thiserror v2.0.18 (*)
-├── tokenizers v0.23.1
-│   ├── ahash v0.8.12 (*)
-│   ├── compact_str v0.9.0
-│   │   ├── castaway v0.2.4
-│   │   │   └── rustversion v1.0.22 (proc-macro)
-│   │   ├── cfg-if v1.0.4
-│   │   ├── itoa v1.0.18
-│   │   ├── rustversion v1.0.22 (proc-macro)
-│   │   ├── ryu v1.0.23
-│   │   ├── serde v1.0.228 (*)
-│   │   └── static_assertions v1.1.0
-│   ├── daachorse v1.0.1
-│   ├── dary_heap v0.3.9
-│   │   └── serde v1.0.228 (*)
-│   ├── derive_builder v0.20.2
-│   │   └── derive_builder_macro v0.20.2 (proc-macro)
-│   │       ├── derive_builder_core v0.20.2
-│   │       │   ├── darling v0.20.11
-│   │       │   │   ├── darling_core v0.20.11
-│   │       │   │   │   ├── fnv v1.0.7
-│   │       │   │   │   ├── ident_case v1.0.1
-│   │       │   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │       │   │   │   ├── quote v1.0.45 (*)
-│   │       │   │   │   ├── strsim v0.11.1
-│   │       │   │   │   └── syn v2.0.117 (*)
-│   │       │   │   └── darling_macro v0.20.11 (proc-macro)
-│   │       │   │       ├── darling_core v0.20.11 (*)
-│   │       │   │       ├── quote v1.0.45 (*)
-│   │       │   │       └── syn v2.0.117 (*)
-│   │       │   ├── proc-macro2 v1.0.106 (*)
-│   │       │   ├── quote v1.0.45 (*)
-│   │       │   └── syn v2.0.117 (*)
-│   │       └── syn v2.0.117 (*)
-│   ├── esaxx-rs v0.1.10
-│   ├── getrandom v0.3.4 (*)
-│   ├── itertools v0.14.0
-│   │   └── either v1.15.0
-│   ├── log v0.4.29
-│   ├── macro_rules_attribute v0.2.2
-│   │   ├── macro_rules_attribute-proc_macro v0.2.2 (proc-macro)
-│   │   └── paste v1.0.15 (proc-macro)
-│   ├── monostate v0.1.18
-│   │   ├── monostate-impl v0.1.18 (proc-macro)
-│   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │   │   ├── quote v1.0.45 (*)
-│   │   │   └── syn v2.0.117 (*)
-│   │   └── serde_core v1.0.228
-│   ├── onig v6.5.3
-│   │   ├── bitflags v2.11.1
-│   │   ├── once_cell v1.21.4
-│   │   └── onig_sys v69.9.3
-│   │       [build-dependencies]
-│   │       ├── cc v1.2.62 (*)
-│   │       └── pkg-config v0.3.33
-│   ├── paste v1.0.15 (proc-macro)
-│   ├── rand v0.9.4 (*)
-│   ├── rayon v1.12.0 (*)
-│   ├── rayon-cond v0.4.0
-│   │   ├── either v1.15.0
-│   │   ├── itertools v0.14.0 (*)
-│   │   └── rayon v1.12.0 (*)
-│   ├── regex v1.12.3 (*)
-│   ├── regex-syntax v0.8.10
-│   ├── serde v1.0.228 (*)
-│   ├── serde_json v1.0.149 (*)
-│   ├── spm_precompiled v0.1.4
-│   │   ├── base64 v0.13.1
-│   │   ├── nom v7.1.3 (*)
-│   │   ├── serde v1.0.228 (*)
-│   │   └── unicode-segmentation v1.13.2
-│   ├── thiserror v2.0.18 (*)
-│   ├── unicode-normalization-alignments v0.1.12
-│   │   └── smallvec v1.15.1
-│   ├── unicode-segmentation v1.13.2
-│   └── unicode_categories v0.1.1
 ├── tokio v1.52.3 (*)
-├── toml v0.8.23
-│   ├── serde v1.0.228 (*)
-│   ├── serde_spanned v0.6.9
-│   │   └── serde v1.0.228 (*)
-│   ├── toml_datetime v0.6.11
-│   │   └── serde v1.0.228 (*)
-│   └── toml_edit v0.22.27
-│       ├── indexmap v2.14.0 (*)
-│       ├── serde v1.0.228 (*)
-│       ├── serde_spanned v0.6.9 (*)
-│       ├── toml_datetime v0.6.11 (*)
-│       ├── toml_write v0.1.2
-│       └── winnow v0.7.15
+├── tokio-stream v0.1.18
+│   ├── futures-core v0.3.32
+│   ├── pin-project-lite v0.2.17
+│   └── tokio v1.52.3 (*)
 ├── tower v0.5.3 (*)
 ├── tower-http v0.6.10 (*)
 ├── tracing v0.1.44 (*)
@@ -1043,7 +638,14 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   └── tree-sitter-language v0.1.7
 │   [build-dependencies]
 │   ├── cc v1.2.62 (*)
-│   └── serde_json v1.0.149 (*)
+│   └── serde_json v1.0.149
+│       ├── indexmap v2.14.0
+│       │   ├── equivalent v1.0.2
+│       │   └── hashbrown v0.17.1
+│       ├── itoa v1.0.18
+│       ├── memchr v2.8.0
+│       ├── serde_core v1.0.228
+│       └── zmij v1.0.21
 ├── tree-sitter-bash v0.23.3
 │   └── tree-sitter-language v0.1.7
 │   [build-dependencies]
@@ -1169,41 +771,8 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   └── tree-sitter-language v0.1.7
 │   [build-dependencies]
 │   └── cc v1.2.62 (*)
-├── url v2.5.8 (*)
-├── usearch v2.25.2
-│   ├── cxx v1.0.194
-│   │   ├── cxxbridge-macro v1.0.194 (proc-macro)
-│   │   │   ├── indexmap v2.14.0 (*)
-│   │   │   ├── proc-macro2 v1.0.106 (*)
-│   │   │   ├── quote v1.0.45 (*)
-│   │   │   └── syn v2.0.117 (*)
-│   │   ├── foldhash v0.2.0
-│   │   └── link-cplusplus v1.0.12
-│   │       [build-dependencies]
-│   │       └── cc v1.2.62 (*)
-│   │   [build-dependencies]
-│   │   ├── cc v1.2.62 (*)
-│   │   └── cxxbridge-flags v1.0.194
-│   └── numkong v7.6.0
-│       [build-dependencies]
-│       └── cc v1.2.62 (*)
-│   [build-dependencies]
-│   └── cxx-build v1.0.194
-│       ├── cc v1.2.62 (*)
-│       ├── codespan-reporting v0.13.1
-│       │   ├── termcolor v1.4.1
-│       │   └── unicode-width v0.2.2
-│       ├── indexmap v2.14.0 (*)
-│       ├── proc-macro2 v1.0.106 (*)
-│       ├── quote v1.0.45 (*)
-│       ├── scratch v1.0.9
-│       └── syn v2.0.117 (*)
 ├── uuid v1.23.1 (*)
-├── walkdir v2.5.0 (*)
-├── wasm-bindgen v0.2.121 (*)
-└── web-sys v0.3.98
-    ├── js-sys v0.3.98 (*)
-    └── wasm-bindgen v0.2.121 (*)
+└── walkdir v2.5.0 (*)
 [dev-dependencies]
 ├── criterion v0.5.1
 │   ├── anes v0.1.6
@@ -1250,8 +819,12 @@ narsil-mcp v1.7.0 (/Users/laurence/RustroverProjects/narsil-mcp)
 │   ├── bit-vec v0.8.0
 │   ├── bitflags v2.11.1
 │   ├── num-traits v0.2.19 (*)
-│   ├── rand v0.9.4 (*)
-│   ├── rand_chacha v0.9.0 (*)
+│   ├── rand v0.9.4
+│   │   └── rand_core v0.9.5
+│   │       └── getrandom v0.3.4 (*)
+│   ├── rand_chacha v0.9.0
+│   │   ├── ppv-lite86 v0.2.21 (*)
+│   │   └── rand_core v0.9.5 (*)
 │   ├── rand_xorshift v0.4.0
 │   │   └── rand_core v0.9.5 (*)
 │   ├── regex-syntax v0.8.10

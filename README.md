@@ -739,24 +739,15 @@ narsil-mcp --repos /path/to/repo/src --repos /path/to/repo/lib
 - [x] Multi-language symbol extraction (32 languages)
 - [x] Full-text search with Tantivy (BM25 ranking)
 - [x] Hybrid search (BM25 + TF-IDF with RRF)
-- [x] AST-aware code chunking
 - [x] Git blame/history integration
 - [x] Call graph analysis with complexity metrics
 - [x] Control flow graph (CFG) analysis
 - [x] Data flow analysis (DFG) with reaching definitions
-- [x] Dead code and dead store detection
-- [x] Taint analysis for injection vulnerabilities
-- [x] Security rules engine (OWASP, CWE, crypto, secrets)
-- [x] SBOM generation (CycloneDX, SPDX)
-- [x] Dependency vulnerability checking (OSV)
-- [x] License compliance analysis
-- [x] Import graph with circular dependency detection
 - [x] Cross-language symbol resolution
 - [x] Incremental indexing with Merkle trees
 - [x] Index persistence
 - [x] Watch mode for file changes
 - [x] LSP integration
-- [x] Remote repository support
 - [x] Streaming responses
 
 ## What's New
