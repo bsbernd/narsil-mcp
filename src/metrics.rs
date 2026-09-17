@@ -201,7 +201,7 @@ struct PersistedCounter {
 
 /// On-disk heap snapshot: the live [`MemoryReport`] plus when it was taken.
 /// Overwritten (not merged) on each flush — memory is a per-run snapshot, not a
-/// counter. Added in v3.
+/// counter. Added in v3; lost its `neural` field in v4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedMemoryReport {
     /// Unix seconds when the engine measured this snapshot.
@@ -230,6 +230,73 @@ pub struct PersistedMetrics {
     /// Heap snapshot from the most recent run (None for migrated v1/v2 files;
     /// added in v3).
     pub memory: Option<PersistedMemoryReport>,
+}
+
+/// v3 on-disk layout, whose [`MemoryReportV3`] still carried the always-zero
+/// `neural` slot. Kept only so `load` can migrate those files. Field order
+/// must match the v3 structs exactly — postcard is positional and not
+/// self-describing.
+///
+/// `Serialize` is derived only so tests can write authentic v3 byte streams;
+/// production code never serialises this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMetricsV3 {
+    version: u32,
+    index_path: String,
+    first_started_at: u64,
+    saved_at: u64,
+    total_uptime_seconds: u64,
+    tools: HashMap<String, PersistedCounter>,
+    file_parse: PersistedCounter,
+    backends: HashMap<String, u64>,
+    memory: Option<PersistedMemoryReportV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMemoryReportV3 {
+    measured_at: u64,
+    report: MemoryReportV3,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemoryReportV3 {
+    symbols: usize,
+    search_index: usize,
+    embeddings: usize,
+    file_cache: usize,
+    call_graphs: usize,
+    repos: usize,
+    git_repos: usize,
+    neural: usize,
+    process_rss: Option<usize>,
+}
+
+impl PersistedMetricsV3 {
+    fn upgrade(self) -> PersistedMetrics {
+        PersistedMetrics {
+            version: PersistedMetrics::CURRENT_VERSION,
+            index_path: self.index_path,
+            first_started_at: self.first_started_at,
+            saved_at: self.saved_at,
+            total_uptime_seconds: self.total_uptime_seconds,
+            tools: self.tools,
+            file_parse: self.file_parse,
+            backends: self.backends,
+            memory: self.memory.map(|m| PersistedMemoryReport {
+                measured_at: m.measured_at,
+                report: MemoryReport {
+                    symbols: m.report.symbols,
+                    search_index: m.report.search_index,
+                    embeddings: m.report.embeddings,
+                    file_cache: m.report.file_cache,
+                    call_graphs: m.report.call_graphs,
+                    repos: m.report.repos,
+                    git_repos: m.report.git_repos,
+                    process_rss: m.report.process_rss,
+                },
+            }),
+        }
+    }
 }
 
 /// v1 on-disk layout (pre-`backends`). Kept only so `load` can migrate files
@@ -302,7 +369,7 @@ impl PersistedMetricsV2 {
 }
 
 impl PersistedMetrics {
-    const CURRENT_VERSION: u32 = 3;
+    const CURRENT_VERSION: u32 = 4;
 
     fn empty(index_path: String) -> Self {
         let now = now_unix_seconds();
@@ -323,14 +390,20 @@ impl PersistedMetrics {
     /// (missing file, bad version, deserialisation failure).
     ///
     /// Older files lack the trailing fields each version added (`backends` in
-    /// v2, `memory` in v3), so decoding them at the current layout hits EOF.
-    /// postcard ignores trailing bytes, so we try the largest layout first and
-    /// fall back through v2 to v1, upgrading in place.
+    /// v2, `memory` in v3) or carry a slot v4 dropped, so decoding them at the
+    /// current layout hits EOF or a wrong version. postcard ignores trailing
+    /// bytes, so we try the largest layout first and fall back through v3 and
+    /// v2 to v1, upgrading in place.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path).context("Failed to read metrics file")?;
         if let Ok(snapshot) = postcard::from_bytes::<Self>(&data) {
             if snapshot.version == Self::CURRENT_VERSION {
                 return Ok(snapshot);
+            }
+        }
+        if let Ok(v3) = postcard::from_bytes::<PersistedMetricsV3>(&data) {
+            if v3.version == 3 {
+                return Ok(v3.upgrade());
             }
         }
         if let Ok(v2) = postcard::from_bytes::<PersistedMetricsV2>(&data) {
@@ -339,7 +412,7 @@ impl PersistedMetrics {
             }
         }
         let v1: PersistedMetricsV1 = postcard::from_bytes(&data)
-            .context("Failed to deserialise metrics file (tried v3, v2 and v1)")?;
+            .context("Failed to deserialise metrics file (tried v4, v3, v2 and v1)")?;
         if v1.version != 1 {
             return Err(anyhow::anyhow!(
                 "Unsupported metrics file version: {}",
@@ -1534,7 +1607,6 @@ pub fn render_aggregate_json(snapshots: &[PersistedMetrics]) -> Result<serde_jso
                     "call_graphs": mem.report.call_graphs,
                     "repos": mem.report.repos,
                     "git_repos": mem.report.git_repos,
-                    "neural": mem.report.neural,
                 },
             }))
         })
@@ -1619,8 +1691,6 @@ pub struct MemoryReport {
     pub repos: usize,
     /// Git repository handle keys (libgit2-internal buffers not tracked).
     pub git_repos: usize,
-    /// Neural embedding engine — not tracked yet; always 0.
-    pub neural: usize,
     /// Process resident set size (Linux /proc/self/status), when available.
     pub process_rss: Option<usize>,
 }
@@ -1635,7 +1705,6 @@ impl MemoryReport {
             + self.call_graphs
             + self.repos
             + self.git_repos
-            + self.neural
     }
 
     /// Named subsystem rows, largest first, for table rendering.
@@ -1648,7 +1717,6 @@ impl MemoryReport {
             ("Call graphs", self.call_graphs),
             ("Repos", self.repos),
             ("Git repos", self.git_repos),
-            ("Neural", self.neural),
         ];
         rows.sort_by(|a, b| b.1.cmp(&a.1));
         rows
@@ -1777,7 +1845,6 @@ mod tests {
             call_graphs: 0,
             repos: 10,
             git_repos: 5,
-            neural: 0,
             process_rss: Some(4096),
         };
         assert_eq!(report.total_tracked(), 100 + 400 + 1000 + 50 + 10 + 5);
@@ -1847,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_file_migrates_to_v3_without_memory() {
+    fn test_v2_file_migrates_without_memory() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v2.bin");
 
@@ -1878,6 +1945,52 @@ mod tests {
             snap.memory.is_none(),
             "migrated v2 file has no memory snapshot"
         );
+    }
+
+    #[test]
+    fn test_v3_file_migrates_keeping_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v3.bin");
+
+        // Write an authentic v3 byte stream (memory report with the old
+        // `neural` slot).
+        let mut tool = MetricStats::new();
+        tool.record(42);
+        let mut tools = HashMap::new();
+        tools.insert("alpha".to_string(), tool.to_persisted().unwrap());
+        let v3 = PersistedMetricsV3 {
+            version: 3,
+            index_path: "/path/v3".to_string(),
+            first_started_at: 111,
+            saved_at: 222,
+            total_uptime_seconds: 50,
+            tools,
+            file_parse: empty_persisted_counter(),
+            backends: HashMap::new(),
+            memory: Some(PersistedMemoryReportV3 {
+                measured_at: 333,
+                report: MemoryReportV3 {
+                    symbols: 1,
+                    search_index: 2,
+                    embeddings: 3,
+                    file_cache: 4,
+                    call_graphs: 5,
+                    repos: 6,
+                    git_repos: 7,
+                    neural: 0,
+                    process_rss: Some(4096),
+                },
+            }),
+        };
+        std::fs::write(&path, postcard::to_stdvec(&v3).unwrap()).unwrap();
+
+        let snap = PersistedMetrics::load(&path).unwrap();
+        assert_eq!(snap.version, PersistedMetrics::CURRENT_VERSION);
+        assert_eq!(snap.tools.get("alpha").unwrap().count, 1);
+        let mem = snap.memory.expect("v3 memory snapshot survives migration");
+        assert_eq!(mem.measured_at, 333);
+        assert_eq!(mem.report.git_repos, 7);
+        assert_eq!(mem.report.process_rss, Some(4096));
     }
 
     #[test]

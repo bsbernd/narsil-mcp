@@ -6129,7 +6129,6 @@ impl CodeIntelEngine {
             call_graphs,
             repos,
             git_repos,
-            neural: 0,
             process_rss: Self::process_rss_bytes(),
         }
     }
