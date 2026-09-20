@@ -3767,9 +3767,13 @@ impl CodeIntelEngine {
             )
         };
         // qualified_name is rarely populated by the extractors, so a caller-supplied
-        // "Type::method" (the natural way to name an inherent-impl method) would
-        // otherwise never match anything but the bare method name itself.
-        let method_tail = symbol_name.rsplit("::").next().unwrap_or(symbol_name);
+        // "Type::method" or "Type.method" (the natural way to name an inherent-impl
+        // or Python method) would otherwise never match anything but the bare
+        // method name itself.
+        let method_tail = match symbol_name.contains("::") {
+            true => symbol_name.rsplit("::").next().unwrap_or(symbol_name),
+            false => symbol_name.rsplit('.').next().unwrap_or(symbol_name),
+        };
         let matches: Vec<&Symbol> = symbols
             .iter()
             .filter(|s| {
@@ -10466,6 +10470,34 @@ similarity index 90%
         assert!(
             !surviving.iter().any(|path| path == &adopted),
             "an idle adopted repo must be dropped: {surviving:?}"
+        );
+    }
+
+    /// `UblkClient.start` is how the source and a review note name the method;
+    /// the symbol table holds it under `start`.
+    #[tokio::test]
+    async fn a_dotted_method_name_resolves_to_its_definition() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("run-system-tests.py"),
+            "class UblkClient:\n    def start(self):\n        return 1\n",
+        )
+        .unwrap();
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.complete_initialization().await.unwrap();
+
+        let definition = engine
+            .get_symbol_definition(repo.to_str().unwrap(), "UblkClient.start", 2)
+            .await
+            .expect("a dotted method name must reach the method");
+        assert!(
+            definition.contains("def start"),
+            "definition of the dotted name: {definition}"
         );
     }
 
