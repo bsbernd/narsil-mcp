@@ -116,13 +116,37 @@ impl GitRepo {
         })
     }
 
+    /// The directory a git command for `file_path` must run in, and the path
+    /// to name there. A submodule's files live in the submodule's own work
+    /// tree: the superproject's HEAD holds the gitlink, not them, so a command
+    /// run at the superproject root reports the path as absent.
+    fn work_tree_for(&self, file_path: &str) -> (std::path::PathBuf, String) {
+        let components: Vec<&str> = file_path.split('/').collect();
+        let mut prefix = std::path::PathBuf::new();
+        let mut submodule: Option<(std::path::PathBuf, usize)> = None;
+
+        for (index, component) in components.iter().enumerate().take(components.len() - 1) {
+            prefix.push(component);
+            let candidate = self.root.join(&prefix);
+            if candidate.join(".git").exists() {
+                submodule = Some((candidate, index + 1));
+            }
+        }
+
+        match submodule {
+            Some((dir, crossed)) => (dir, components[crossed..].join("/")),
+            None => (self.root.clone(), file_path.to_string()),
+        }
+    }
+
     /// Get blame information for a file
     pub fn blame(&self, file_path: &str) -> Result<Vec<BlameInfo>> {
         Self::validate_input(file_path, "file_path")?;
+        let (work_tree, file_path) = self.work_tree_for(file_path);
 
         let output = Command::new("git")
-            .args(["blame", "--line-porcelain", file_path])
-            .current_dir(&self.root)
+            .args(["blame", "--line-porcelain", &file_path])
+            .current_dir(&work_tree)
             .output()
             .context("Failed to run git blame")?;
 
@@ -186,15 +210,16 @@ impl GitRepo {
     /// Get blame for a specific line range
     pub fn blame_range(&self, file_path: &str, start: usize, end: usize) -> Result<Vec<BlameInfo>> {
         Self::validate_input(file_path, "file_path")?;
+        let (work_tree, file_path) = self.work_tree_for(file_path);
 
         let output = Command::new("git")
             .args([
                 "blame",
                 "--line-porcelain",
                 &format!("-L{},{}", start, end),
-                file_path,
+                &file_path,
             ])
-            .current_dir(&self.root)
+            .current_dir(&work_tree)
             .output()
             .context("Failed to run git blame")?;
 
@@ -209,6 +234,7 @@ impl GitRepo {
     /// Get recent commits affecting a file
     pub fn file_history(&self, file_path: &str, max_commits: usize) -> Result<Vec<FileCommit>> {
         Self::validate_input(file_path, "file_path")?;
+        let (work_tree, file_path) = self.work_tree_for(file_path);
 
         let output = Command::new("git")
             .args([
@@ -217,9 +243,9 @@ impl GitRepo {
                 "--numstat",
                 &format!("-{}", max_commits),
                 "--",
-                file_path,
+                &file_path,
             ])
-            .current_dir(&self.root)
+            .current_dir(&work_tree)
             .output()
             .context("Failed to run git log")?;
 
@@ -366,10 +392,11 @@ impl GitRepo {
     /// Get contributors to a file
     pub fn file_contributors(&self, file_path: &str) -> Result<Vec<(String, usize)>> {
         Self::validate_input(file_path, "file_path")?;
+        let (work_tree, file_path) = self.work_tree_for(file_path);
 
         let output = Command::new("git")
-            .args(["shortlog", "-sne", "HEAD", "--", file_path])
-            .current_dir(&self.root)
+            .args(["shortlog", "-sne", "HEAD", "--", &file_path])
+            .current_dir(&work_tree)
             .output()
             .context("Failed to run git shortlog")?;
 
@@ -828,6 +855,55 @@ mod tests {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A submodule's file is absent from the superproject's HEAD, so blame and
+    /// history for it have to run in the submodule's own work tree.
+    #[test]
+    fn blame_and_history_of_a_submodule_file() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub_origin");
+        std::fs::create_dir(&sub).unwrap();
+        run_git(&sub, &["init", "-q"]);
+        std::fs::write(sub.join("Makefile.am"), "SUBDIRS = src\n").unwrap();
+        run_git(&sub, &["add", "Makefile.am"]);
+        run_git(&sub, &["commit", "-q", "-m", "add the submodule makefile"]);
+
+        let super_project = dir.path().join("super");
+        std::fs::create_dir(&super_project).unwrap();
+        run_git(&super_project, &["init", "-q"]);
+        std::fs::write(super_project.join("README"), "top\n").unwrap();
+        run_git(&super_project, &["add", "README"]);
+        run_git(&super_project, &["commit", "-q", "-m", "top"]);
+        run_git(
+            &super_project,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "--quiet",
+                "add",
+                sub.to_str().unwrap(),
+                "core",
+            ],
+        );
+        run_git(&super_project, &["commit", "-q", "-m", "add the submodule"]);
+
+        let repo = GitRepo::new(&super_project).unwrap();
+
+        let blame = repo
+            .blame("core/Makefile.am")
+            .expect("blame of a file under a gitlink");
+        assert_eq!(blame.len(), 1);
+        assert_eq!(blame[0].summary, "add the submodule makefile");
+
+        let history = repo
+            .file_history("core/Makefile.am", 5)
+            .expect("history of a file under a gitlink");
+        assert_eq!(history.len(), 1);
+
+        // A path that crosses no gitlink still answers from the repo root.
+        assert_eq!(repo.blame("README").unwrap().len(), 1);
     }
 
     #[test]
