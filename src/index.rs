@@ -9773,7 +9773,12 @@ fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
         if incoming.kind != SymbolKind::Unknown {
             existing.kind = incoming.kind;
         }
-        if incoming.signature.is_some() {
+        // Except a C signature: clang answers `int` for a parameter whose type
+        // it could not resolve (implicit int, a C-only recovery), so a failing
+        // translation unit would replace the text the file actually holds.
+        let keep_source_signature =
+            existing.signature.is_some() && get_language_from_path(&existing.file_path) == "c";
+        if incoming.signature.is_some() && !keep_source_signature {
             existing.signature = incoming.signature;
         }
         if incoming.qualified_name.is_some() {
@@ -10920,6 +10925,51 @@ similarity index 90%
         assert_eq!(existing.len(), 2);
         let bar = existing.iter().find(|s| s.name == "BAR").unwrap();
         assert_eq!(bar.confirmed_by, SourceSet::GTAGS);
+    }
+
+    /// clang assumes int for a parameter whose type it cannot resolve, so a
+    /// translation unit missing the typedef reports fuse_req_t as int. The
+    /// signature must stay the text the file holds.
+    #[test]
+    fn a_c_signature_survives_a_backend_that_could_not_resolve_a_type() {
+        let source_text = "int fuse_req_get_payload(fuse_req_t req, unsigned *len)";
+        let mut existing = vec![Symbol {
+            signature: Some(source_text.to_string()),
+            ..sym("fuse_req_get_payload", 10, SourceSet::TREE_SITTER)
+        }];
+        merge_symbols(
+            &mut existing,
+            vec![Symbol {
+                signature: Some("int (int, unsigned int *)".to_string()),
+                ..sym("fuse_req_get_payload", 10, SourceSet::CCLS)
+            }],
+            SourceSet::CCLS,
+        );
+
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].signature.as_deref(), Some(source_text));
+        // The backend still wins everything it ranks for.
+        assert!(existing[0].confirmed_by.contains(SourceSet::CCLS));
+
+        // C++ keeps taking the backend's resolved, qualified rendering.
+        let mut cxx = vec![Symbol {
+            file_path: "a.cc".to_string(),
+            signature: Some("auto run(T t)".to_string()),
+            ..sym("run", 10, SourceSet::TREE_SITTER)
+        }];
+        merge_symbols(
+            &mut cxx,
+            vec![Symbol {
+                file_path: "a.cc".to_string(),
+                signature: Some("void Runner::run(Task &&)".to_string()),
+                ..sym("run", 10, SourceSet::CCLS)
+            }],
+            SourceSet::CCLS,
+        );
+        assert_eq!(
+            cxx[0].signature.as_deref(),
+            Some("void Runner::run(Task &&)")
+        );
     }
 
     fn source_set(bits: &[SourceSet]) -> SourceSet {
