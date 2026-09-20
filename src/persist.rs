@@ -437,6 +437,36 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Which running narsil-mcp holds `repo_root`, from the status files every
+    /// instance writes. The flock names no owner, and the status files are the
+    /// only record of who is serving what.
+    fn holder(repo_root: &Path) -> String {
+        let canonical = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let mine = std::process::id();
+        let holder = crate::pid_status::read_all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|status| status.pid != mine)
+            .find(|status| {
+                status.repos.iter().any(|repo| {
+                    repo.path
+                        .canonicalize()
+                        .unwrap_or_else(|_| repo.path.clone())
+                        == canonical
+                })
+            });
+
+        match holder {
+            Some(status) => format!(
+                "another narsil-mcp: pid {} ({}, {:?})",
+                status.pid, status.transport, status.role
+            ),
+            None => "another process".to_string(),
+        }
+    }
+
     /// Open-or-return the cached redb handle for a repo.
     fn db(&self, repo_root: &Path) -> Result<Arc<Database>> {
         use dashmap::mapref::entry::Entry;
@@ -444,10 +474,21 @@ impl IndexStore {
         match self.dbs.entry(path.clone()) {
             Entry::Occupied(e) => Ok(Arc::clone(e.get())),
             Entry::Vacant(e) => {
-                let db = Arc::new(
-                    Database::create(&path)
-                        .with_context(|| format!("Failed to open redb store {:?}", path))?,
-                );
+                let db = match Database::create(&path) {
+                    Ok(db) => Arc::new(db),
+                    Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                        return Err(anyhow::anyhow!(
+                            "redb store {} is locked by {}. Two instances cannot persist \
+                             the same repository; this one keeps its index in memory.",
+                            path.display(),
+                            Self::holder(repo_root)
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("Failed to open redb store {:?}", path)))
+                    }
+                };
                 e.insert(Arc::clone(&db));
                 Ok(db)
             }
@@ -1779,6 +1820,28 @@ mod tests {
             .edge
             .confirmed_by
             .contains(crate::symbols::SourceSet::CCLS));
+    }
+
+    /// A store another instance holds must say so, and say who holds it —
+    /// 'Failed to open redb store' reads as a corrupt cache instead.
+    #[test]
+    fn a_locked_store_reports_the_lock_and_not_a_failure_to_open() {
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+
+        let holder = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        holder
+            .save_full(&PersistedIndex::new(root.clone()))
+            .unwrap();
+
+        let second = IndexStore::new(dir.path().to_path_buf()).unwrap();
+        let error = second
+            .save_full(&PersistedIndex::new(root.clone()))
+            .expect_err("the store is already locked")
+            .to_string();
+        assert!(error.contains("is locked by"), "{error}");
+        assert!(!error.contains("Failed to open"), "{error}");
     }
 
     fn symbol(name: &str, kind: SymbolKind) -> (String, SymbolKind) {
