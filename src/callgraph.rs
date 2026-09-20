@@ -97,6 +97,10 @@ impl Default for CallGraph {
     }
 }
 
+/// Definitions of one name that `to_markdown` renders in full. A name like
+/// `init` has one per file in a large C tree; the rest are named by count.
+const MAX_RENDERED_DEFINITIONS: usize = 10;
+
 /// Heap bytes owned by one call edge (strings + line_conflicts Vec). Excludes
 /// the edge's inline footprint, counted by the holding Vec's capacity.
 fn call_edge_heap_bytes(edge: &CallEdge) -> usize {
@@ -1347,39 +1351,67 @@ impl CallGraph {
             .collect()
     }
 
+    /// Every node key a query names.
+    ///
+    /// Call sites are recorded against the `file::name` key of the definition
+    /// `resolve_callee` picked, so one name's edges are spread over all its
+    /// definitions — a header declaration beside its definition, a `static`
+    /// helper repeated in several C files. A bare name therefore answers from
+    /// all of them. A query naming a file keeps the single-key resolution.
+    pub fn keys_for_query(&self, query: &str) -> Vec<String> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        if self.nodes.contains_key(query) {
+            return vec![query.to_string()];
+        }
+
+        if !query.contains("::") && !query.contains('/') {
+            let name = method_of_receiver_qualified(query).unwrap_or(query);
+            let keys = self.keys_ending_in_name(name);
+            if !keys.is_empty() {
+                return keys;
+            }
+        }
+
+        self.find_function(query).into_iter().collect()
+    }
+
+    /// Edges of every definition `function` names, folded so identically
+    /// rendered sites are not repeated.
+    fn edges_of(&self, function: &str, pick: fn(&CallNode) -> &Vec<CallEdge>) -> Vec<CallEdge> {
+        let mut edges = Vec::new();
+        for key in self.keys_for_query(function) {
+            if let Some(node) = self.nodes.get(&key) {
+                edges.extend(pick(node.value()).iter().cloned());
+            }
+        }
+        Self::fold_duplicate_sites(edges)
+    }
+
     /// Get direct callers of a function (with fuzzy matching)
     pub fn get_callers(&self, function: &str) -> Vec<CallEdge> {
-        let actual_name = self
-            .find_function(function)
-            .unwrap_or_else(|| function.to_string());
-        self.nodes
-            .get(&actual_name)
-            .map(|n| n.called_by.clone())
-            .unwrap_or_default()
+        self.edges_of(function, |node| &node.called_by)
     }
 
     /// Get functions called by a function (with fuzzy matching)
     pub fn get_callees(&self, function: &str) -> Vec<CallEdge> {
-        let actual_name = self
-            .find_function(function)
-            .unwrap_or_else(|| function.to_string());
-        self.nodes
-            .get(&actual_name)
-            .map(|n| n.calls.clone())
-            .unwrap_or_default()
+        self.edges_of(function, |node| &node.calls)
     }
 
     /// Get transitive callers (all functions that eventually call this) - with fuzzy matching
     pub fn get_transitive_callers(&self, function: &str, max_depth: usize) -> Vec<(String, usize)> {
-        let actual_name = self
-            .find_function(function)
-            .unwrap_or_else(|| function.to_string());
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
-        queue.push_back((actual_name.clone(), 0));
-        visited.insert(actual_name);
+        // Seeded from every definition of the name, like get_callers. Deeper
+        // levels walk `called_by.target`, which is already a resolved key.
+        for key in self.keys_for_query(function) {
+            if visited.insert(key.clone()) {
+                queue.push_back((key, 0));
+            }
+        }
 
         while let Some((func, depth)) = queue.pop_front() {
             if depth > 0 {
@@ -1403,15 +1435,15 @@ impl CallGraph {
 
     /// Get transitive callees (all functions eventually called) - with fuzzy matching
     pub fn get_transitive_callees(&self, function: &str, max_depth: usize) -> Vec<(String, usize)> {
-        let actual_name = self
-            .find_function(function)
-            .unwrap_or_else(|| function.to_string());
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
-        queue.push_back((actual_name.clone(), 0));
-        visited.insert(actual_name);
+        for key in self.keys_for_query(function) {
+            if visited.insert(key.clone()) {
+                queue.push_back((key, 0));
+            }
+        }
 
         while let Some((func, depth)) = queue.pop_front() {
             if depth > 0 {
@@ -1435,21 +1467,25 @@ impl CallGraph {
 
     /// Find the path between two functions - with fuzzy matching
     pub fn find_call_path(&self, from: &str, to: &str) -> Option<Vec<String>> {
-        let actual_from = self.find_function(from).unwrap_or_else(|| from.to_string());
-        let actual_to = self.find_function(to).unwrap_or_else(|| to.to_string());
+        // Any definition of `from` may hold the path, and reaching any
+        // definition of `to` ends it.
+        let targets: HashSet<String> = self.keys_for_query(to).into_iter().collect();
 
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut predecessors: HashMap<String, String> = HashMap::new();
 
-        queue.push_back(actual_from.clone());
-        visited.insert(actual_from);
+        for key in self.keys_for_query(from) {
+            if visited.insert(key.clone()) {
+                queue.push_back(key);
+            }
+        }
 
         while let Some(current) = queue.pop_front() {
-            if current == actual_to {
+            if targets.contains(&current) {
                 // Reconstruct path
-                let mut path = vec![actual_to.clone()];
-                let mut node = actual_to.clone();
+                let mut path = vec![current.clone()];
+                let mut node = current.clone();
                 while let Some(pred) = predecessors.get(&node) {
                     path.push(pred.clone());
                     node = pred.clone();
@@ -1605,11 +1641,14 @@ impl CallGraph {
 
         match function {
             Some(func) => {
-                // Use fuzzy matching to find the function
-                let actual_name = self.find_function(func);
-                if let Some(node) = actual_name.as_ref().and_then(|n| self.nodes.get(n)) {
-                    let display_name = actual_name.as_ref().unwrap();
-                    md.push_str(&format!("# Call Graph: {}\n\n", display_name));
+                // One section per definition the name resolves to
+                let keys = self.keys_for_query(func);
+                let shown = keys.len().min(MAX_RENDERED_DEFINITIONS);
+                for key in &keys[..shown] {
+                    let Some(node) = self.nodes.get(key) else {
+                        continue;
+                    };
+                    md.push_str(&format!("# Call Graph: {}\n\n", key));
                     md.push_str(&format!(
                         "**Location**: `{}:{}`\n",
                         node.file_path, node.line
@@ -1642,9 +1681,18 @@ impl CallGraph {
                                 caller.target, caller.file_path, caller.line
                             ));
                         }
+                        md.push('\n');
                     }
-                } else {
+                }
+                if keys.is_empty() {
                     md.push_str(&format!("Function `{}` not found in call graph.\n", func));
+                } else if keys.len() > shown {
+                    md.push_str(&format!(
+                        "*{} further definition(s) of `{}` not shown; ask for one by \
+                         its file-qualified name.*\n",
+                        keys.len() - shown,
+                        func
+                    ));
                 }
             }
             None => {
@@ -2239,6 +2287,65 @@ int caller(struct q *queue) {
                 "submit".to_string(),
             ]
         );
+    }
+
+    /// Call sites attach to the definition in their own file, so one name's
+    /// callers are spread over its definitions. A bare name must gather all of
+    /// them; the file-qualified name must not.
+    #[test]
+    fn a_bare_name_gathers_the_callers_of_every_definition() {
+        let sources = [
+            (
+                "lib.c",
+                "\
+void session_destroy(void) { }
+
+void user_one(void) { session_destroy(); }
+",
+            ),
+            (
+                "stub.c",
+                "\
+void session_destroy(void) { }
+
+void user_two(void) { session_destroy(); }
+",
+            ),
+        ];
+
+        let mut files = Vec::new();
+        for (path, source) in sources {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_c::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            files.push((path.to_string(), source.to_string(), tree));
+        }
+
+        let graph = CallGraph::new();
+        graph.build_from_files(&files).unwrap();
+
+        let mut callers: Vec<String> = graph
+            .get_callers("session_destroy")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        callers.sort();
+        assert_eq!(
+            callers,
+            vec![
+                "lib.c::user_one".to_string(),
+                "stub.c::user_two".to_string()
+            ]
+        );
+
+        let one: Vec<String> = graph
+            .get_callers("stub.c::session_destroy")
+            .into_iter()
+            .map(|edge| edge.target)
+            .collect();
+        assert_eq!(one, vec!["stub.c::user_two".to_string()]);
     }
 
     /// `TestRunner.run_one` is how the method is written in the source and in

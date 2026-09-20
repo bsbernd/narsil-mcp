@@ -9096,32 +9096,23 @@ fn path_is_within_repo(path: &Path, repo: &Path) -> bool {
 }
 
 /// Header naming every definition of `function` when the graph holds more than
-/// one, so edges gathered from a single file cannot read as the whole picture.
+/// one, so edges gathered from several files cannot read as one definition's own.
 /// Empty when the name is unambiguous.
 fn ambiguity_note(call_graph: &CallGraph, function: &str) -> String {
     let matches = call_graph.find_all_functions(function);
     if matches.len() < 2 {
         return String::new();
     }
-    let chosen = call_graph.find_function(function).unwrap_or_default();
-    let others: Vec<String> = matches
-        .iter()
-        .filter(|key| **key != chosen)
-        .map(|key| format!("`{}`", key))
-        .collect();
+    let named: Vec<String> = matches.iter().map(|key| format!("`{}`", key)).collect();
 
     format!(
-        "> `{}` has {} definitions. Showing `{}`.\n\
-         > Also defined in: {}.\n\
-         > Pass the file-qualified name (e.g. `{}`) to select another.\n\n",
+        "> `{}` has {} definitions; the edges of all of them are listed.\n\
+         > Defined in: {}.\n\
+         > Pass the file-qualified name (e.g. `{}`) for one alone.\n\n",
         function,
         matches.len(),
-        chosen,
-        others.join(", "),
-        matches
-            .iter()
-            .find(|key| **key != chosen)
-            .unwrap_or(&chosen),
+        named.join(", "),
+        matches[0],
     )
 }
 
@@ -9880,8 +9871,8 @@ mod tests {
     }
 
     /// Two examples in one repo each define a static `update_fs_loop`. The
-    /// alphabetically first one wins the lookup, so the answer has to say that
-    /// a choice was made and how to make the other one.
+    /// answer carries the edges of both, so it has to say so, name them, and
+    /// say how to ask for one alone.
     #[test]
     fn a_repeated_function_name_names_its_other_definitions() {
         let mut parser = tree_sitter::Parser::new();
@@ -9907,7 +9898,7 @@ mod tests {
 
         let note = ambiguity_note(&call_graph, "update_fs_loop");
         assert!(note.contains("has 2 definitions"));
-        assert!(note.contains("Showing `example/invalidate_path.c::update_fs_loop`"));
+        assert!(note.contains("`example/invalidate_path.c::update_fs_loop`"));
         assert!(note.contains("`example/notify_prune.c::update_fs_loop`"));
 
         // A name defined once says nothing at all.
