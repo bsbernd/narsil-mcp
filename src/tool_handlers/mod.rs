@@ -136,6 +136,7 @@ impl ToolRegistry {
         mut args: Value,
     ) -> Result<String> {
         normalize_arg_aliases(&mut args);
+        reject_undeclared_args(name, &args)?;
         resolve_repo_from_path(engine, name, &mut args);
         // Index-backed tools must not answer from an index that is being
         // rebuilt: hold a read lease for the call, or refuse with EAGAIN.
@@ -256,6 +257,15 @@ impl ArgExtractor for Value {
     }
 }
 
+// (canonical, alias) pairs.
+const ALIASES: &[(&str, &str)] = &[
+    ("path", "file_path"),
+    ("path", "file"),
+    ("repo", "repo_path"),
+    ("symbol", "symbol_name"),
+    ("commit", "commit_hash"),
+];
+
 /// Map well-known argument-name aliases onto the canonical names used by the
 /// handlers, in place. Clients reach for a plausible-but-wrong key
 /// (`file_path` for `path`, `repo_path` for `repo`, `symbol_name` for
@@ -265,14 +275,6 @@ impl ArgExtractor for Value {
 /// that falls through to an all-repos search. An explicit canonical key always
 /// wins over its alias.
 fn normalize_arg_aliases(args: &mut Value) {
-    // (canonical, alias) pairs.
-    const ALIASES: &[(&str, &str)] = &[
-        ("path", "file_path"),
-        ("path", "file"),
-        ("repo", "repo_path"),
-        ("symbol", "symbol_name"),
-        ("commit", "commit_hash"),
-    ];
     if let Some(obj) = args.as_object_mut() {
         for (canonical, alias) in ALIASES {
             if !obj.contains_key(*canonical) {
@@ -291,6 +293,49 @@ fn normalize_arg_aliases(args: &mut Value) {
             }
         }
     }
+}
+
+/// Refuse an argument the tool's schema does not declare. A handler reads the
+/// keys it knows and ignores the rest, so a mistaken one (`mode` on a tool
+/// with no modes) leaves an answer that reads as if it had been honoured —
+/// the whole query silently means something else. Aliases and camelCase are
+/// accepted: normalize_arg_aliases has already put their canonical form in.
+fn reject_undeclared_args(tool: &str, args: &Value) -> Result<()> {
+    let Some(metadata) = crate::tool_metadata::get_tool_metadata(tool) else {
+        return Ok(());
+    };
+    let Some(properties) = metadata.input_schema["properties"].as_object() else {
+        return Ok(());
+    };
+    let Some(passed) = args.as_object() else {
+        return Ok(());
+    };
+
+    let declared = |key: &str| {
+        properties.contains_key(key)
+            || properties.contains_key(&snake_case(key))
+            || ALIASES
+                .iter()
+                .any(|(canonical, alias)| *alias == key && properties.contains_key(*canonical))
+    };
+
+    let undeclared: Vec<&str> = passed
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !declared(key))
+        .collect();
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+
+    let mut accepted: Vec<&str> = properties.keys().map(String::as_str).collect();
+    accepted.sort_unstable();
+    Err(anyhow::anyhow!(
+        "{} does not take {}. It takes: {}.",
+        tool,
+        undeclared.join(", "),
+        accepted.join(", ")
+    ))
 }
 
 /// An absolute `path` already names the repository it lives in: take `repo`
@@ -509,6 +554,31 @@ mod tests {
 
         assert_eq!(args.get_bool("enabled"), Some(true));
         assert!(!args.get_bool_or("missing", false));
+    }
+
+    /// An argument no tool declares changes nothing, so an answer computed
+    /// without it looks like an answer that honoured it. It must be refused.
+    #[test]
+    fn an_undeclared_argument_is_refused() {
+        let args = serde_json::json!({"query": "a|b", "depth": 3});
+        let error = reject_undeclared_args("search_code", &args)
+            .expect_err("search_code has no depth argument")
+            .to_string();
+        assert!(error.contains("does not take depth"), "{error}");
+        assert!(error.contains("file_pattern"), "{error}");
+
+        // Declared, aliased and camelCase forms all pass.
+        let good = serde_json::json!({
+            "query": "a|b",
+            "mode": "regex",
+            "repo_path": "/tmp/r",
+            "maxResults": 5,
+            "max_results": 5,
+        });
+        assert!(reject_undeclared_args("search_code", &good).is_ok());
+
+        // A tool with no metadata is not second-guessed.
+        assert!(reject_undeclared_args("no_such_tool", &args).is_ok());
     }
 
     #[test]

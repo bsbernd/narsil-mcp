@@ -168,6 +168,8 @@ pub struct SearchOptions {
     pub max_results: Option<usize>,
     /// Whether to exclude test files
     pub exclude_tests: Option<bool>,
+    /// How the query is matched (`text`, `regex`)
+    pub mode: Option<String>,
 }
 
 impl SearchOptions {
@@ -184,6 +186,9 @@ impl SearchOptions {
         }
         if let Some(et) = self.exclude_tests {
             hasher.update([et as u8]);
+        }
+        if let Some(ref mode) = self.mode {
+            hasher.update(mode.as_bytes());
         }
         format!("{:x}", hasher.finalize())[..16].to_string()
     }
@@ -526,6 +531,7 @@ mod tests {
             file_pattern: Some("*.rs".to_string()),
             max_results: Some(10),
             exclude_tests: Some(true),
+            mode: None,
         };
         let key = QueryCacheKey::code_search_with_options(Some("repo"), "query", &options);
         assert!(key.options_hash.is_some());
@@ -537,11 +543,13 @@ mod tests {
             file_pattern: Some("*.rs".to_string()),
             max_results: Some(10),
             exclude_tests: Some(true),
+            mode: None,
         };
         let options2 = SearchOptions {
             file_pattern: Some("*.rs".to_string()),
             max_results: Some(10),
             exclude_tests: Some(true),
+            mode: None,
         };
         assert_eq!(options1.to_hash(), options2.to_hash());
     }
@@ -552,11 +560,13 @@ mod tests {
             file_pattern: Some("*.rs".to_string()),
             max_results: Some(10),
             exclude_tests: Some(true),
+            mode: None,
         };
         let options2 = SearchOptions {
             file_pattern: Some("*.py".to_string()),
             max_results: Some(10),
             exclude_tests: Some(true),
+            mode: None,
         };
         assert_ne!(options1.to_hash(), options2.to_hash());
     }

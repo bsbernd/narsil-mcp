@@ -45,6 +45,62 @@ async fn engine_for(repo_paths: Vec<PathBuf>) -> Result<(CodeIntelEngine, TempDi
     Ok((engine, index_dir))
 }
 
+/// The reported case: an alternation of macro names. Text mode reads it as one
+/// literal and finds nothing; regex mode must find every branch.
+#[tokio::test]
+async fn regex_mode_matches_an_alternation_text_mode_cannot() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_file(
+        "src/include/nio_uring.h",
+        "#define QUEUE_DEPTH_DEF 64\n#define QUEUE_DEPTH_MAX 256\n",
+    )?;
+    repo.add_file(
+        "src/nio_uring.c",
+        "int depth = QUEUE_DEPTH_DEF;\nint entries = URING_ENTRIES_MAX;\n",
+    )?;
+    let repo_path = repo.path().canonicalize()?;
+    let (engine, _index) = engine_for(vec![repo_path.clone()]).await?;
+    let repo_arg = repo_path.to_string_lossy().to_string();
+    let alternation = "QUEUE_DEPTH_DEF|QUEUE_DEPTH_MAX|URING_ENTRIES_MAX";
+
+    let text = engine
+        .search_code(Some(&repo_arg), alternation, None, 60, None, None)
+        .await?;
+    assert!(
+        text.contains("Found 0 results"),
+        "text mode reads the alternation as a literal:\n{text}"
+    );
+
+    let regex = engine
+        .search_code(Some(&repo_arg), alternation, None, 60, None, Some("regex"))
+        .await?;
+    assert!(
+        regex.contains("nio_uring.h") && regex.contains("nio_uring.c"),
+        "regex mode must find every branch:\n{regex}"
+    );
+
+    let broken = engine
+        .search_code(
+            Some(&repo_arg),
+            "QUEUE_DEPTH_(",
+            None,
+            60,
+            None,
+            Some("regex"),
+        )
+        .await;
+    assert!(
+        broken.is_err(),
+        "an unparsable pattern must be reported, not silently match nothing"
+    );
+
+    let unknown_mode = engine
+        .search_code(Some(&repo_arg), "depth", None, 60, None, Some("glob"))
+        .await;
+    assert!(unknown_mode.is_err(), "an unknown mode must be refused");
+    Ok(())
+}
+
 /// A multi-word query whose terms sit on different lines must still find the
 /// file (via the file-level fallback), not return zero results.
 #[tokio::test]
@@ -64,6 +120,7 @@ async fn test_search_code_multi_token_non_adjacent() -> Result<()> {
             "struct tool_config",
             None,
             10,
+            None,
             None,
         )
         .await?;
@@ -107,6 +164,7 @@ async fn test_search_code_fallback_prefers_code_over_comments() -> Result<()> {
             None,
             10,
             None,
+            None,
         )
         .await?;
 
@@ -141,6 +199,7 @@ async fn test_search_code_phrase_on_one_line_no_fallback() -> Result<()> {
             None,
             10,
             None,
+            None,
         )
         .await?;
 
@@ -164,7 +223,9 @@ async fn test_search_code_labels_repo_across_repos() -> Result<()> {
     let (engine, _index) = engine_for(vec![path_a.clone(), path_b.clone()]).await?;
 
     // repo=None searches all indexed repos.
-    let out = engine.search_code(None, "widget", None, 10, None).await?;
+    let out = engine
+        .search_code(None, "widget", None, 10, None, None)
+        .await?;
 
     assert!(
         out.contains("**Repo**:"),
@@ -187,7 +248,14 @@ async fn test_search_code_no_repo_label_single_repo() -> Result<()> {
     let (engine, _index) = engine_for(vec![repo_path.clone()]).await?;
 
     let out = engine
-        .search_code(Some(&repo_path.to_string_lossy()), "widget", None, 10, None)
+        .search_code(
+            Some(&repo_path.to_string_lossy()),
+            "widget",
+            None,
+            10,
+            None,
+            None,
+        )
         .await?;
 
     assert!(out.contains("widget"), "hit must be found:\n{out}");

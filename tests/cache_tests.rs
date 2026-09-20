@@ -47,12 +47,14 @@ fn test_search_options_cache_key_uniqueness() {
         file_pattern: Some("*.rs".to_string()),
         max_results: Some(10),
         exclude_tests: Some(true),
+        mode: None,
     };
 
     let options2 = SearchOptions {
         file_pattern: Some("*.rs".to_string()),
         max_results: Some(20), // Different max_results
         exclude_tests: Some(true),
+        mode: None,
     };
 
     let key1 = QueryCacheKey::code_search_with_options(Some("repo"), "query", &options1);

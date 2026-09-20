@@ -3512,6 +3512,7 @@ impl CodeIntelEngine {
                 file_pattern: file_pattern.map(String::from),
                 max_results: Some(limit),
                 exclude_tests,
+                mode: None,
             };
             let query = format!(
                 "{}|{}",
@@ -3899,8 +3900,28 @@ impl CodeIntelEngine {
         file_pattern: Option<&str>,
         max_results: usize,
         exclude_tests: Option<bool>,
+        mode: Option<&str>,
     ) -> Result<String> {
         use crate::extract::is_test_file;
+
+        // A pattern the regex crate rejects has to say so: silently matching
+        // nothing reads as "the code is not there".
+        let pattern = match mode {
+            Some("regex") => Some(regex::Regex::new(query).map_err(|e| {
+                anyhow!(
+                    "Invalid regex `{}` for search_code(mode=\"regex\"): {}",
+                    query,
+                    e
+                )
+            })?),
+            Some("text") | None => None,
+            Some(other) => {
+                return Err(anyhow!(
+                    "search_code does not know mode `{}`. Accepted modes: text (default), regex.",
+                    other
+                ))
+            }
+        };
 
         // Build cache key from query parameters
         let cache_key = {
@@ -3908,6 +3929,7 @@ impl CodeIntelEngine {
                 file_pattern: file_pattern.map(String::from),
                 max_results: Some(max_results),
                 exclude_tests,
+                mode: mode.map(String::from),
             };
             QueryCacheKey::code_search_with_options(repo, query, &options)
         };
@@ -4002,11 +4024,19 @@ impl CodeIntelEngine {
                 let lines: Vec<&str> = content.lines().collect();
 
                 for (line_num, line) in lines.iter().enumerate() {
-                    let line_lower = line.to_lowercase();
-                    let matched = line_lower.contains(&query_lower)
-                        || (multi_token && tokens.iter().all(|t| line_lower.contains(t.as_str())));
-                    if matched {
-                        let score = calculate_relevance(line, &query_lower);
+                    let score = match &pattern {
+                        Some(re) => re
+                            .find(line)
+                            .map(|hit| calculate_relevance(line, &hit.as_str().to_lowercase())),
+                        None => {
+                            let line_lower = line.to_lowercase();
+                            let matched = line_lower.contains(&query_lower)
+                                || (multi_token
+                                    && tokens.iter().all(|t| line_lower.contains(t.as_str())));
+                            matched.then(|| calculate_relevance(line, &query_lower))
+                        }
+                    };
+                    if let Some(score) = score {
                         results.push((
                             repo_name.clone(),
                             make_excerpt(&lines, line_num, &rel_path, score),
@@ -4020,7 +4050,7 @@ impl CodeIntelEngine {
         // back to files that contain every token somewhere, anchored at the
         // first token occurrence. Runs only when pass 1 found nothing, so it
         // never dilutes precise single-line hits.
-        let used_fallback = results.is_empty() && multi_token;
+        let used_fallback = results.is_empty() && multi_token && pattern.is_none();
         if used_fallback {
             for repo_name in &repos_to_search {
                 let repo_path = PathBuf::from(repo_name);
@@ -6353,6 +6383,7 @@ impl CodeIntelEngine {
                 file_pattern: None,
                 max_results: Some(max_results),
                 exclude_tests,
+                mode: None,
             };
             QueryCacheKey::code_search_with_options(repo, format!("semantic:{}", query), &options)
         };
@@ -10234,7 +10265,14 @@ similarity index 90%
         engine.reindex_all().await.unwrap();
 
         let out = engine
-            .search_code(Some(repo.to_str().unwrap()), "--verbose", None, 10, None)
+            .search_code(
+                Some(repo.to_str().unwrap()),
+                "--verbose",
+                None,
+                10,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
