@@ -1536,11 +1536,29 @@ impl CodeIntelEngine {
         Ok(())
     }
 
+    /// Make the git tools answer for `repo_name`, unless --git is off or its
+    /// work tree is already registered. A path git does not own is skipped
+    /// silently: the git tools then report it as they do for any non-checkout.
+    fn register_git_repo(&self, repo_name: &str, path: &Path) {
+        if !self.options.git_enabled || self.git_repos.contains_key(repo_name) {
+            return;
+        }
+        match GitRepo::new(path) {
+            Ok(git_repo) => {
+                info!("Git enabled for repository: {}", repo_name);
+                self.git_repos.insert(repo_name.to_string(), git_repo);
+            }
+            Err(e) => debug!("Failed to initialize git for {}: {}", repo_name, e),
+        }
+    }
+
     /// Build (or rebuild) the index for `path`. The caller holds the repo's
     /// update lease — `reindex` needs it across the clears preceding this call.
     async fn index_repo(&self, path: &Path) -> Result<()> {
         let start_time = std::time::Instant::now();
         let repo_name = canonical_repo_key(path)?;
+
+        self.register_git_repo(&repo_name, path);
 
         // If symbols are already loaded from the persistence cache, skip the
         // expensive per-symbol embedding indexing — BM25 and call graph still
@@ -10410,6 +10428,70 @@ similarity index 90%
         assert!(
             !surviving.iter().any(|path| path == &adopted),
             "an idle adopted repo must be dropped: {surviving:?}"
+        );
+    }
+
+    /// A repo the server was not started with — every adopted one, since
+    /// adoption is a reindex over HTTP — must get the git tools too.
+    #[tokio::test]
+    async fn a_repo_registered_after_startup_answers_the_git_tools() {
+        fn git(repo: &Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let configured = temp.path().join("configured");
+        let adopted = temp.path().join("adopted");
+        for repo in [&configured, &adopted] {
+            std::fs::create_dir_all(repo).unwrap();
+            std::fs::write(repo.join("lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        }
+        git(&adopted, &["init", "-q"]);
+        git(&adopted, &["add", "lib.rs"]);
+        git(
+            &adopted,
+            &[
+                "-c",
+                "user.name=narsil",
+                "-c",
+                "user.email=narsil@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "add lib.rs",
+            ],
+        );
+
+        let options = EngineOptions {
+            git_enabled: true,
+            ..EngineOptions::default()
+        };
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![configured.clone()],
+            options,
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+
+        engine
+            .reindex(Some(adopted.to_str().unwrap()))
+            .await
+            .expect("adopting a repo the engine was not started with");
+
+        let history = engine
+            .get_file_history(adopted.to_str().unwrap(), "lib.rs", 5)
+            .await
+            .expect("an adopted repo must answer the git tools");
+        assert!(
+            history.contains("add lib.rs"),
+            "history of the adopted repo: {history}"
         );
     }
 
