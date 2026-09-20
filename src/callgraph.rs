@@ -1405,8 +1405,6 @@ impl CallGraph {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
-        // Seeded from every definition of the name, like get_callers. Deeper
-        // levels walk `called_by.target`, which is already a resolved key.
         for key in self.keys_for_query(function) {
             if visited.insert(key.clone()) {
                 queue.push_back((key, 0));
@@ -1579,17 +1577,6 @@ impl CallGraph {
         hotspots
     }
 
-    /// Get highly connected functions with a limit on results.
-    pub fn get_hotspots_limited(
-        &self,
-        min_connections: usize,
-        limit: usize,
-    ) -> Vec<(String, usize, usize)> {
-        let mut hotspots = self.get_hotspots(min_connections);
-        hotspots.truncate(limit);
-        hotspots
-    }
-
     /// Get function metrics
     pub fn get_metrics(&self, function: &str) -> Option<FunctionMetrics> {
         let actual_name = self.find_function(function)?;
@@ -1635,14 +1622,19 @@ impl CallGraph {
         dot
     }
 
-    /// Format call graph as markdown for AI consumption
-    pub fn to_markdown(&self, function: Option<&str>) -> String {
+    /// Format call graph as markdown for AI consumption.
+    /// `exclude_tests` drops the rows whose file is test code.
+    pub fn to_markdown(&self, function: Option<&str>, exclude_tests: bool) -> String {
+        let keep = |file: &str| !exclude_tests || !crate::extract::is_test_file(file);
         let mut md = String::new();
 
         match function {
             Some(func) => {
-                // One section per definition the name resolves to
-                let keys = self.keys_for_query(func);
+                let keys: Vec<String> = self
+                    .keys_for_query(func)
+                    .into_iter()
+                    .filter(|key| keep(file_of_key(key)))
+                    .collect();
                 let shown = keys.len().min(MAX_RENDERED_DEFINITIONS);
                 for key in &keys[..shown] {
                     let Some(node) = self.nodes.get(key) else {
@@ -1658,11 +1650,22 @@ impl CallGraph {
                         node.metrics.cyclomatic, node.metrics.loc, node.metrics.max_depth
                     ));
 
+                    let calls: Vec<&CallEdge> = node
+                        .calls
+                        .iter()
+                        .filter(|call| keep(file_of_key(&call.target)))
+                        .collect();
+                    let called_by: Vec<&CallEdge> = node
+                        .called_by
+                        .iter()
+                        .filter(|caller| keep(&caller.file_path))
+                        .collect();
+
                     md.push_str("## Calls (outgoing)\n\n");
-                    if node.calls.is_empty() {
+                    if calls.is_empty() {
                         md.push_str("*No outgoing calls*\n\n");
                     } else {
-                        for call in &node.calls {
+                        for call in calls {
                             md.push_str(&format!(
                                 "- `{}` at `{}:{}` ({:?})\n",
                                 call.target, call.file_path, call.line, call.call_type
@@ -1672,10 +1675,10 @@ impl CallGraph {
                     }
 
                     md.push_str("## Called By (incoming)\n\n");
-                    if node.called_by.is_empty() {
+                    if called_by.is_empty() {
                         md.push_str("*No incoming calls (entry point or unused)*\n\n");
                     } else {
-                        for caller in &node.called_by {
+                        for caller in called_by {
                             md.push_str(&format!(
                                 "- `{}` at `{}:{}`\n",
                                 caller.target, caller.file_path, caller.line
@@ -1704,6 +1707,7 @@ impl CallGraph {
                 let mut by_callers: Vec<_> = self
                     .nodes
                     .iter()
+                    .filter(|e| keep(file_of_key(e.key())))
                     .map(|e| (e.key().clone(), e.called_by.len()))
                     .collect();
                 by_callers.sort_by_key(|caller| std::cmp::Reverse(caller.1));
@@ -1718,6 +1722,7 @@ impl CallGraph {
                 let mut by_complexity: Vec<_> = self
                     .nodes
                     .iter()
+                    .filter(|e| keep(file_of_key(e.key())))
                     .map(|e| (e.key().clone(), e.metrics.clone()))
                     .collect();
                 by_complexity.sort_by_key(|entry| std::cmp::Reverse(entry.1.cyclomatic));
@@ -1793,6 +1798,13 @@ impl CallGraph {
     ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, String, CallNode>> {
         self.nodes.iter()
     }
+}
+
+/// The file part of a node key (`lib/fuse.c::fuse_session_destroy` ->
+/// `lib/fuse.c`). An unresolved callee has no `::` and yields the bare name,
+/// which names no file and so passes a test-file filter.
+pub(crate) fn file_of_key(key: &str) -> &str {
+    key.rsplit_once("::").map(|(file, _)| file).unwrap_or(key)
 }
 
 /// The method part of a receiver-qualified query (`TestRunner.run_one` ->
@@ -3093,7 +3105,7 @@ class TestRunner:
 
         graph.nodes.insert("test_func".to_string(), node);
 
-        let markdown = graph.to_markdown(Some("test_func"));
+        let markdown = graph.to_markdown(Some("test_func"), false);
 
         assert!(markdown.contains("# Call Graph: test_func"));
         assert!(markdown.contains("/path/to/file.rs:42"));
@@ -3103,11 +3115,44 @@ class TestRunner:
         assert!(markdown.contains("main"));
     }
 
+    /// exclude_tests drops a caller sitting in a test file and keeps the rest.
+    #[test]
+    fn exclude_tests_drops_a_caller_in_a_test_file() {
+        let source = "\
+void probe(void) { }
+
+void user(void) { probe(); }
+";
+        let test_source = "\
+void run_case(void) { probe(); }
+";
+        let mut files = Vec::new();
+        for (path, text) in [("lib/probe.c", source), ("test/case.c", test_source)] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_c::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            files.push((path.to_string(), text.to_string(), tree));
+        }
+
+        let graph = CallGraph::new();
+        graph.build_from_files(&files).unwrap();
+
+        let all = graph.to_markdown(Some("probe"), false);
+        assert!(all.contains("test/case.c::run_case"));
+        assert!(all.contains("lib/probe.c::user"));
+
+        let without_tests = graph.to_markdown(Some("probe"), true);
+        assert!(!without_tests.contains("test/case.c::run_case"));
+        assert!(without_tests.contains("lib/probe.c::user"));
+    }
+
     #[test]
     fn test_to_markdown_nonexistent_function() {
         let graph = CallGraph::new();
 
-        let markdown = graph.to_markdown(Some("nonexistent"));
+        let markdown = graph.to_markdown(Some("nonexistent"), false);
 
         assert!(markdown.contains("Function `nonexistent` not found"));
     }
@@ -3134,7 +3179,7 @@ class TestRunner:
 
         graph.nodes.insert("func1".to_string(), node1);
 
-        let markdown = graph.to_markdown(None);
+        let markdown = graph.to_markdown(None, false);
 
         assert!(markdown.contains("# Call Graph Summary"));
         assert!(markdown.contains("**Total Functions**: 1"));

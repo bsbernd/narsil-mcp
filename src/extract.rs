@@ -377,6 +377,8 @@ pub fn is_test_file(path: &str) -> bool {
         || path_lower.contains("/mocks/")
         || path_lower.contains("/__mocks__/")
         || path_lower.contains("/spec/")
+        || path_lower.starts_with("test/")
+        || path_lower.starts_with("tests/")
         // Also catch test-fixtures at start of path or after a slash
         || path_lower.starts_with("test-fixtures/")
         || path_lower.contains("/test-fixtures/")

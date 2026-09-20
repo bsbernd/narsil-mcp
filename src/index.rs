@@ -6455,10 +6455,9 @@ impl CodeIntelEngine {
         repo: &str,
         function: &str,
         _depth: usize,
-        _exclude_tests: Option<bool>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
-        // For now, the parameter is accepted but filtering happens at source
+        let exclude_tests = exclude_tests.unwrap_or(false);
 
         let repo = self.resolve_repo(repo)?;
 
@@ -6470,7 +6469,11 @@ impl CodeIntelEngine {
         }
 
         // Build cache key with function as discriminator
-        let cache_key = AnalysisCacheKey::with_discriminator(&repo, "call_graph", function);
+        let cache_key = AnalysisCacheKey::with_discriminator(
+            &repo,
+            "call_graph",
+            format!("{}|{}", function, exclude_tests),
+        );
 
         // Compute repo hash for invalidation
         let repo_hash = self.compute_repo_hash(&repo);
@@ -6498,7 +6501,7 @@ impl CodeIntelEngine {
         } else {
             Some(function)
         };
-        let result = call_graph.to_markdown(func_option);
+        let result = call_graph.to_markdown(func_option, exclude_tests);
 
         // Cache the result
         if self.options.cache_enabled {
@@ -6564,10 +6567,14 @@ impl CodeIntelEngine {
         function: &str,
         transitive: bool,
         max_depth: usize,
-        _exclude_tests: Option<bool>,
+        exclude_tests: Option<bool>,
         window: response_budget::ListWindow,
     ) -> Result<String> {
+        use crate::callgraph::file_of_key;
+        use crate::extract::is_test_file;
+
         let repo = self.resolve_repo(repo)?;
+        let exclude_tests = exclude_tests.unwrap_or(false);
 
         if function.trim().is_empty() {
             return Err(anyhow!(
@@ -6587,7 +6594,10 @@ impl CodeIntelEngine {
         let cache_key = AnalysisCacheKey::with_discriminator(
             &repo,
             "callers_hybrid",
-            format!("{}|{}|{}", function, window.offset, window.limit),
+            format!(
+                "{}|{}|{}|{}",
+                function, window.offset, window.limit, exclude_tests
+            ),
         );
         let repo_hash = self.compute_repo_hash(&repo);
         if self.options.cache_enabled {
@@ -6611,7 +6621,10 @@ impl CodeIntelEngine {
         output.push_str(&ambiguity_note(&call_graph, function));
 
         if transitive {
-            let callers = call_graph.get_transitive_callers(function, max_depth);
+            let mut callers = call_graph.get_transitive_callers(function, max_depth);
+            if exclude_tests {
+                callers.retain(|(key, _)| !is_test_file(file_of_key(key)));
+            }
             output.push_str(&format!(
                 "Found {} transitive callers (max depth: {})\n\n",
                 callers.len(),
@@ -6707,7 +6720,10 @@ impl CodeIntelEngine {
                 }
             }
 
-            let callers = CallGraph::fold_duplicate_sites(callers);
+            let mut callers = CallGraph::fold_duplicate_sites(callers);
+            if exclude_tests {
+                callers.retain(|edge| !is_test_file(&edge.file_path));
+            }
 
             output.push_str(&format!("Found {} direct callers\n\n", callers.len()));
             let (page, capped) = response_budget::cap(&callers, window, "get_callers");
@@ -6763,10 +6779,14 @@ impl CodeIntelEngine {
         function: &str,
         transitive: bool,
         max_depth: usize,
-        _exclude_tests: Option<bool>,
+        exclude_tests: Option<bool>,
         window: response_budget::ListWindow,
     ) -> Result<String> {
+        use crate::callgraph::file_of_key;
+        use crate::extract::is_test_file;
+
         let repo = self.resolve_repo(repo)?;
+        let exclude_tests = exclude_tests.unwrap_or(false);
 
         if function.trim().is_empty() {
             return Err(anyhow!(
@@ -6784,7 +6804,10 @@ impl CodeIntelEngine {
         let cache_key = AnalysisCacheKey::with_discriminator(
             &repo,
             "callees_hybrid",
-            format!("{}|{}|{}", function, window.offset, window.limit),
+            format!(
+                "{}|{}|{}|{}",
+                function, window.offset, window.limit, exclude_tests
+            ),
         );
         let repo_hash = self.compute_repo_hash(&repo);
         if self.options.cache_enabled {
@@ -6808,7 +6831,10 @@ impl CodeIntelEngine {
         output.push_str(&ambiguity_note(&call_graph, function));
 
         if transitive {
-            let callees = call_graph.get_transitive_callees(function, max_depth);
+            let mut callees = call_graph.get_transitive_callees(function, max_depth);
+            if exclude_tests {
+                callees.retain(|(key, _)| !is_test_file(file_of_key(key)));
+            }
             output.push_str(&format!(
                 "Found {} transitive callees (max depth: {})\n\n",
                 callees.len(),
@@ -6823,7 +6849,10 @@ impl CodeIntelEngine {
                 output.push_str(&capped.footer());
             }
         } else {
-            let callees = CallGraph::fold_duplicate_sites(call_graph.get_callees(function));
+            let mut callees = CallGraph::fold_duplicate_sites(call_graph.get_callees(function));
+            if exclude_tests {
+                callees.retain(|edge| !is_test_file(file_of_key(&edge.target)));
+            }
             output.push_str(&format!("Found {} direct callees\n\n", callees.len()));
             let (page, capped) = response_budget::cap(&callees, window, "get_callees");
             for callee in page {
@@ -6961,9 +6990,12 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         min_connections: usize,
-        _exclude_tests: Option<bool>,
+        exclude_tests: Option<bool>,
     ) -> Result<String> {
-        // Note: exclude_tests filtering would require call graph regeneration
+        use crate::callgraph::file_of_key;
+        use crate::extract::is_test_file;
+
+        let exclude_tests = exclude_tests.unwrap_or(false);
         let repo = self.resolve_repo(repo)?;
 
         if !self.is_fully_initialized() {
@@ -6981,8 +7013,13 @@ impl CodeIntelEngine {
         })?;
 
         let default_limit = 50;
-        let hotspots = call_graph.get_hotspots_limited(min_connections, default_limit);
-        let total_count = call_graph.get_hotspots(min_connections).len();
+        let mut all_hotspots = call_graph.get_hotspots(min_connections);
+        if exclude_tests {
+            all_hotspots.retain(|(key, _, _)| !is_test_file(file_of_key(key)));
+        }
+        let total_count = all_hotspots.len();
+        let mut hotspots = all_hotspots;
+        hotspots.truncate(default_limit);
 
         let mut output = String::new();
         output.push_str(&format!(
