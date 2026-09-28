@@ -169,6 +169,16 @@ impl LanguageParser {
                     (type_definition declarator: (type_identifier) @type.name) @type.def
                     (preproc_def name: (identifier) @macro.name) @macro.def
                     (preproc_function_def name: (identifier) @macro.name) @macro.def
+                    (translation_unit
+                      (declaration
+                        declarator: [
+                          (identifier) @var.name
+                          (pointer_declarator declarator: (identifier) @var.name)
+                          (array_declarator declarator: (identifier) @var.name)
+                          (init_declarator declarator: (identifier) @var.name)
+                          (init_declarator declarator: (pointer_declarator declarator: (identifier) @var.name))
+                          (init_declarator declarator: (array_declarator declarator: (identifier) @var.name))
+                        ]) @var.def)
                 "#,
             },
             // C++
@@ -199,6 +209,16 @@ impl LanguageParser {
                     (namespace_definition name: (namespace_identifier) @namespace.name) @namespace.def
                     (preproc_def name: (identifier) @macro.name) @macro.def
                     (preproc_function_def name: (identifier) @macro.name) @macro.def
+                    (translation_unit
+                      (declaration
+                        declarator: [
+                          (identifier) @var.name
+                          (pointer_declarator declarator: (identifier) @var.name)
+                          (array_declarator declarator: (identifier) @var.name)
+                          (init_declarator declarator: (identifier) @var.name)
+                          (init_declarator declarator: (pointer_declarator declarator: (identifier) @var.name))
+                          (init_declarator declarator: (array_declarator declarator: (identifier) @var.name))
+                        ]) @var.def)
                 "#,
             },
             // Java
@@ -846,6 +866,56 @@ static int helper(void) { return MAX_USERS; }
             .symbols
             .iter()
             .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
+    }
+
+    /// A file-scope variable declaration parses as `declaration`, a node the
+    /// C/C++ query had no pattern for at all: a static struct-literal table
+    /// (the reported case), a plain scalar, and a pointer must all surface as
+    /// Variable symbols. A local of the same shape, inside a function body,
+    /// must not — it is not anchored under `translation_unit`.
+    #[test]
+    fn test_parse_c_file_scope_variables() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+struct export_operations { int (*encode_fh)(void); };
+
+static const struct export_operations fuse_export_operations = {
+    .encode_fh = 0,
+};
+
+int global_counter = 0;
+
+static char *global_name = "widget";
+
+static int helper(void) {
+    int local_counter = 1;
+    return local_counter;
+}
+"#;
+        let parsed = parser.parse_file(Path::new("widget.c"), content).unwrap();
+
+        let vars: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Variable)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            vars.contains(&"fuse_export_operations"),
+            "static struct-literal global missing, got {vars:?}"
+        );
+        assert!(
+            vars.contains(&"global_counter"),
+            "plain scalar global missing, got {vars:?}"
+        );
+        assert!(
+            vars.contains(&"global_name"),
+            "pointer global missing, got {vars:?}"
+        );
+        assert!(
+            !vars.contains(&"local_counter"),
+            "function-local variable must not be indexed as file scope, got {vars:?}"
+        );
     }
 
     /// The names-only path feeds the definition map while the index proper
