@@ -1203,8 +1203,18 @@ pub struct AsyncFileWatcher {
 
 #[cfg(feature = "native")]
 impl AsyncFileWatcher {
-    /// Create a new async file watcher and return a channel receiver for events
-    pub fn new() -> Result<(Self, mpsc::Receiver<Vec<FileChange>>)> {
+    /// Create a new async file watcher and return a channel receiver for
+    /// batches of changes, each already holding the update-window leases for
+    /// the repos it touches.
+    ///
+    /// The write lease for a repo is taken as soon as its first file-change
+    /// event enters the debounce buffer, not only once the debounce timer
+    /// flushes that buffer — otherwise a query landing in between sees a
+    /// file that has already changed on disk but an index that has not
+    /// (the source of a stale reference reported right after an edit).
+    pub fn new(
+        engine: Arc<crate::index::CodeIntelEngine>,
+    ) -> Result<(Self, mpsc::Receiver<WatchBatch>)> {
         let (tx, rx) = mpsc::channel(100);
 
         // Create a channel for the notify watcher
@@ -1220,6 +1230,8 @@ impl AsyncFileWatcher {
         // Spawn a task to process notify events and send batched changes
         tokio::spawn(async move {
             let mut debounce_buffer: HashMap<PathBuf, FileChange> = HashMap::new();
+            // Leases already taken for this batch, grown as changes land.
+            let mut held: Option<crate::index::IndexUpdateLeases> = None;
             let debounce_duration = Duration::from_millis(300);
             let mut debounce_timer = tokio::time::interval(debounce_duration);
             debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1237,9 +1249,18 @@ impl AsyncFileWatcher {
                                     _ => continue,
                                 };
 
-                                for change in source_changes_for_path(&path, change_type.clone()) {
-                                    // Add to debounce buffer (overwrites previous events for same file)
-                                    debounce_buffer.insert(change.path.clone(), change);
+                                let changes = source_changes_for_path(&path, change_type.clone());
+                                for change in &changes {
+                                    debounce_buffer.insert(change.path.clone(), change.clone());
+                                }
+                                // Take the write lease for every repo this event
+                                // touches before the file's stale state can be
+                                // read, not after the debounce timer flushes.
+                                for repo_key in engine.repos_for_changes(&changes) {
+                                    if held.is_none() {
+                                        held = Some(engine.begin_update_window().await);
+                                    }
+                                    held.as_mut().unwrap().add(&engine, &repo_key).await;
                                 }
                             }
                         }
@@ -1248,7 +1269,17 @@ impl AsyncFileWatcher {
                     _ = debounce_timer.tick() => {
                         if !debounce_buffer.is_empty() {
                             let changes: Vec<FileChange> = debounce_buffer.drain().map(|(_, v)| v).collect();
-                            if tx.send(changes).await.is_err() {
+                            // Reconcile against the final change set: covers the
+                            // (normally empty) gap between an event landing and
+                            // its lease being taken above.
+                            let mut leases = match held.take() {
+                                Some(l) => l,
+                                None => engine.begin_update_window().await,
+                            };
+                            for repo_key in engine.repos_for_changes(&changes) {
+                                leases.add(&engine, &repo_key).await;
+                            }
+                            if tx.send(WatchBatch { changes, _leases: leases }).await.is_err() {
                                 // Receiver dropped, exit task
                                 break;
                             }
@@ -1286,6 +1317,15 @@ impl AsyncFileWatcher {
     pub fn watched_paths(&self) -> &[PathBuf] {
         &self.watched_paths
     }
+}
+
+/// A debounced batch of file changes, plus the update-window leases already
+/// held for every repo it touches. Dropping it (once the batch has been
+/// applied) reopens those repos to queries.
+#[cfg(feature = "native")]
+pub struct WatchBatch {
+    pub changes: Vec<FileChange>,
+    _leases: crate::index::IndexUpdateLeases,
 }
 
 /// A detected file change
@@ -1518,7 +1558,7 @@ pub async fn run_watch_mode(
 ) {
     info!("Starting async watch mode background task");
 
-    let (_watcher, mut rx) = match engine.create_async_file_watcher() {
+    let (_watcher, mut rx) = match Arc::clone(&engine).create_async_file_watcher() {
         Some((w, r)) => (w, r),
         None => {
             warn!("Failed to create async file watcher, watch mode disabled");
@@ -1528,36 +1568,25 @@ pub async fn run_watch_mode(
 
     loop {
         tokio::select! {
-            // Receive batched file change events
-            Some(changes) = rx.recv() => {
-                if !changes.is_empty() {
-                    debug!("Detected {} file change(s)", changes.len());
-                    // Hold the update leases for every repo this batch touches,
-                    // so a query sees the index either before the batch or
-                    // after it, never mid-apply.
-                    let window = engine
-                        .index_update_leases(&engine.repos_for_changes(&changes))
-                        .await;
-                    let switched = changes.iter().any(|change| is_git_head_file(&change.path));
-                    apply_changes(&engine, &changes).await;
+            // Receive batched file change events, each already holding the
+            // update-window leases for the repos it touches (taken by the
+            // watcher's debounce task, not here) — a query can never land in
+            // the gap between a file changing on disk and this batch's apply.
+            Some(batch) = rx.recv() => {
+                if !batch.changes.is_empty() {
+                    debug!("Detected {} file change(s)", batch.changes.len());
+                    let switched = batch.changes.iter().any(|change| is_git_head_file(&change.path));
+                    apply_changes(&engine, &batch.changes).await;
                     // HEAD moved: the checkout that follows rewrites many files
-                    // across several debounced batches. Keep this one window
-                    // open until the worktree goes quiet, so a query sees the
-                    // old branch or the new one, never a mixture.
+                    // across several debounced batches. Each subsequent batch
+                    // carries its own leases the same way, so simply keep
+                    // applying them until the worktree goes quiet.
                     if switched {
                         info!("Branch switch detected; holding the index update window");
                         while let Ok(Some(more)) =
                             tokio::time::timeout(BRANCH_SWITCH_SETTLE, rx.recv()).await
                         {
-                            for repo in engine.repos_for_changes(&more) {
-                                if !window.covers(&repo) {
-                                    debug!(
-                                        "Changes in {} applied outside the branch-switch window",
-                                        repo
-                                    );
-                                }
-                            }
-                            apply_changes(&engine, &more).await;
+                            apply_changes(&engine, &more.changes).await;
                         }
                         info!("Worktree settled; index update window closed");
                     }

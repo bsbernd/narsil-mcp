@@ -384,18 +384,34 @@ pub const JSONRPC_INDEX_BUSY: i32 = -32001;
 
 /// Write leases held for one index update, plus the gate admitting a single
 /// updater at a time. Dropping it reopens the affected repos to queries.
-pub struct IndexUpdateLeases<'a> {
+///
+/// Owned (no borrowed guards) so a caller can grow it with `add()` across
+/// `.await` points and hand the whole thing to another task — the watcher
+/// takes this at the first file-change event for a debounce batch, not only
+/// once the batch is dequeued, so a query can never land in the gap between
+/// a file landing on disk and the batch that re-indexes it.
+pub struct IndexUpdateLeases {
     /// Held for the whole update: writers never interleave, so the order in
     /// which they take per-repo leases cannot deadlock them against each other.
-    _gate: tokio::sync::MutexGuard<'a, ()>,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
     /// Held write leases, keyed by canonical repo path.
     leases: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
-impl IndexUpdateLeases<'_> {
+impl IndexUpdateLeases {
     /// Whether this update window already covers `repo_key`.
     pub fn covers(&self, repo_key: &str) -> bool {
         self.leases.contains_key(repo_key)
+    }
+
+    /// Add `repo_key` to this window if not already covered. The caller
+    /// already holds `_gate`, so acquisition order across repos added one at
+    /// a time this way still cannot deadlock against another updater.
+    pub async fn add(&mut self, engine: &CodeIntelEngine, repo_key: &str) {
+        if !self.leases.contains_key(repo_key) {
+            self.leases
+                .insert(repo_key.to_string(), engine.index_lease(repo_key).write_owned().await);
+        }
     }
 }
 
@@ -480,8 +496,10 @@ pub struct CodeIntelEngine {
     index_leases: DashMap<String, IndexLease>,
     /// Admits one index update at a time. Updates take several per-repo leases
     /// at once (reindex_all, a watch batch spanning repos); serializing them
-    /// makes their acquisition order irrelevant.
-    update_gate: tokio::sync::Mutex<()>,
+    /// makes their acquisition order irrelevant. `Arc`-wrapped so the owned
+    /// guard can be held by `IndexUpdateLeases` across `.await` points and
+    /// moved into the watcher's debounce task.
+    update_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CodeIntelEngine {
@@ -694,7 +712,7 @@ impl CodeIntelEngine {
             repo_settings,
             index_filtered_repos: DashMap::new(),
             index_leases: DashMap::new(),
-            update_gate: tokio::sync::Mutex::new(()),
+            update_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -2764,20 +2782,26 @@ impl CodeIntelEngine {
             .ok()
     }
 
-    /// Write leases over `repo_keys` for one index update. Waits for in-flight
-    /// queries to drain; queries arriving meanwhile are refused.
-    pub async fn index_update_leases(&self, repo_keys: &[String]) -> IndexUpdateLeases<'_> {
-        let gate = self.update_gate.lock().await;
-        let mut leases = HashMap::with_capacity(repo_keys.len());
-        for key in repo_keys {
-            if !leases.contains_key(key) {
-                leases.insert(key.clone(), self.index_lease(key).write_owned().await);
-            }
-        }
+    /// Begin an update window covering no repos yet. Waits for in-flight
+    /// queries to drain on each repo `add()`ed to it; queries arriving
+    /// meanwhile are refused. Grow it with `add()` as repos are discovered —
+    /// the watcher takes this at the first change of a debounce batch, before
+    /// the batch's final repo set is known.
+    pub async fn begin_update_window(&self) -> IndexUpdateLeases {
+        let gate = Arc::clone(&self.update_gate).lock_owned().await;
         IndexUpdateLeases {
             _gate: gate,
-            leases,
+            leases: HashMap::new(),
         }
+    }
+
+    /// Write leases over `repo_keys` for one index update.
+    pub async fn index_update_leases(&self, repo_keys: &[String]) -> IndexUpdateLeases {
+        let mut leases = self.begin_update_window().await;
+        for key in repo_keys {
+            leases.add(self, key).await;
+        }
+        leases
     }
 
     /// Snapshot of the registered repository paths. A snapshot rather than a
@@ -4982,18 +5006,22 @@ impl CodeIntelEngine {
     /// Create an async file watcher for the indexed repositories.
     /// Returns the watcher and a receiver for batched file change events.
     /// Returns None if watch mode is not enabled.
+    ///
+    /// Takes `Arc<Self>` (not `&self`) because the watcher's debounce task
+    /// holds it past this call, to take an update-window lease at the first
+    /// change of a batch rather than only once the batch is dequeued.
     #[cfg(feature = "native")]
     pub fn create_async_file_watcher(
-        &self,
+        self: Arc<Self>,
     ) -> Option<(
         crate::persist::AsyncFileWatcher,
-        tokio::sync::mpsc::Receiver<Vec<crate::persist::FileChange>>,
+        tokio::sync::mpsc::Receiver<crate::persist::WatchBatch>,
     )> {
         if !self.options.watch_enabled {
             return None;
         }
 
-        match crate::persist::AsyncFileWatcher::new() {
+        match crate::persist::AsyncFileWatcher::new(Arc::clone(&self)) {
             Ok((mut watcher, rx)) => {
                 for repo_path in &self.registered_repo_paths() {
                     if repo_path.exists() {
@@ -10507,6 +10535,45 @@ similarity index 90%
 
         drop(update);
         assert!(engine.try_query_lease(&repo_key).await.is_some());
+    }
+
+    /// The watcher grows one `IndexUpdateLeases` as file-change events for
+    /// different repos land, rather than acquiring the full set only once a
+    /// debounce batch is known — this is what lets a repo's write lease start
+    /// at its first change event instead of at the batch flush. A repo not
+    /// yet `add()`ed must stay answerable; one just added must not.
+    #[tokio::test]
+    async fn update_window_grows_incrementally_across_repos() {
+        let temp = TempDir::new().unwrap();
+        let repo_a = temp.path().join("repo_a");
+        let repo_b = temp.path().join("repo_b");
+        std::fs::create_dir(&repo_a).unwrap();
+        std::fs::create_dir(&repo_b).unwrap();
+        let engine =
+            CodeIntelEngine::new(temp.path().join("index"), vec![repo_a.clone(), repo_b.clone()])
+                .await
+                .unwrap();
+        let key_a = canonical_repo_key(&repo_a).unwrap();
+        let key_b = canonical_repo_key(&repo_b).unwrap();
+
+        let mut window = engine.begin_update_window().await;
+        assert!(!window.covers(&key_a));
+        assert!(!window.covers(&key_b));
+        assert!(engine.try_query_lease(&key_a).await.is_some());
+        assert!(engine.try_query_lease(&key_b).await.is_some());
+
+        window.add(&engine, &key_a).await;
+        assert!(window.covers(&key_a));
+        assert!(engine.try_query_lease(&key_a).await.is_none());
+        assert!(engine.try_query_lease(&key_b).await.is_some());
+
+        window.add(&engine, &key_b).await;
+        assert!(window.covers(&key_b));
+        assert!(engine.try_query_lease(&key_b).await.is_none());
+
+        drop(window);
+        assert!(engine.try_query_lease(&key_a).await.is_some());
+        assert!(engine.try_query_lease(&key_b).await.is_some());
     }
 
     /// The sweep exists to bound what stdio delegation adds to a long-running
