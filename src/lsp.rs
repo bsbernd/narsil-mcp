@@ -1131,6 +1131,98 @@ impl LspManager {
         Ok(out)
     }
 
+    /// workspace/symbol against one C/C++ `backend`, filtered to hits naming
+    /// `name` and converted into narsil `Symbol`s. Unlike `get_document_symbols`
+    /// this needs no target file — the query is repo-wide — which makes it a
+    /// last-resort rescue when a symbol is in neither the static index nor
+    /// gtags, tried live rather than merged into the persisted index.
+    pub async fn get_workspace_symbols(
+        &self,
+        backend: SourceSet,
+        repo_path: &Path,
+        language: &str,
+        name: &str,
+    ) -> Result<Vec<Symbol>> {
+        let cxx = match Self::cxx_backend_for_source(backend) {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let server_key = Self::server_key(language, cxx, repo_path);
+        let server = match self.get_or_start_server_for_key(&server_key).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Failed to start LSP server {}: {}", server_key, e);
+                return Ok(Vec::new());
+            }
+        };
+
+        let params = WorkspaceSymbolParams {
+            query: name.to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let params_value = serde_json::to_value(&params)?;
+        let response = self
+            .send_request_with_timeout(
+                &server,
+                "workspace/symbol",
+                params_value,
+                self.config.index_timeout_ms,
+            )
+            .await?;
+        if response.is_null() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(Deserialize)]
+        struct RawWorkspaceHit {
+            name: String,
+            kind: SymbolKind,
+            location: RawWorkspaceLocation,
+        }
+        #[derive(Deserialize)]
+        struct RawWorkspaceLocation {
+            uri: Url,
+            range: Option<Range>,
+        }
+        let hits: Vec<RawWorkspaceHit> = serde_json::from_value(response)?;
+
+        let mut out = Vec::new();
+        for hit in hits {
+            if !workspace_symbol_name_matches(&hit.name, name) {
+                continue;
+            }
+            let Ok(abs_path) = hit.location.uri.to_file_path() else {
+                continue;
+            };
+            let file_path = abs_path
+                .strip_prefix(repo_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| abs_path.to_string_lossy().into_owned());
+            let line = hit
+                .location
+                .range
+                .map(|r| r.start.line as usize + 1)
+                .unwrap_or(1);
+            out.push(Symbol {
+                // `name`, not `hit.name`: ccls returns the whole declaration
+                // text ("static const struct T foo") as the name, not the
+                // bare identifier.
+                name: name.to_string(),
+                kind: lsp_kind_to_narsil(hit.kind),
+                file_path,
+                start_line: line,
+                end_line: line,
+                signature: None,
+                qualified_name: None,
+                doc_comment: None,
+                confirmed_by: backend,
+                line_conflicts: Vec::new(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Prepare a `CallHierarchyItem` for `symbol_name` (anchored on its name
     /// token at/after the 1-based `line`) on one `backend`, then fetch its
     /// outgoing calls. Returns (callee_name, callee_def_file, call_site_line):
@@ -1458,6 +1550,25 @@ fn flatten_document_symbols(symbols: &[DocumentSymbol], backend: SourceSet, out:
     }
 }
 
+/// Whether a workspace/symbol result's `candidate` name identifies `name`:
+/// either an exact match (clangd), or `name` as `candidate`'s trailing
+/// identifier (ccls, which returns the whole declaration text as the name,
+/// e.g. "static const struct T foo" for a query of "foo"). The character
+/// before the match must not itself be part of an identifier, so a query for
+/// "foo" cannot match a declaration ending in "not_foo".
+fn workspace_symbol_name_matches(candidate: &str, name: &str) -> bool {
+    if candidate == name {
+        return true;
+    }
+    match candidate.strip_suffix(name) {
+        Some(prefix) => match prefix.chars().last() {
+            Some(c) => !c.is_alphanumeric() && c != '_',
+            None => true,
+        },
+        None => false,
+    }
+}
+
 /// 0-based (line, UTF-16 column) of `name` as a whole-word token, scanning a
 /// few lines from `start_line` (0-based). A leading return type can push the
 /// name token below the definition's first line, so a short window is scanned.
@@ -1548,6 +1659,30 @@ mod tests {
 
         let message = LspManager::parse_lsp_message(body.as_bytes()).expect("parse");
         assert_eq!(message.id, Some(7));
+    }
+
+    /// ccls names a workspace/symbol hit after its whole declaration
+    /// ("static const struct export_operations fuse_export_operations"), not
+    /// the bare identifier clangd returns; the match must accept the former
+    /// without accepting a longer identifier that merely shares the suffix.
+    #[test]
+    fn test_workspace_symbol_name_matches() {
+        assert!(workspace_symbol_name_matches(
+            "fuse_export_operations",
+            "fuse_export_operations"
+        ));
+        assert!(workspace_symbol_name_matches(
+            "static const struct export_operations fuse_export_operations",
+            "fuse_export_operations"
+        ));
+        assert!(!workspace_symbol_name_matches(
+            "fuse_export_fid_operations",
+            "fuse_export_operations"
+        ));
+        assert!(!workspace_symbol_name_matches(
+            "not_fuse_export_operations",
+            "fuse_export_operations"
+        ));
     }
 
     #[test]

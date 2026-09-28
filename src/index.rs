@@ -3740,6 +3740,47 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
+    /// Render a symbol located by a live workspace/symbol query. Mirrors
+    /// `render_gtags_definition`: the LSP response gives only a point (the
+    /// name token), not an AST end line, so a bounded window after it is
+    /// shown and the provenance is flagged as approximate.
+    fn render_lsp_definition(
+        &self,
+        repo_path: &Path,
+        symbol: &Symbol,
+        backend: SourceSet,
+        context_lines: usize,
+    ) -> Result<String> {
+        const LSP_DEF_WINDOW: usize = 40;
+
+        let file_path = validate_path(repo_path, &symbol.file_path)?;
+        let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
+        let lines: Vec<&str> = content.lines().collect();
+        let end = (symbol.start_line + LSP_DEF_WINDOW).min(lines.len());
+        let start = symbol.start_line.saturating_sub(context_lines + 1).min(end);
+
+        let mut output = String::new();
+        output.push_str(&format!("# {}\n\n", symbol.name));
+        output.push_str(&format!("**File**: `{}`\n", symbol.file_path));
+        output.push_str(&format!("**Line**: {}\n", symbol.start_line));
+        output.push_str(&format!(
+            "**Provenance**: located via a live {} workspace/symbol query; the AST \
+             symbol table and gtags both missed it, so the shown body window is \
+             approximate\n\n",
+            backend.labels().join("/"),
+        ));
+        output.push_str("```");
+        output.push_str(get_language_id(&symbol.file_path));
+        output.push('\n');
+        for (offset, line) in lines[start..end].iter().enumerate() {
+            let line_num = start + offset + 1;
+            let marker = if line_num == symbol.start_line { "→" } else { " " };
+            output.push_str(&format!("{} {:4} │ {}\n", marker, line_num, line));
+        }
+        output.push_str("```\n");
+        Ok(output)
+    }
+
     pub async fn get_symbol_definition(
         &self,
         repo: &str,
@@ -3808,6 +3849,38 @@ impl CodeIntelEngine {
                                 line,
                                 context_lines,
                             );
+                        }
+                    }
+                }
+                // Still nothing: gtags is a text-based tag scan and misses some
+                // declaration forms entirely (e.g. GNU Global's own parser never
+                // tags a file-scope variable definition). clangd/ccls parse the
+                // real AST, so a live workspace/symbol query against every active
+                // backend can still resolve a name neither of the above did.
+                if self.lsp_repo_enabled(&repo_path) && !self.lsp_augment_disabled(&repo) {
+                    if let Some(lsp) = &self.lsp_manager {
+                        for backend in lsp.active_cxx_backends_for(&repo_path) {
+                            for language in ["c", "cpp"] {
+                                match lsp
+                                    .get_workspace_symbols(backend, &repo_path, language, symbol_name)
+                                    .await
+                                {
+                                    Ok(hits) => {
+                                        if let Some(hit) = hits.into_iter().next() {
+                                            return self.render_lsp_definition(
+                                                &repo_path,
+                                                &hit,
+                                                backend,
+                                                context_lines,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => debug!(
+                                        "workspace/symbol failed for {:?} ({language}): {}",
+                                        repo_path, e
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
