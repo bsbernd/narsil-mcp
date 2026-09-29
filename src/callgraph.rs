@@ -8,7 +8,9 @@ use anyhow::Result;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 use tree_sitter::{Node, Tree};
 
 /// A node in the call graph
@@ -81,6 +83,17 @@ pub struct FunctionMetrics {
     pub cognitive: usize,
 }
 
+/// A span tree-sitter could not parse into a function definition — typically an
+/// `if` whose condition or opening brace is split across `#if`/`#else`/`#endif`,
+/// which the C/C++ grammars fold into a single `ERROR` node. The functions (and
+/// any calls inside them) in this span are absent from the call graph.
+#[derive(Debug, Clone)]
+pub struct DegradedRegion {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub likely_preprocessor: bool,
+}
+
 /// The call graph for a repository
 pub struct CallGraph {
     /// Function name -> CallNode
@@ -89,6 +102,8 @@ pub struct CallGraph {
     file_functions: DashMap<String, Vec<String>>,
     /// bare_name -> Vec<qualified_key>  (built during first pass, O(1) lookup in resolve_callee)
     name_index: DashMap<String, Vec<String>>,
+    /// File -> unparsed regions that look like function bodies (see `DegradedRegion`)
+    degraded: DashMap<String, Vec<DegradedRegion>>,
 }
 
 impl Default for CallGraph {
@@ -123,12 +138,41 @@ fn string_vec_map_heap_bytes(map: &DashMap<String, Vec<String>>) -> usize {
         .sum()
 }
 
+/// An identifier, a parenthesised parameter list, and an opening brace — the
+/// shape of a function signature immediately followed by its body. Cheap
+/// stand-in for re-parsing an `ERROR` node's text.
+fn function_like_error_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*\{").expect("static regex is valid")
+    })
+}
+
+/// Classify an `ERROR` node as a lost function body, or `None` if it doesn't
+/// look like one. `likely_preprocessor` names the common cause seen in
+/// practice: an `if` whose condition or brace is split across
+/// `#if`/`#else`/`#endif`, which C/C++ grammars cannot reconcile into one
+/// `if_statement`.
+fn degraded_region_for(node: Node, source: &[u8]) -> Option<DegradedRegion> {
+    let text = node.utf8_text(source).ok()?;
+    if !function_like_error_regex().is_match(text) {
+        return None;
+    }
+    let likely_preprocessor = text.contains("#if") || text.contains("#ifdef") || text.contains("#else");
+    Some(DegradedRegion {
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        likely_preprocessor,
+    })
+}
+
 impl CallGraph {
     pub fn new() -> Self {
         Self {
             nodes: DashMap::new(),
             file_functions: DashMap::new(),
             name_index: DashMap::new(),
+            degraded: DashMap::new(),
         }
     }
 
@@ -165,7 +209,17 @@ impl CallGraph {
         let name_index = hashmap_table_bytes::<String, Vec<String>>(self.name_index.len())
             + string_vec_map_heap_bytes(&self.name_index);
 
-        nodes + file_functions + name_index
+        let degraded = hashmap_table_bytes::<String, Vec<DegradedRegion>>(self.degraded.len())
+            + self
+                .degraded
+                .iter()
+                .map(|entry| {
+                    entry.key().capacity()
+                        + entry.value().capacity() * std::mem::size_of::<DegradedRegion>()
+                })
+                .sum::<usize>();
+
+        nodes + file_functions + name_index + degraded
     }
 
     /// Build call graph from parsed files
@@ -194,6 +248,8 @@ impl CallGraph {
 
     /// Remove the definitions and call edges contributed by one file.
     pub fn remove_file(&self, file_path: &str) {
+        self.degraded.remove(file_path);
+
         let function_names = self
             .file_functions
             .remove(file_path)
@@ -478,8 +534,9 @@ impl CallGraph {
         let source = content.as_bytes();
         let mut cursor = tree.walk();
         let mut functions = Vec::new();
+        let mut degraded = Vec::new();
 
-        self.walk_for_functions(&mut cursor, source, path, &mut functions);
+        self.walk_for_functions(&mut cursor, source, path, &mut functions, &mut degraded);
 
         for func in &functions {
             let key = Self::qualified_key(path, &func.name);
@@ -496,6 +553,12 @@ impl CallGraph {
             .collect();
         self.file_functions.insert(path.to_string(), names);
 
+        if degraded.is_empty() {
+            self.degraded.remove(path);
+        } else {
+            self.degraded.insert(path.to_string(), degraded);
+        }
+
         Ok(())
     }
 
@@ -505,6 +568,7 @@ impl CallGraph {
         source: &[u8],
         path: &str,
         functions: &mut Vec<CallNode>,
+        degraded: &mut Vec<DegradedRegion>,
     ) {
         let mut depth: usize = 0;
         loop {
@@ -514,7 +578,14 @@ impl CallGraph {
                 functions.push(func);
             }
 
-            if cursor.goto_first_child() {
+            // An ERROR node that reads like a function body is a parse failure,
+            // not a construct to recurse into — nested ERROR children inside it
+            // add no further signal and would only double-count the same gap.
+            if node.kind() == "ERROR" {
+                if let Some(region) = degraded_region_for(node, source) {
+                    degraded.push(region);
+                }
+            } else if cursor.goto_first_child() {
                 depth += 1;
                 continue;
             }
@@ -1549,6 +1620,18 @@ impl CallGraph {
         } else {
             false
         }
+    }
+
+    /// Total unparsed regions and the number of files they span, or `None` when
+    /// there are none. A non-`None` result means every caller/callee list this
+    /// call graph produces may be missing edges from those regions.
+    pub fn degraded_summary(&self) -> Option<(usize, usize)> {
+        let file_count = self.degraded.len();
+        if file_count == 0 {
+            return None;
+        }
+        let region_count = self.degraded.iter().map(|entry| entry.value().len()).sum();
+        Some((region_count, file_count))
     }
 
     /// Get highly connected functions (potential refactoring targets).

@@ -634,6 +634,71 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
     );
 }
 
+#[test]
+fn test_c_preprocessor_split_if_is_a_degraded_region() {
+    // Reproduces a real libfuse function: an `if` whose condition and opening
+    // brace are split across #if/#else/#endif, sharing one closing brace.
+    // tree-sitter-c cannot parse this into a function_definition — it folds
+    // the whole body into a single ERROR node — so the function and the call
+    // inside it are silently absent from the call graph unless flagged.
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+int fuse_send_reply_iov_nofree(int req, int error, int count)
+{
+	int out;
+
+#if __GLIBC__ >= 2 && __GLIBC_MINOR__ >= 32
+	const char *str = strerrordesc_np(error * -1);
+	if ((str == 0 && error != 0) || error > 0) {
+#else
+	if (error <= -1000 || error > 0) {
+#endif
+		fuse_log(error);
+		error = -1;
+	}
+
+	return fuse_send_msg(req, out, count);
+}
+"#;
+
+    let tree = parser.parse_to_tree(Path::new("fuse_lowlevel.c"), code).unwrap();
+    let files = vec![("fuse_lowlevel.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    // The function is invisible to the call graph — this is the bug being
+    // flagged, not fixed, by this patch.
+    assert!(
+        call_graph.get_callees("fuse_send_reply_iov_nofree").is_empty(),
+        "fuse_send_reply_iov_nofree should have no recorded callees — the point \
+         of this test is that tree-sitter cannot see its body at all"
+    );
+
+    let (regions, files) = call_graph
+        .degraded_summary()
+        .expect("the split-if body should be recorded as a degraded region");
+    assert_eq!(regions, 1);
+    assert_eq!(files, 1);
+}
+
+#[test]
+fn test_c_call_graph_without_parse_errors_has_no_degraded_regions() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+static int helper(int x) { return x; }
+static int caller(int x) { return helper(x); }
+"#;
+
+    let tree = parser.parse_to_tree(Path::new("clean.c"), code).unwrap();
+    let files = vec![("clean.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    assert!(call_graph.degraded_summary().is_none());
+}
+
 /// Build a repo where `hot` has `count` callers spread over two files.
 fn write_hot_function_repo(root: &std::path::Path, count: usize) -> std::io::Result<()> {
     std::fs::create_dir_all(root.join("src"))?;
