@@ -789,3 +789,98 @@ async fn get_callers_limit_zero_is_not_served_the_cached_page() {
     assert_eq!(full.matches("\n- `").count(), 60, "{}", full);
     assert!(!full.contains("Showing"), "{}", full);
 }
+
+/// A repo with one C file whose only function has an `if` split across
+/// #if/#else/#endif — tree-sitter cannot see this function or its calls at
+/// all, so get_callers/get_callees must say the call graph may be incomplete
+/// rather than presenting an empty or partial answer as exhaustive.
+fn write_preprocessor_split_repo(root: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(
+        root.join("reply.c"),
+        r#"
+static int send_msg(int fd, int len) { return 0; }
+
+int send_reply_nofree(int req, int error, int len)
+{
+	int out;
+
+#if __GLIBC__ >= 2 && __GLIBC_MINOR__ >= 32
+	const char *str = "err";
+	if ((str == 0 && error != 0) || error > 0) {
+#else
+	if (error <= -1000 || error > 0) {
+#endif
+		error = -1;
+	}
+
+	return send_msg(req, len);
+}
+"#,
+    )
+}
+
+#[tokio::test]
+async fn get_callers_and_get_callees_report_unparsed_regions() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_preprocessor_split_repo(repo.path()).unwrap();
+    let engine = hot_function_engine(repo.path(), index_dir.path()).await;
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let callers = engine
+        .get_callers(
+            repo_arg,
+            "send_msg",
+            false,
+            5,
+            None,
+            ListWindow::new(0, narsil_mcp::response_budget::DEFAULT_LIST_LIMIT),
+        )
+        .await
+        .unwrap();
+    assert!(
+        callers.contains("could not be parsed by tree-sitter"),
+        "{}",
+        callers
+    );
+
+    let callees = engine
+        .get_callees(
+            repo_arg,
+            "send_reply_nofree",
+            false,
+            5,
+            None,
+            ListWindow::new(0, narsil_mcp::response_budget::DEFAULT_LIST_LIMIT),
+        )
+        .await
+        .unwrap();
+    assert!(
+        callees.contains("could not be parsed by tree-sitter"),
+        "{}",
+        callees
+    );
+}
+
+/// A repo with no unparsed regions must not carry the degraded-region
+/// footnote — the note is only for a genuine coverage gap.
+#[tokio::test]
+async fn get_callers_omits_the_degraded_note_when_the_graph_is_complete() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    write_hot_function_repo(repo.path(), 2).unwrap();
+    let engine = hot_function_engine(repo.path(), index_dir.path()).await;
+
+    let output = engine
+        .get_callers(
+            repo.path().to_str().unwrap(),
+            "hot",
+            false,
+            5,
+            None,
+            ListWindow::new(0, narsil_mcp::response_budget::DEFAULT_LIST_LIMIT),
+        )
+        .await
+        .unwrap();
+    assert!(!output.contains("could not be parsed by tree-sitter"), "{}", output);
+}

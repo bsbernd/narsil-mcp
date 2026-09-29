@@ -6460,6 +6460,17 @@ impl CodeIntelEngine {
                         ));
                     }
                 }
+                if let Some((regions, files)) = self
+                    .call_graphs
+                    .get(key)
+                    .and_then(|cg| cg.degraded_summary())
+                {
+                    output.push_str(&format!(
+                        "- Call graph: {} unparsed region(s) across {} file(s) — \
+                         see get_callers/get_callees for detail\n",
+                        regions, files
+                    ));
+                }
                 output.push('\n');
             }
         }
@@ -6655,7 +6666,8 @@ impl CodeIntelEngine {
         } else {
             Some(function)
         };
-        let result = call_graph.to_markdown(func_option, exclude_tests);
+        let mut result = call_graph.to_markdown(func_option, exclude_tests);
+        result.push_str(&degraded_note(&call_graph));
 
         // Cache the result
         if self.options.cache_enabled {
@@ -6773,6 +6785,7 @@ impl CodeIntelEngine {
         let mut output = String::new();
         output.push_str(&format!("# Callers of `{}`\n\n", function));
         output.push_str(&ambiguity_note(&call_graph, function));
+        output.push_str(&degraded_note(&call_graph));
 
         if transitive {
             let mut callers = call_graph.get_transitive_callers(function, max_depth);
@@ -6983,6 +6996,7 @@ impl CodeIntelEngine {
         let mut output = String::new();
         output.push_str(&format!("# Callees of `{}`\n\n", function));
         output.push_str(&ambiguity_note(&call_graph, function));
+        output.push_str(&degraded_note(&call_graph));
 
         if transitive {
             let mut callees = call_graph.get_transitive_callees(function, max_depth);
@@ -9305,6 +9319,21 @@ fn ambiguity_note(call_graph: &CallGraph, function: &str) -> String {
         named.join(", "),
         matches[0],
     )
+}
+
+/// Footnote naming a call graph's unparsed regions, or empty when there are
+/// none. Attached to every call-graph-derived answer so a short list reads as
+/// possibly incomplete rather than exhaustive.
+fn degraded_note(call_graph: &CallGraph) -> String {
+    match call_graph.degraded_summary() {
+        Some((regions, files)) => format!(
+            "> {} region(s) across {} file(s) could not be parsed by tree-sitter \
+             (commonly an `if` split across `#if`/`#else`/`#endif`) and are missing \
+             from this call graph; the list above may be incomplete.\n\n",
+            regions, files
+        ),
+        None => String::new(),
+    }
 }
 
 /// Note naming every other real (body-having) definition of a symbol name,
