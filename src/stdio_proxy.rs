@@ -42,6 +42,8 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(2);
 /// Per-line reconnect budget: a server that keeps rejecting one request
 /// terminates the proxy (editor respawns it) rather than looping forever.
 const MAX_RECONNECTS: u32 = 5;
+/// How long one forwarded request may take before the client gets an error.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// State for one stdio↔SSE proxy session: the upstream endpoint, the captured
 /// `Mcp-Session-Id`, and the cached MCP handshake so a server restart can be
@@ -100,7 +102,7 @@ impl ProxySession {
     ) -> Result<Self> {
         let endpoint = format!("{}/mcp", base_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(UPSTREAM_TIMEOUT)
             .build()
             .context("Building reqwest client for stdio proxy")?;
         Ok(Self {
@@ -251,11 +253,14 @@ impl ProxySession {
     /// handler returns 404 when it no longer knows our session id and 503
     /// while it is bound but not yet serving, both of which happen when the
     /// server rebinds the same port on restart. Any other non-2xx terminates.
+    /// A timeout is answered with an error instead: the server is alive and
+    /// still working, and replaying the line would run the request twice.
     async fn forward(&mut self, line: &str) -> Result<Forward> {
         let mut reconnects: u32 = 0;
         loop {
             let response = match self.post_once(line).await {
                 Ok(response) => response,
+                Err(e) if e.is_timeout() => return Ok(timeout_reply(line)),
                 Err(e) => {
                     self.reconnect_or_bail(line, &mut reconnects, &format!("send failed: {e}"))
                         .await?;
@@ -279,6 +284,7 @@ impl ProxySession {
 
             match response.bytes().await {
                 Ok(body) => return Ok(Forward::Body(body.to_vec())),
+                Err(e) if e.is_timeout() => return Ok(timeout_reply(line)),
                 Err(e) => {
                     self.reconnect_or_bail(
                         line,
@@ -481,6 +487,35 @@ fn method_of(line: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// JSON-RPC error answering `line` after [`UPSTREAM_TIMEOUT`]; a notification
+/// gets no answer.
+fn timeout_reply(line: &str) -> Forward {
+    warn!(
+        "proxy: upstream did not answer within {:?}",
+        UPSTREAM_TIMEOUT
+    );
+    let id = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|request| request.get("id").cloned());
+    let Some(id) = id else {
+        return Forward::Accepted;
+    };
+    let reply = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            // Not -32001: that is the daemon's "index busy, retry" code.
+            "code": -32002,
+            "message": format!(
+                "narsil-mcp server did not answer within {}s; the request may \
+                 still be running there",
+                UPSTREAM_TIMEOUT.as_secs()
+            ),
+        },
+    });
+    Forward::Body(reply.to_string().into_bytes())
+}
+
 /// Only a tool call can need the repo being adopted. The client sends
 /// `tools/list` while connecting, and the adoption's full index pass
 /// outlasts the client's connect timeout.
@@ -515,6 +550,22 @@ mod list_changed_tests {
         );
         assert_eq!(method_of(r#"{"jsonrpc":"2.0","id":1}"#), None);
         assert_eq!(method_of("not json"), None);
+    }
+
+    #[test]
+    fn test_timeout_reply_answers_the_request_id() {
+        let Forward::Body(body) =
+            timeout_reply(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#)
+        else {
+            panic!("a request must get an error reply");
+        };
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32002);
+        assert!(matches!(
+            timeout_reply(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            Forward::Accepted
+        ));
     }
 
     #[test]
