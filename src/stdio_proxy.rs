@@ -547,7 +547,9 @@ async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
             .context("Reading stdin for proxy")?;
         if bytes_read == 0 {
             info!("Proxy session terminating: stdin closed");
-            return Ok(());
+            // A returning main would block in runtime shutdown until a
+            // still-running adoption request ends, up to its timeout.
+            exit_after_flush(0).await
         }
 
         let trimmed = line.trim_end_matches(['\n', '\r']);
