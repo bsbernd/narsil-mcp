@@ -372,22 +372,21 @@ async fn main() -> Result<()> {
         // A server short of some of these repos is still the right place to
         // send every query — the alternative is a local index that answers for
         // one repo and loses every repo the server has. Ask it to index the
-        // ones it lacks. This must not block delegation on that indexing: a
-        // repo whose reindex outlasts the MCP client's own connect timeout
-        // would otherwise never connect at all, even with the server up and
-        // working. Adoption runs in the background; only the first
-        // non-handshake line the proxy forwards waits on it.
+        // ones it lacks. Nothing waits on that indexing: a repo whose reindex
+        // outlasts the MCP client's connect or tool timeout would otherwise
+        // never answer at all, and until the server has indexed the repo it
+        // answers queries for it with "being indexed, retry later".
         let delegate_to = match discovered {
             Some((proxy_url, missing)) => {
-                let pending_adoption = if missing.is_empty() {
-                    None
-                } else {
+                if !missing.is_empty() {
                     let target = proxy_url.clone();
-                    Some(tokio::spawn(async move {
-                        sse_discovery::adopt_repos(&target, &missing).await
-                    }))
-                };
-                Some((proxy_url, pending_adoption))
+                    tokio::spawn(async move {
+                        if let Err(e) = sse_discovery::adopt_repos(&target, &missing).await {
+                            warn!("SSE discovery: adoption failed: {}", e);
+                        }
+                    });
+                }
+                Some(proxy_url)
             }
             None => {
                 info!("SSE discovery: no matching server, building local index");
@@ -395,7 +394,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        if let Some((proxy_url, pending_adoption)) = delegate_to {
+        if let Some(proxy_url) = delegate_to {
             info!("SSE discovery: delegating stdio to {}", proxy_url);
             // The upstream daemon decides its own tool list; nothing on this
             // side can narrow it, so say so rather than appear to have applied it.
@@ -417,12 +416,7 @@ async fn main() -> Result<()> {
             ))
             .map_err(|e| warn!("pid status: could not write: {}", e))
             .ok();
-            return stdio_proxy::run_stdio_proxy_with_shutdown(
-                &proxy_url,
-                &repos,
-                pending_adoption,
-            )
-            .await;
+            return stdio_proxy::run_stdio_proxy_with_shutdown(&proxy_url, &repos).await;
         }
     }
 

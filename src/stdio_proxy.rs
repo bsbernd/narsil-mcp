@@ -73,11 +73,6 @@ struct ProxySession {
     /// started with a different `--expose`. Drained by the proxy loop, which
     /// owns stdout.
     tools_may_have_changed: bool,
-    /// A background `adopt_repos` call still registering a missing repo with
-    /// the upstream daemon. Only the first tool call waits on this, taken and
-    /// awaited once by the proxy loop, so an actual query never races ahead
-    /// of adoption.
-    pending_adoption: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 /// Emitted to the client after a transparent reconnect. The proxy cannot tell
@@ -95,11 +90,7 @@ enum Forward {
 }
 
 impl ProxySession {
-    fn new(
-        base_url: &str,
-        repos: &[PathBuf],
-        pending_adoption: Option<tokio::task::JoinHandle<Result<()>>>,
-    ) -> Result<Self> {
+    fn new(base_url: &str, repos: &[PathBuf]) -> Result<Self> {
         let endpoint = format!("{}/mcp", base_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(UPSTREAM_TIMEOUT)
@@ -115,27 +106,7 @@ impl ProxySession {
             init_request: None,
             initialized_notification: None,
             tools_may_have_changed: false,
-            pending_adoption,
         })
-    }
-
-    /// Await a still-pending background repo adoption exactly once, so the
-    /// first tool call never reaches the daemon ahead of it. A no-op
-    /// once taken, and a no-op when nothing was pending (the common case: the
-    /// discovered server already covered every requested repo).
-    async fn await_pending_adoption(&mut self) {
-        let Some(handle) = self.pending_adoption.take() else {
-            return;
-        };
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(
-                "SSE discovery: background adoption failed: {}; the upstream \
-                 may still answer \"unknown repo\" for it",
-                e
-            ),
-            Err(e) => warn!("SSE discovery: background adoption task panicked: {}", e),
-        }
     }
 
     /// Resolve which served repo a `repo: "."` argument refers to. The proxy
@@ -429,14 +400,8 @@ impl ProxySession {
 /// Run the proxy loop against `base_url` until stdin closes, the upstream
 /// returns an unrecoverable error, or a shutdown signal arrives. `repos` is
 /// the set this process serves, used to rediscover the server if it restarts.
-/// `pending_adoption`, when given, is a background task still registering a
-/// repo the discovered server lacked; only the first tool call waits on it.
-pub async fn run_stdio_proxy_with_shutdown(
-    base_url: &str,
-    repos: &[PathBuf],
-    pending_adoption: Option<tokio::task::JoinHandle<Result<()>>>,
-) -> Result<()> {
-    let mut session = ProxySession::new(base_url, repos, pending_adoption)?;
+pub async fn run_stdio_proxy_with_shutdown(base_url: &str, repos: &[PathBuf]) -> Result<()> {
+    let mut session = ProxySession::new(base_url, repos)?;
 
     tokio::select! {
         result = proxy_loop(&mut session) => result,
@@ -516,13 +481,6 @@ fn timeout_reply(line: &str) -> Forward {
     Forward::Body(reply.to_string().into_bytes())
 }
 
-/// Only a tool call can need the repo being adopted. The client sends
-/// `tools/list` while connecting, and the adoption's full index pass
-/// outlasts the client's connect timeout.
-fn waits_for_adoption(line: &str) -> bool {
-    method_of(line).as_deref() == Some("tools/call")
-}
-
 #[cfg(test)]
 mod list_changed_tests {
     use super::*;
@@ -567,21 +525,6 @@ mod list_changed_tests {
             Forward::Accepted
         ));
     }
-
-    #[test]
-    fn test_only_tool_calls_wait_for_adoption() {
-        assert!(waits_for_adoption(
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_symbols"}}"#
-        ));
-        for line in [
-            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
-        ] {
-            assert!(!waits_for_adoption(line), "must not wait: {line}");
-        }
-    }
 }
 
 async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
@@ -612,10 +555,6 @@ async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
         // Cache the handshake before sending so a reconnect can replay it even
         // if this very request is the one that hits a restarted server.
         session.observe_handshake(trimmed);
-
-        if waits_for_adoption(trimmed) {
-            session.await_pending_adoption().await;
-        }
 
         match session.forward(trimmed).await? {
             Forward::Accepted => {
@@ -709,48 +648,5 @@ mod tests {
             None
         );
         assert_eq!(ProxySession::dot_repo_for_cwd(&repos, None), None);
-    }
-
-    #[tokio::test]
-    async fn await_pending_adoption_is_a_no_op_when_nothing_is_pending() {
-        let mut session = ProxySession::new("http://127.0.0.1:1", &[], None).unwrap();
-        // Must return immediately rather than hang — there is nothing to await.
-        session.await_pending_adoption().await;
-    }
-
-    #[tokio::test]
-    async fn await_pending_adoption_waits_for_a_slow_background_task_exactly_once() {
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_setter = flag.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            flag_setter.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        });
-        let mut session = ProxySession::new("http://127.0.0.1:1", &[], Some(handle)).unwrap();
-
-        session.await_pending_adoption().await;
-        assert!(
-            flag.load(std::sync::atomic::Ordering::SeqCst),
-            "the gate must wait for the background task to finish, not race ahead of it"
-        );
-        assert!(
-            session.pending_adoption.is_none(),
-            "the handle must be taken so a later line does not await it again"
-        );
-
-        // Second call is a no-op: no handle left, must not hang or panic.
-        session.await_pending_adoption().await;
-    }
-
-    #[tokio::test]
-    async fn await_pending_adoption_logs_and_proceeds_on_a_failed_adoption() {
-        let handle = tokio::spawn(async move { Err(anyhow!("upstream rejected the repo")) });
-        let mut session = ProxySession::new("http://127.0.0.1:1", &[], Some(handle)).unwrap();
-
-        // Must not propagate the error or hang — a failed adoption still lets
-        // the forwarded request through, to surface the daemon's own error.
-        session.await_pending_adoption().await;
-        assert!(session.pending_adoption.is_none());
     }
 }
