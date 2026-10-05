@@ -318,7 +318,16 @@ async fn mcp_streamable_handler(
         return (StatusCode::ACCEPTED, resp_headers).into_response();
     }
 
-    let response = mcp_server.dispatch(req).await;
+    // Spawned so it outlives this handler: hyper drops the handler future when
+    // the client disconnects, which aborted a long reindex partway, after it
+    // had emptied the repo and before it rebuilt it.
+    let response = match tokio::spawn(async move { mcp_server.dispatch(req).await }).await {
+        Ok(response) => response,
+        Err(e) => {
+            warn!("MCP request task failed: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let json_body = match serde_json::to_string(&response) {
         Ok(j) => j,
         Err(e) => {
