@@ -246,17 +246,33 @@ pub fn find_at(path: &Path, repos: &[PathBuf]) -> Option<(String, Vec<PathBuf>)>
 
 /// Ask the server at `url` to index every repo in `missing`, one at a time.
 ///
-/// Each call blocks until that repo's index pass has finished, so it runs on
+/// Each call blocks until that repo's index pass has finished or
+/// [`ADOPT_TIMEOUT`] has passed, so it runs on
 /// the blocking pool rather than on the async worker.
 pub async fn adopt_repos(url: &str, missing: &[PathBuf]) -> Result<()> {
     for repo in missing {
         info!("SSE discovery: asking {} to index {}", url, repo.display());
         let target = url.to_string();
         let path = repo.clone();
-        tokio::task::spawn_blocking(move || adopt_repo(&target, &path))
-            .await
-            .context("the adopt request task was cancelled")?
-            .with_context(|| format!("{} could not index {}", url, repo.display()))?;
+        tokio::task::spawn_blocking(move || {
+            adopt_repo(&target, &path)?;
+            // Otherwise every later stdio start finds the repo missing and
+            // asks again, and `reindex` redoes the full index pass each time.
+            if let Err(e) =
+                discovery_file_path().and_then(|file| record_adopted_repo(&file, &target, &path))
+            {
+                warn!(
+                    "SSE discovery: could not list {} under {}: {}",
+                    path.display(),
+                    target,
+                    e
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("the adopt request task was cancelled")?
+        .with_context(|| format!("{} could not index {}", url, repo.display()))?;
     }
     Ok(())
 }
@@ -268,8 +284,8 @@ pub async fn adopt_repos(url: &str, missing: &[PathBuf]) -> Result<()> {
 /// entry point runs this in the background rather than awaiting it before
 /// the MCP handshake, so this bounds the proxy's first forwarded query
 /// (which does wait, in `ProxySession::await_pending_adoption`) and not
-/// stdio startup itself: past the timeout the server keeps indexing, and a
-/// later stdio start finds the repo already registered.
+/// stdio startup itself: past the timeout the server keeps indexing, and the
+/// repo is recorded as adopted all the same.
 const ADOPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Call the `reindex` tool on `url` for `repo`.
@@ -293,13 +309,27 @@ fn adopt_repo(url: &str, repo: &Path) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(ADOPT_TIMEOUT)
         .build()?;
-    let response = client
+    let sent = client
         .post(&endpoint)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .body(serde_json::to_vec(&request)?)
-        .send()
-        .with_context(|| format!("POST reindex to {endpoint}"))?;
+        .send();
+    let response = match sent {
+        // The server has registered the repo and keeps indexing it; treating
+        // this as a failure leaves the repo unrecorded, and the next stdio
+        // start restarts the unfinished index pass.
+        Err(e) if e.is_timeout() => {
+            info!(
+                "SSE discovery: {} still indexing {} after {:?}; continuing without waiting",
+                url,
+                repo.display(),
+                ADOPT_TIMEOUT
+            );
+            return Ok(());
+        }
+        sent => sent.with_context(|| format!("POST reindex to {endpoint}"))?,
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -389,6 +419,22 @@ fn atomic_write(path: &Path, records: &[SseServerRecord]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Add `repo` to the record of the server at `url`. The server rewrites its
+/// record on restart, which drops the repo again with the index it had.
+/// A missing record (server gone meanwhile) is left missing.
+fn record_adopted_repo(path: &Path, url: &str, repo: &Path) -> Result<()> {
+    let mut file = open_locked(path)?;
+    let mut records = read_records(&mut file)?;
+    let Some(record) = records.iter_mut().find(|r| r.url == url) else {
+        return Ok(());
+    };
+    if record.repos.iter().any(|have| have == repo) {
+        return Ok(());
+    }
+    record.repos.push(repo.to_path_buf());
+    atomic_write(path, &records)
 }
 
 fn remove_entry(path: &Path, url: &str) -> Result<()> {
@@ -568,6 +614,35 @@ mod tests {
             .expect("the exact record is alive");
         assert_eq!(found, exact_url);
         assert!(missing.is_empty(), "exact match must lack nothing");
+    }
+
+    /// After one stdio start adopted `/b`, the next finds nothing missing
+    /// and so sends no second `reindex`.
+    #[test]
+    fn adopted_repo_is_no_longer_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json");
+        let url = spawn_200_server();
+        write_records(
+            &path,
+            &[record(&url, &["/a"]), record(UNREACHABLE_URL, &["/c"])],
+        );
+
+        record_adopted_repo(&path, &url, Path::new("/b")).unwrap();
+        record_adopted_repo(&path, &url, Path::new("/b")).unwrap();
+        assert_eq!(
+            read_back(&path),
+            vec![
+                record(&url, &["/a", "/b"]),
+                record(UNREACHABLE_URL, &["/c"])
+            ],
+            "listed once, other servers' records untouched"
+        );
+
+        let (found, missing) = find_at(&path, &[PathBuf::from("/a"), PathBuf::from("/b")])
+            .expect("the server is alive");
+        assert_eq!(found, url);
+        assert!(missing.is_empty());
     }
 
     #[test]
