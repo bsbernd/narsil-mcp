@@ -264,9 +264,12 @@ pub async fn adopt_repos(url: &str, missing: &[PathBuf]) -> Result<()> {
 // ── internals ────────────────────────────────────────────────────────────
 
 /// How long to wait for a server to finish indexing a repo it was asked to
-/// adopt. `reindex` answers only once the index pass is done, so this bounds
-/// stdio startup and not the server's work: past the timeout the server keeps
-/// indexing, and a later stdio start finds the repo already registered.
+/// adopt. `reindex` answers only once the index pass is done. The stdio
+/// entry point runs this in the background rather than awaiting it before
+/// the MCP handshake, so this bounds the proxy's first forwarded query
+/// (which does wait, in `ProxySession::await_pending_adoption`) and not
+/// stdio startup itself: past the timeout the server keeps indexing, and a
+/// later stdio start finds the repo already registered.
 const ADOPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Call the `reindex` tool on `url` for `repo`.
