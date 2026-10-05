@@ -2686,7 +2686,12 @@ impl CodeIntelEngine {
         if let Some(gtags) = gtags {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(CXX_AUGMENT_CONCURRENCY));
             let mut tasks = tokio::task::JoinSet::new();
-            for (name, _rel_path, _line) in &functions {
+            // A prototype and its definition are two symbols with one name;
+            // querying both merges every reference twice.
+            let mut names: Vec<&String> = functions.iter().map(|(name, _, _)| name).collect();
+            names.sort_unstable();
+            names.dedup();
+            for name in names {
                 let permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
