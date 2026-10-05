@@ -315,20 +315,12 @@ impl ProxySession {
             .flatten();
 
             // A restarted server has forgotten every repo it was asked to index
-            // rather than started with, so ask it again before replaying the
-            // handshake — otherwise this session's own repo answers nothing.
-            let reattached = match found {
-                Some((url, missing)) => {
-                    match crate::sse_discovery::adopt_repos(&url, &missing).await {
-                        Ok(()) => Some(url),
-                        Err(e) => {
-                            warn!("Proxy reconnect: {}", e);
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
+            // rather than started with, so ask it again — otherwise this
+            // session's own repo answers nothing.
+            let reattached = found.map(|(url, missing)| {
+                crate::sse_discovery::adopt_repos_in_background(&url, missing);
+                url
+            });
 
             if let Some(url) = reattached {
                 self.endpoint = format!("{}/mcp", url.trim_end_matches('/'));

@@ -372,20 +372,10 @@ async fn main() -> Result<()> {
         // A server short of some of these repos is still the right place to
         // send every query — the alternative is a local index that answers for
         // one repo and loses every repo the server has. Ask it to index the
-        // ones it lacks. Nothing waits on that indexing: a repo whose reindex
-        // outlasts the MCP client's connect or tool timeout would otherwise
-        // never answer at all, and until the server has indexed the repo it
-        // answers queries for it with "being indexed, retry later".
+        // ones it lacks, without waiting for that indexing.
         let delegate_to = match discovered {
             Some((proxy_url, missing)) => {
-                if !missing.is_empty() {
-                    let target = proxy_url.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = sse_discovery::adopt_repos(&target, &missing).await {
-                            warn!("SSE discovery: adoption failed: {}", e);
-                        }
-                    });
-                }
+                sse_discovery::adopt_repos_in_background(&proxy_url, missing);
                 Some(proxy_url)
             }
             None => {

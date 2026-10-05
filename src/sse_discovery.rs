@@ -277,6 +277,21 @@ pub async fn adopt_repos(url: &str, missing: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// [`adopt_repos`] as a detached task. Nothing may wait on it: a repo's index
+/// pass can outlast the MCP client's connect and tool timeouts, and until it
+/// finishes the server answers queries for the repo with "being indexed".
+pub fn adopt_repos_in_background(url: &str, missing: Vec<PathBuf>) {
+    if missing.is_empty() {
+        return;
+    }
+    let target = url.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = adopt_repos(&target, &missing).await {
+            warn!("SSE discovery: adoption failed: {}", e);
+        }
+    });
+}
+
 // ── internals ────────────────────────────────────────────────────────────
 
 /// How long to wait for a server to finish indexing a repo it was asked to
