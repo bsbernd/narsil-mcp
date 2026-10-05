@@ -374,6 +374,16 @@ impl LspManager {
         Ok(serde_json::from_slice(buffer)?)
     }
 
+    /// The `id` of a message `parse_lsp_message` rejected. serde_json skips
+    /// the fields this ignores without recursing, so depth does not matter.
+    fn unparseable_message_id(buffer: &[u8]) -> Option<i64> {
+        #[derive(Deserialize)]
+        struct IdOnly {
+            id: Option<i64>,
+        }
+        serde_json::from_slice::<IdOnly>(buffer).ok()?.id
+    }
+
     /// Handle responses from LSP server
     async fn handle_responses(
         stdout: ChildStdout,
@@ -405,7 +415,8 @@ impl LspManager {
 
                 // A single unparseable message must not take down the reader:
                 // returning here would orphan every later request on this
-                // server, each then waiting out its full timeout. Skip it.
+                // server, each then waiting out its full timeout. Skip it,
+                // but fail its own request now rather than after its timeout.
                 let message: LspMessage = match Self::parse_lsp_message(&buffer) {
                     Ok(m) => m,
                     Err(e) => {
@@ -414,6 +425,15 @@ impl LspManager {
                             buffer.len(),
                             e
                         );
+                        let waiting = Self::unparseable_message_id(&buffer)
+                            .and_then(|id| pending_requests.remove(&id));
+                        if let Some((_, tx)) = waiting {
+                            let _ = tx.send(Err(LspError {
+                                code: -32700,
+                                message: format!("unparseable response: {e}"),
+                                data: None,
+                            }));
+                        }
                         content_length = 0;
                         continue;
                     }
@@ -1681,6 +1701,8 @@ mod tests {
         body.push('}');
 
         assert!(LspManager::parse_lsp_message(body.as_bytes()).is_err());
+        // The request it answers can still be failed at once.
+        assert_eq!(LspManager::unparseable_message_id(body.as_bytes()), Some(1));
     }
 
     #[test]
