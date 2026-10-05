@@ -2957,7 +2957,7 @@ impl CodeIntelEngine {
                 let _leases = self
                     .index_update_leases(std::slice::from_ref(&repo_key))
                     .await;
-                self.repos.remove(&repo_key);
+                let was_indexed = self.repos.remove(&repo_key).is_some();
                 self.symbols.remove(&repo_key);
                 // Drop this repo's cached contents; index_repo only inserts, so a
                 // file the new branch does not have would keep answering
@@ -2982,6 +2982,16 @@ impl CodeIntelEngine {
                 self.query_cache.invalidate_for_repo(&repo_key);
                 self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
                 self.index_repo(&path).await?;
+                // A configured repo is counted by the startup sweep instead,
+                // which may not have reached it yet.
+                let adopted = self
+                    .repo_paths
+                    .read()
+                    .iter()
+                    .any(|repo| repo.path == path && repo.origin == RepoOrigin::Adopted);
+                if adopted && !was_indexed {
+                    self.indexed_repos_count.fetch_add(1, Ordering::Release);
+                }
                 self.refresh_memory_snapshot();
                 if newly_registered {
                     Ok(format!("Registered and indexed repository: {}", repo_key))
@@ -3091,6 +3101,8 @@ impl CodeIntelEngine {
         let repo_key = canonical_repo_key(&canonical).ok()?;
         if self.register_repo_path(canonical, RepoOrigin::Adopted) {
             info!("reindex: registered new repository {}", repo_key);
+            // forget_repo takes it off again, for adopted and configured alike.
+            self.total_repos_count.fetch_add(1, Ordering::Release);
         }
         Some(repo_key)
     }
@@ -10389,6 +10401,31 @@ similarity index 90%
             listing.contains("Being Indexed") && listing.contains(&key),
             "{listing}"
         );
+    }
+
+    /// "(19/19 repos indexed)" was reported while qemu, adopted on top of 19
+    /// configured repos, was still indexing; forgetting it then undercounted.
+    #[tokio::test]
+    async fn adopted_repo_counts_in_indexing_progress() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("adopted");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(&repo.join("main.c"), "int main(void) { return 0; }\n");
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![])
+            .await
+            .unwrap();
+        let repo_arg = repo.to_string_lossy().into_owned();
+
+        let key = engine.register_unknown_repo(&repo_arg).unwrap();
+        // Registered but not indexed yet.
+        assert_eq!(engine.indexing_progress(), (0, 1));
+        engine.reindex(Some(&key)).await.unwrap();
+        assert_eq!(engine.indexing_progress(), (1, 1));
+        // A second pass adds nothing.
+        engine.reindex(Some(&key)).await.unwrap();
+        assert_eq!(engine.indexing_progress(), (1, 1));
+        engine.forget_repo(&key).await.unwrap();
+        assert_eq!(engine.indexing_progress(), (0, 0));
     }
 
     /// With one indexed repo, naming it adds nothing the engine doesn't know.
