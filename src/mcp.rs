@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info};
 
@@ -400,9 +399,8 @@ impl McpServer {
                 )),
             };
 
-        // Record metrics and log execution time.  Cap at 60 s to exclude
-        // suspend-inflated measurements (CLOCK_BOOTTIME advances during sleep).
-        let elapsed = start_time.elapsed().min(Duration::from_secs(60));
+        // Record metrics and log execution time.
+        let elapsed = start_time.elapsed();
         self.engine.metrics.record_tool(tool_name, elapsed);
         tracing::info!(
             tool = tool_name,
