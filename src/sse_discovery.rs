@@ -462,12 +462,12 @@ fn missing_repos(available: &[PathBuf], requested: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 enum ProbeResult {
-    /// 2xx response — server is alive and accepting MCP traffic.
+    /// 2xx response, or connected but no answer in time — server is alive.
     Ok,
     /// Non-2xx response — server is bound but rejected the ping. Entry
     /// is kept for future probes but we will not delegate now.
     HttpError(u16),
-    /// Connection refused / timeout / DNS — server is gone, drop entry.
+    /// Connection refused / connect timeout / DNS — server is gone, drop entry.
     Transport(String),
 }
 
@@ -495,6 +495,16 @@ fn http_probe(url: &str) -> ProbeResult {
             } else {
                 ProbeResult::HttpError(status.as_u16())
             }
+        }
+        // Connected but slow to answer: a busy server, e.g. mid-index. Taking
+        // it for gone would drop its record, and new stdio starts would build
+        // a duplicate local index instead of delegating.
+        Err(e) if e.is_timeout() && !e.is_connect() => {
+            debug!(
+                "SSE discovery: ping {} timed out; treating as alive",
+                endpoint
+            );
+            ProbeResult::Ok
         }
         Err(e) => ProbeResult::Transport(e.to_string()),
     }
@@ -764,6 +774,33 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// A server too busy to answer: accepts connections, never replies.
+    fn spawn_silent_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().flatten().collect();
+            drop(held);
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The qemu failure: a daemon busy indexing missed the ping deadline, its
+    /// record was pruned, and the next stdio start built a local index.
+    #[test]
+    fn slow_server_is_kept_and_delegated_to() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("servers.json");
+        let url = spawn_silent_server();
+        write_records(&path, &[record(&url, &["/a"])]);
+
+        let (found, missing) =
+            find_at(&path, &[PathBuf::from("/a")]).expect("a busy server is still alive");
+        assert_eq!(found, url);
+        assert!(missing.is_empty());
+        assert_eq!(read_back(&path), vec![record(&url, &["/a"])]);
     }
 
     /// A live server for the probe, which only checks the status code.
