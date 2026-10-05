@@ -208,6 +208,7 @@ async fn query_leases(
                     repo,
                     indexed_repos,
                     total_repos,
+                    first_pass: false,
                 }
                 .into());
             }

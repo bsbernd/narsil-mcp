@@ -386,10 +386,20 @@ pub struct IndexBusy {
     /// from one that looks stuck without a separate call.
     pub indexed_repos: usize,
     pub total_repos: usize,
+    /// The repo has no finished index pass yet (queued at startup, or adopted
+    /// and mid-pass), rather than an update of an existing index.
+    pub first_pass: bool,
 }
 
 impl std::fmt::Display for IndexBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.first_pass {
+            return write!(
+                f,
+                "EAGAIN: {} is being indexed — retry later ({}/{} repos indexed)",
+                self.repo, self.indexed_repos, self.total_repos,
+            );
+        }
         write!(
             f,
             "EAGAIN: index update in progress for {} — waited {}s, retry the request \
@@ -3309,8 +3319,36 @@ impl CodeIntelEngine {
             .invalidate_where(|key| key.repo == repo_prefix);
     }
 
+    /// Registered repos whose first index pass has not finished: queued at
+    /// startup, or adopted and still indexing. Canonical keys.
+    fn repos_being_indexed(&self) -> Vec<String> {
+        self.registered_repo_paths()
+            .iter()
+            .filter_map(|path| canonical_repo_key(path).ok())
+            .filter(|key| !self.repos.contains_key(key))
+            .collect()
+    }
+
+    /// "Come back later" for a repo that is registered but not indexed yet, so
+    /// a client retries instead of calling it unknown and reindexing it.
+    fn first_pass_busy(&self, repo_key: &str) -> Option<IndexBusy> {
+        if !self.repos_being_indexed().iter().any(|key| key == repo_key) {
+            return None;
+        }
+        let (indexed_repos, total_repos) = self.indexing_progress();
+        Some(IndexBusy {
+            repo: repo_key.to_string(),
+            indexed_repos,
+            total_repos,
+            first_pass: true,
+        })
+    }
+
     /// Helper to create a helpful error message for missing/invalid repo parameter
     fn repo_not_found_error(&self, repo: &str) -> anyhow::Error {
+        if let Some(busy) = self.first_pass_busy(repo) {
+            return busy.into();
+        }
         if repo.is_empty() {
             let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
             if repo_names.is_empty() {
@@ -3359,6 +3397,9 @@ impl CodeIntelEngine {
             Some(r) => Some(self.resolve_repo(r)?),
             None => None,
         };
+        if let Some(busy) = only.as_deref().and_then(|key| self.first_pass_busy(key)) {
+            return Err(busy.into());
+        }
 
         let mut output = String::new();
         output.push_str("# Indexed Repositories\n\n");
@@ -3408,6 +3449,16 @@ impl CodeIntelEngine {
             output.push_str("*No repositories indexed yet.*\n");
         } else if shown == 0 {
             output.push_str("*No matching repository.*\n");
+        }
+
+        if only.is_none() {
+            let being_indexed = self.repos_being_indexed();
+            if !being_indexed.is_empty() {
+                output.push_str("\n# Being Indexed — retry later\n\n");
+                for key in being_indexed {
+                    output.push_str(&format!("- `{}`\n", key));
+                }
+            }
         }
 
         Ok(output)
@@ -10308,6 +10359,36 @@ similarity index 90%
         let err = engine.resolve_repo("linux").unwrap_err().to_string();
         assert!(err.contains("a/linux.git"), "{err}");
         assert!(err.contains("b/linux.git"), "{err}");
+    }
+
+    /// The qemu regression: mid-pass, list_repos said "No matching repository"
+    /// and queries said "not found", so the client reindexed from scratch.
+    #[tokio::test]
+    async fn repo_without_a_finished_pass_answers_come_back_later() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("adopted");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![])
+            .await
+            .unwrap();
+        let key = engine
+            .register_unknown_repo(&repo.to_string_lossy())
+            .expect("a directory with .git is adoptable");
+
+        let busy = |error: anyhow::Error| {
+            error
+                .downcast_ref::<IndexBusy>()
+                .is_some_and(|busy| busy.first_pass && busy.repo == key)
+        };
+        let listed = engine.list_repos_scoped(Some(&key), false).await;
+        assert!(busy(listed.unwrap_err()));
+        let queried = engine.get_symbol_definition(&key, "main", 0).await;
+        assert!(busy(queried.unwrap_err()));
+        let listing = engine.list_repos_scoped(None, false).await.unwrap();
+        assert!(
+            listing.contains("Being Indexed") && listing.contains(&key),
+            "{listing}"
+        );
     }
 
     /// With one indexed repo, naming it adds nothing the engine doesn't know.

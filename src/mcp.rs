@@ -604,6 +604,7 @@ mod tests {
                 repo: "/repo".to_string(),
                 indexed_repos: 3,
                 total_repos: 5,
+                first_pass: false,
             }),
         );
         let error = busy.error.expect("IndexBusy is an error response");
