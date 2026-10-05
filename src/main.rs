@@ -277,6 +277,11 @@ struct ServerArgs {
     /// flag; populated by `apply_named_profile`.
     #[arg(skip)]
     repo_settings: Vec<config::schema::RepoEntrySettings>,
+
+    /// The `--profile` group defaults, for a repo with no entry in
+    /// `repo_settings`. Not a CLI flag; populated by `apply_named_profile`.
+    #[arg(skip)]
+    unlisted_repo_settings: config::schema::RepoEntrySettings,
 }
 
 #[tokio::main]
@@ -556,6 +561,7 @@ async fn main() -> Result<()> {
         lsp_scope: server_args.lsp_scope,
         index_filter: server_args.index_filter,
         repo_settings: server_args.repo_settings,
+        unlisted_repo_settings: server_args.unlisted_repo_settings,
         gtags_enabled,
         lsp_intent,
         gtags_intent,
@@ -859,6 +865,13 @@ fn apply_named_profile(server_args: &mut ServerArgs) -> Result<()> {
                 )
             })
             .collect();
+        // A repo adopted later is served under the same profile.
+        server_args.unlisted_repo_settings = config::schema::RepoEntrySettings::default()
+            .with_group_defaults(
+                profile.clangd.as_ref(),
+                profile.ccls.as_ref(),
+                profile.gtags.as_ref(),
+            );
     }
     if server_args.discover.is_none() {
         server_args.discover = profile.discover.clone();

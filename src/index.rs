@@ -145,6 +145,9 @@ pub struct EngineOptions {
     /// its own index_filter/lsp_scope/background_index; `lsp_scope`/`index_filter`
     /// above remain the defaults for any repo without an entry.
     pub repo_settings: Vec<crate::config::schema::RepoEntrySettings>,
+    /// Settings for a repo without an entry in `repo_settings`, such as one
+    /// adopted after startup: the profile's group defaults, `path` unused.
+    pub unlisted_repo_settings: crate::config::schema::RepoEntrySettings,
     /// Enable GNU Global (gtags) as an additional C/C++ reference backend
     pub gtags_enabled: bool,
     /// Per-repo intent for LSP index-time augmentation (On/Off/Auto).
@@ -175,6 +178,7 @@ impl Default for EngineOptions {
             lsp_scope: Vec::new(),
             index_filter: Vec::new(),
             repo_settings: Vec::new(),
+            unlisted_repo_settings: Default::default(),
             gtags_enabled: false,
             lsp_intent: BackendIntent::default(),
             gtags_intent: BackendIntent::default(),
@@ -206,6 +210,28 @@ struct CompiledRepoSettings {
     gtags_generate: Option<bool>,
     /// Per-repo compile_commands coverage threshold (percent). None = global default.
     compile_commands_min_coverage_pct: Option<usize>,
+}
+
+/// clangd/ccls tuning from a repo entry's backend blocks; an unset field keeps
+/// the `RepoLspTuning` default (backend on, no dial). None when the entry has
+/// neither block.
+fn lsp_tuning_from(
+    entry: &crate::config::schema::RepoEntrySettings,
+) -> Option<crate::lsp::RepoLspTuning> {
+    if entry.clangd.is_none() && entry.ccls.is_none() {
+        return None;
+    }
+    let clangd = entry.clangd.as_ref();
+    let ccls = entry.ccls.as_ref();
+    Some(crate::lsp::RepoLspTuning {
+        clangd_enabled: clangd.and_then(|c| c.enabled).unwrap_or(true),
+        clangd_jobs: clangd.and_then(|c| c.jobs),
+        clangd_background_index: clangd.and_then(|c| c.background_index).unwrap_or(true),
+        ccls_enabled: ccls.and_then(|c| c.enabled).unwrap_or(true),
+        ccls_threads: ccls.and_then(|c| c.threads),
+        ccls_retain_in_memory: ccls.and_then(|c| c.retain_in_memory),
+        ccls_background_index: ccls.and_then(|c| c.background_index).unwrap_or(true),
+    })
 }
 
 /// Compile raw scope entries (paths or globs) into matchers. Invalid globs are
@@ -486,8 +512,10 @@ pub struct CodeIntelEngine {
     /// per-repo override; empty means the whole repo is indexed.
     default_index_filter: Vec<ScopeRule>,
     /// Per-repo compiled scope rules and flags, keyed by canonical repo path.
-    /// A repo absent here falls back to the global defaults above.
+    /// A repo absent here uses `unlisted_repo_settings`.
     repo_settings: std::collections::HashMap<String, CompiledRepoSettings>,
+    /// Compiled `EngineOptions::unlisted_repo_settings`.
+    unlisted_repo_settings: CompiledRepoSettings,
     /// Per-repo memo: true when the repo had >=1 file under `--index-filter`, so
     /// the watch path can drop changes to out-of-scope files. Absent = not
     /// scoped (full index), which keeps unrelated repos untouched.
@@ -550,9 +578,9 @@ impl CodeIntelEngine {
             // config block keeps the RepoLspTuning default (backend on, no dial).
             let mut tuning_map = std::collections::HashMap::new();
             for entry in &options.repo_settings {
-                if entry.clangd.is_none() && entry.ccls.is_none() {
+                let Some(tuning) = lsp_tuning_from(entry) else {
                     continue;
-                }
+                };
                 let key = match expand_path(&entry.path).and_then(|p| canonical_repo_key(&p)) {
                     Ok(key) => PathBuf::from(key),
                     Err(e) => {
@@ -560,24 +588,7 @@ impl CodeIntelEngine {
                         continue;
                     }
                 };
-                let clangd = entry.clangd.as_ref();
-                let ccls = entry.ccls.as_ref();
-                tuning_map.insert(
-                    key,
-                    crate::lsp::RepoLspTuning {
-                        clangd_enabled: clangd.and_then(|c| c.enabled).unwrap_or(true),
-                        clangd_jobs: clangd.and_then(|c| c.jobs),
-                        clangd_background_index: clangd
-                            .and_then(|c| c.background_index)
-                            .unwrap_or(true),
-                        ccls_enabled: ccls.and_then(|c| c.enabled).unwrap_or(true),
-                        ccls_threads: ccls.and_then(|c| c.threads),
-                        ccls_retain_in_memory: ccls.and_then(|c| c.retain_in_memory),
-                        ccls_background_index: ccls
-                            .and_then(|c| c.background_index)
-                            .unwrap_or(true),
-                    },
-                );
+                tuning_map.insert(key, tuning);
             }
             if !tuning_map.is_empty() {
                 info!(
@@ -586,6 +597,7 @@ impl CodeIntelEngine {
                 );
             }
             options.lsp_config.lsp_tuning = tuning_map;
+            options.lsp_config.default_tuning = lsp_tuning_from(&options.unlisted_repo_settings);
             Some(Arc::new(LspManager::new(
                 options.lsp_config.clone(),
                 expanded_repos.clone(),
@@ -646,6 +658,22 @@ impl CodeIntelEngine {
         // Compile per-repo overrides, keyed by canonical repo path so lookups
         // match canonical_repo_key(repo_path). A repo entry that omits a scope
         // list inherits the corresponding global default.
+        let compile_entry =
+            |entry: &crate::config::schema::RepoEntrySettings| CompiledRepoSettings {
+                index_filter: if entry.index_filter.is_empty() {
+                    default_index_filter.clone()
+                } else {
+                    compile_scope(&entry.index_filter)
+                },
+                lsp_scope: if entry.lsp_scope.is_empty() {
+                    default_lsp_scope.clone()
+                } else {
+                    compile_scope(&entry.lsp_scope)
+                },
+                gtags_enabled: entry.gtags.as_ref().and_then(|g| g.enabled),
+                gtags_generate: entry.gtags.as_ref().and_then(|g| g.generate),
+                compile_commands_min_coverage_pct: entry.compile_commands_min_coverage_pct,
+            };
         let mut repo_settings: std::collections::HashMap<String, CompiledRepoSettings> =
             std::collections::HashMap::new();
         for entry in &options.repo_settings {
@@ -656,25 +684,9 @@ impl CodeIntelEngine {
                     continue;
                 }
             };
-            repo_settings.insert(
-                key,
-                CompiledRepoSettings {
-                    index_filter: if entry.index_filter.is_empty() {
-                        default_index_filter.clone()
-                    } else {
-                        compile_scope(&entry.index_filter)
-                    },
-                    lsp_scope: if entry.lsp_scope.is_empty() {
-                        default_lsp_scope.clone()
-                    } else {
-                        compile_scope(&entry.lsp_scope)
-                    },
-                    gtags_enabled: entry.gtags.as_ref().and_then(|g| g.enabled),
-                    gtags_generate: entry.gtags.as_ref().and_then(|g| g.generate),
-                    compile_commands_min_coverage_pct: entry.compile_commands_min_coverage_pct,
-                },
-            );
+            repo_settings.insert(key, compile_entry(entry));
         }
+        let unlisted_repo_settings = compile_entry(&options.unlisted_repo_settings);
 
         let engine = Self {
             _index_path: expanded_index,
@@ -710,6 +722,7 @@ impl CodeIntelEngine {
             default_lsp_scope,
             default_index_filter,
             repo_settings,
+            unlisted_repo_settings,
             index_filtered_repos: DashMap::new(),
             index_leases: DashMap::new(),
             update_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1268,12 +1281,13 @@ impl CodeIntelEngine {
     }
 
     /// Per-repo compiled settings for `repo_path`, looked up by canonical key
-    /// (matching how `repo_settings` was built). None = no profile entry, so the
-    /// global defaults apply.
-    fn repo_settings_for_path(&self, repo_path: &Path) -> Option<&CompiledRepoSettings> {
+    /// (matching how `repo_settings` was built); `unlisted_repo_settings` for a
+    /// repo with no profile entry.
+    fn repo_settings_for_path(&self, repo_path: &Path) -> &CompiledRepoSettings {
         canonical_repo_key(repo_path)
             .ok()
             .and_then(|key| self.repo_settings.get(&key))
+            .unwrap_or(&self.unlisted_repo_settings)
     }
 
     /// Effective compile_commands coverage threshold (percent) for `repo_path`:
@@ -1281,7 +1295,7 @@ impl CodeIntelEngine {
     /// global default.
     fn compile_commands_min_coverage_pct(&self, repo_path: &Path) -> usize {
         self.repo_settings_for_path(repo_path)
-            .and_then(|s| s.compile_commands_min_coverage_pct)
+            .compile_commands_min_coverage_pct
             .unwrap_or(COMPILE_COMMANDS_DEFAULT_MIN_COVERAGE_PCT)
     }
 
@@ -1330,10 +1344,7 @@ impl CodeIntelEngine {
     /// built). The per-repo `gtags: { enabled }` override wins over the global
     /// `--gtags`/`--no-gtags` intent.
     fn gtags_repo_intended(&self, repo_path: &Path) -> bool {
-        match self
-            .repo_settings_for_path(repo_path)
-            .and_then(|s| s.gtags_enabled)
-        {
+        match self.repo_settings_for_path(repo_path).gtags_enabled {
             Some(enabled) => enabled,
             None => self.options.gtags_intent != BackendIntent::Off,
         }
@@ -1344,7 +1355,7 @@ impl CodeIntelEngine {
     /// `--gtags-generate` flag.
     fn gtags_generate_for_repo(&self, repo_path: &Path) -> bool {
         self.repo_settings_for_path(repo_path)
-            .and_then(|s| s.gtags_generate)
+            .gtags_generate
             .unwrap_or(self.options.gtags_generate)
     }
 

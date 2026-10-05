@@ -52,9 +52,9 @@ impl CxxLspBackend {
 }
 
 /// Per-repo clangd/ccls tuning, keyed by canonical repo root in
-/// `LspConfig.lsp_tuning`. A repo absent from that map runs every backend with
-/// compiled defaults; the bool fields default to true so an unset block means
-/// "on". The dials bound parallelism (clangd `-j`, ccls `index.threads`) and
+/// `LspConfig.lsp_tuning`. A repo absent from that map uses
+/// `LspConfig.default_tuning`; the bool fields default to true so an unset
+/// block means "on". The dials bound parallelism (clangd `-j`, ccls `index.threads`) and
 /// resident cache (ccls `cache.retainInMemory`) — clangd has no hard RSS cap.
 #[derive(Debug, Clone)]
 pub struct RepoLspTuning {
@@ -107,8 +107,17 @@ pub struct LspConfig {
     /// Which C/C++ LSP backends to start (defaults to clangd only)
     pub cxx_lsp_backends: Vec<CxxLspBackend>,
     /// Per-repo clangd/ccls tuning, keyed by canonical repo root. A repo absent
-    /// here runs every backend with compiled defaults (see `RepoLspTuning`).
+    /// here uses `default_tuning`.
     pub lsp_tuning: HashMap<PathBuf, RepoLspTuning>,
+    /// Tuning for a repo absent from `lsp_tuning`, e.g. one adopted after
+    /// startup: the profile's group defaults. None = compiled defaults.
+    pub default_tuning: Option<RepoLspTuning>,
+}
+
+impl LspConfig {
+    fn tuning_for(&self, repo: &Path) -> Option<&RepoLspTuning> {
+        self.lsp_tuning.get(repo).or(self.default_tuning.as_ref())
+    }
 }
 
 impl Default for LspConfig {
@@ -123,6 +132,7 @@ impl Default for LspConfig {
             enabled: false,
             cxx_lsp_backends: vec![CxxLspBackend::Clangd],
             lsp_tuning: HashMap::new(),
+            default_tuning: None,
         }
     }
 }
@@ -847,7 +857,7 @@ impl LspManager {
 
         // Per-repo tuning (the repo is encoded in the key); absent = defaults.
         let (_, repo) = Self::parse_server_key(server_key);
-        let tuning = self.config.lsp_tuning.get(repo);
+        let tuning = self.config.tuning_for(repo);
 
         match lang_backend {
             "rust" => Ok((PathBuf::from("rust-analyzer"), vec![])),
@@ -1034,7 +1044,7 @@ impl LspManager {
     /// with tree-sitter + gtags only — no language server starts. `repo` must be
     /// the canonical repo root used to key `lsp_tuning`.
     fn cxx_backends_for_repo(&self, repo: &Path) -> Vec<CxxLspBackend> {
-        let tuning = self.config.lsp_tuning.get(repo);
+        let tuning = self.config.tuning_for(repo);
         self.config
             .cxx_lsp_backends
             .iter()
@@ -1837,6 +1847,34 @@ mod tests {
         assert_eq!(
             manager.active_cxx_backends_for(&untuned),
             vec![SourceSet::CLANGD, SourceSet::CCLS]
+        );
+    }
+
+    /// A repo adopted after startup has no `lsp_tuning` entry; it must take
+    /// the profile's group defaults, not start a clangd the profile disabled.
+    #[test]
+    fn test_unlisted_repo_uses_default_tuning() {
+        let listed = PathBuf::from("/work/listed");
+        let config = LspConfig {
+            enabled: true,
+            cxx_lsp_backends: vec![CxxLspBackend::Clangd, CxxLspBackend::Ccls],
+            lsp_tuning: HashMap::from([(listed.clone(), RepoLspTuning::default())]),
+            default_tuning: Some(RepoLspTuning {
+                clangd_enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = LspManager::new(config, vec![]);
+
+        assert_eq!(
+            manager.active_cxx_backends_for(Path::new("/work/adopted")),
+            vec![SourceSet::CCLS]
+        );
+        assert_eq!(
+            manager.active_cxx_backends_for(&listed),
+            vec![SourceSet::CLANGD, SourceSet::CCLS],
+            "a repo's own entry still wins over the default"
         );
     }
 
