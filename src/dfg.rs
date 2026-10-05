@@ -1314,7 +1314,7 @@ fn extract_base_identifier(node: Node, source: &str) -> Option<String> {
 /// by another identifier character on either side. Used to disambiguate
 /// per-line identifier hits when a statement's truncated `text` slice may or
 /// may not actually mention an identifier the AST emitted for that line.
-fn contains_word(text: &str, word: &str) -> bool {
+pub(crate) fn contains_word(text: &str, word: &str) -> bool {
     if word.is_empty() || text.len() < word.len() {
         return false;
     }

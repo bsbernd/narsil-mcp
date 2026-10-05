@@ -8005,7 +8005,7 @@ impl CodeIntelEngine {
                     continue;
                 }
 
-                if line.contains(symbol_name) {
+                if line.contains(symbol_name) && crate::dfg::contains_word(line, symbol_name) {
                     let context = if is_import { "import" } else { "usage" };
                     usages.push((rel_path.clone(), line_num + 1, context.to_string()));
                 }

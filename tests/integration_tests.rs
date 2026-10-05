@@ -2303,6 +2303,40 @@ fn test_find_symbol_usages_error_missing_symbol() -> Result<()> {
 }
 
 #[test]
+fn test_find_symbol_usages_skips_longer_names() -> Result<()> {
+    let repo = TestRepo::new()?;
+    repo.add_rust_file(
+        "src/lib.rs",
+        r#"
+pub const MAX_RETRIES: u32 = 3;
+pub const MAX_RETRIES_LIMIT: u32 = 10;
+pub fn retry_allowed(attempt: u32) -> bool {
+    attempt < MAX_RETRIES
+}
+"#,
+    )?;
+
+    let server = TestMcpServer::start_with_repo(repo.path())?;
+    let repo_name = repo.path().to_str().unwrap();
+    server.wait_for_repo(repo_name, Duration::from_secs(30))?;
+
+    let response = server.call_tool(
+        "find_symbol_usages",
+        json!({"repo": repo_name, "symbol": "MAX_RETRIES"}),
+    )?;
+
+    assert!(response["error"].is_null());
+    let content = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("Expected text content");
+    assert!(content.contains("| src/lib.rs | 2 |"), "{content}");
+    assert!(content.contains("| src/lib.rs | 5 |"), "{content}");
+    assert!(!content.contains("| src/lib.rs | 3 |"), "{content}");
+
+    Ok(())
+}
+
+#[test]
 fn test_search_code_error_missing_query() -> Result<()> {
     let (_repo, server, repo_name) = require_arg_test_server()?;
 
