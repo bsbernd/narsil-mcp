@@ -167,7 +167,11 @@ pub struct LspManager {
     /// Per-key locks serializing server creation so concurrent callers for the
     /// same key spawn one process, not one each.
     server_start_locks: DashMap<String, Arc<Mutex<()>>>,
-    workspace_roots: Vec<PathBuf>,
+    /// Roots known at startup plus any repo adopted later via `reindex`
+    /// (`register_workspace_root`) — `repo_for_path` falls back to the first
+    /// entry when a file matches none, so a repo missing from this list is
+    /// silently misattributed to whichever root happens to be first.
+    workspace_roots: std::sync::RwLock<Vec<PathBuf>>,
 }
 
 impl LspManager {
@@ -177,7 +181,21 @@ impl LspManager {
             config,
             servers: DashMap::new(),
             server_start_locks: DashMap::new(),
-            workspace_roots,
+            workspace_roots: std::sync::RwLock::new(workspace_roots),
+        }
+    }
+
+    /// Add `root` to the known workspace roots if not already present. Called
+    /// whenever a repo is indexed, including one adopted after startup — a
+    /// root missing here makes `repo_for_path` silently resolve the repo's
+    /// files to the first-configured root instead.
+    pub fn register_workspace_root(&self, root: PathBuf) {
+        let mut roots = self
+            .workspace_roots
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if !roots.contains(&root) {
+            roots.push(root);
         }
     }
 
@@ -225,11 +243,15 @@ impl LspManager {
         let abs = file_path
             .canonicalize()
             .unwrap_or_else(|_| file_path.to_path_buf());
-        self.workspace_roots
+        let roots = self
+            .workspace_roots
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        roots
             .iter()
             .filter(|root| abs.starts_with(root))
             .max_by_key(|root| root.as_os_str().len())
-            .or_else(|| self.workspace_roots.first())
+            .or_else(|| roots.first())
             .cloned()
             .unwrap_or(abs)
     }
@@ -727,6 +749,8 @@ impl LspManager {
     fn workspace_root_for(&self, repo: &Path) -> PathBuf {
         if repo.as_os_str().is_empty() || repo == Path::new(".") {
             self.workspace_roots
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
                 .first()
                 .cloned()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -1813,6 +1837,36 @@ mod tests {
         assert_eq!(
             manager.active_cxx_backends_for(&untuned),
             vec![SourceSet::CLANGD, SourceSet::CCLS]
+        );
+    }
+
+    #[test]
+    fn test_register_workspace_root_fixes_repo_for_path_fallback() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let root_a = dir_a.path().canonicalize().unwrap();
+        let root_b = dir_b.path().canonicalize().unwrap();
+        let file_b = root_b.join("main.c");
+        std::fs::write(&file_b, "int main(void) { return 0; }").unwrap();
+
+        // Only root_a is known at construction, mirroring a repo configured
+        // at startup while root_b is adopted later via `reindex`.
+        let manager = LspManager::new(LspConfig::default(), vec![root_a.clone()]);
+
+        // Before registration, a file under the unknown root falls back to
+        // the first configured root — root_a — exactly the bug this fixes.
+        assert_eq!(manager.repo_for_path(&file_b), root_a);
+
+        manager.register_workspace_root(root_b.clone());
+        assert_eq!(manager.repo_for_path(&file_b), root_b);
+
+        // Idempotent: registering the same root again must not duplicate it
+        // or change the resolution.
+        manager.register_workspace_root(root_b.clone());
+        assert_eq!(
+            manager.workspace_roots.read().unwrap().len(),
+            2,
+            "re-registering an already-known root must not duplicate it"
         );
     }
 

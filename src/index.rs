@@ -1577,6 +1577,12 @@ impl CodeIntelEngine {
         let repo_name = canonical_repo_key(path)?;
 
         self.register_git_repo(&repo_name, path);
+        // A repo adopted after startup (e.g. via `reindex`) is otherwise absent
+        // from the LSP manager's workspace roots, so `repo_for_path` silently
+        // misattributes its files to the first-configured root instead.
+        if let Some(lsp) = &self.lsp_manager {
+            lsp.register_workspace_root(path.to_path_buf());
+        }
 
         // If symbols are already loaded from the persistence cache, skip the
         // expensive per-symbol embedding indexing — BM25 and call graph still
