@@ -352,11 +352,7 @@ impl CallGraph {
 
             // Outgoing edge on the caller.
             if let Some(mut caller_node) = self.nodes.get_mut(&caller_key) {
-                match caller_node
-                    .calls
-                    .iter_mut()
-                    .find(|e| e.target == callee_key)
-                {
+                match Self::edge_to(&mut caller_node.calls, &callee_key, new_edge.line) {
                     Some(existing) => {
                         Self::fold_edge(existing, source, new_edge.line, new_edge.column)
                     }
@@ -370,11 +366,7 @@ impl CallGraph {
 
             // Incoming edge on the callee (keyed by the caller).
             if let Some(mut callee_node) = self.nodes.get_mut(callee_key.as_str()) {
-                match callee_node
-                    .called_by
-                    .iter_mut()
-                    .find(|e| e.target == caller_key)
-                {
+                match Self::edge_to(&mut callee_node.called_by, &caller_key, new_edge.line) {
                     Some(existing) => {
                         Self::fold_edge(existing, source, new_edge.line, new_edge.column)
                     }
@@ -393,6 +385,22 @@ impl CallGraph {
                 }
             }
         }
+    }
+
+    /// The edge to `target` at `line`, else the first edge to `target`. A caller
+    /// can call one function on several lines; matching by name alone folds
+    /// every site onto the first. The fallback keeps a backend that reports
+    /// another line for a single site folding into it.
+    fn edge_to<'a>(
+        edges: &'a mut [CallEdge],
+        target: &str,
+        line: usize,
+    ) -> Option<&'a mut CallEdge> {
+        let idx = edges
+            .iter()
+            .position(|e| e.target == target && e.line == line)
+            .or_else(|| edges.iter().position(|e| e.target == target))?;
+        Some(&mut edges[idx])
     }
 
     /// Fold a `source` confirmation into an existing edge: record the confirmer,
@@ -495,11 +503,7 @@ impl CallGraph {
             let callee_key = edge.target.clone();
 
             if let Some(mut caller_node) = self.nodes.get_mut(&caller_key) {
-                match caller_node
-                    .calls
-                    .iter_mut()
-                    .find(|e| e.target == callee_key)
-                {
+                match Self::edge_to(&mut caller_node.calls, &callee_key, edge.line) {
                     Some(existing) => *existing = edge.clone(),
                     None => caller_node.calls.push(edge.clone()),
                 }
@@ -518,11 +522,7 @@ impl CallGraph {
                     confirmed_by: edge.confirmed_by,
                     line_conflicts: edge.line_conflicts.clone(),
                 };
-                match callee_node
-                    .called_by
-                    .iter_mut()
-                    .find(|e| e.target == caller_key)
-                {
+                match Self::edge_to(&mut callee_node.called_by, &caller_key, incoming.line) {
                     Some(existing) => *existing = incoming,
                     None => callee_node.called_by.push(incoming),
                 }
@@ -2119,6 +2119,44 @@ mod tests {
         assert_eq!(folded[1].line, 111);
         assert!(folded[0].confirmed_by.contains(SourceSet::TREE_SITTER));
         assert!(folded[0].confirmed_by.contains(SourceSet::CCLS));
+    }
+
+    #[test]
+    fn test_merge_edges_keeps_call_sites_of_one_caller_apart() {
+        // `a` calls `b` on lines 4 and 9; a backend hit on each line must
+        // confirm the edge at that line, not fold onto the line-4 edge.
+        let site = |target: &str, line: usize| CallEdge {
+            target: target.to_string(),
+            file_path: "f.c".to_string(),
+            line,
+            column: 0,
+            call_type: CallType::Direct,
+            scope_hint: None,
+            confirmed_by: SourceSet::TREE_SITTER,
+            line_conflicts: Vec::new(),
+        };
+        let graph = CallGraph::new();
+        graph.nodes.insert(
+            "f.c::a".to_string(),
+            node_with("a", vec![site("f.c::b", 4), site("f.c::b", 9)], Vec::new()),
+        );
+        graph.nodes.insert(
+            "f.c::b".to_string(),
+            node_with("b", Vec::new(), vec![site("f.c::a", 4), site("f.c::a", 9)]),
+        );
+
+        let hits = vec![
+            ("f.c::a".to_string(), site("b", 4)),
+            ("f.c::a".to_string(), site("b", 9)),
+        ];
+        graph.merge_edges(hits, SourceSet::GTAGS);
+
+        let a = graph.nodes.get("f.c::a").unwrap();
+        let b = graph.nodes.get("f.c::b").unwrap();
+        for edge in a.calls.iter().chain(b.called_by.iter()) {
+            assert!(edge.confirmed_by.contains(SourceSet::GTAGS), "{:?}", edge);
+            assert!(edge.line_conflicts.is_empty(), "{:?}", edge);
+        }
     }
 
     #[test]
