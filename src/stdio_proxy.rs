@@ -72,9 +72,9 @@ struct ProxySession {
     /// owns stdout.
     tools_may_have_changed: bool,
     /// A background `adopt_repos` call still registering a missing repo with
-    /// the upstream daemon. The MCP handshake does not wait on this — only
-    /// the first non-handshake line does, taken and awaited once by the
-    /// proxy loop, so an actual query never races ahead of adoption.
+    /// the upstream daemon. Only the first tool call waits on this, taken and
+    /// awaited once by the proxy loop, so an actual query never races ahead
+    /// of adoption.
     pending_adoption: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
@@ -118,7 +118,7 @@ impl ProxySession {
     }
 
     /// Await a still-pending background repo adoption exactly once, so the
-    /// first non-handshake line never reaches the daemon ahead of it. A no-op
+    /// first tool call never reaches the daemon ahead of it. A no-op
     /// once taken, and a no-op when nothing was pending (the common case: the
     /// discovered server already covered every requested repo).
     async fn await_pending_adoption(&mut self) {
@@ -424,8 +424,7 @@ impl ProxySession {
 /// returns an unrecoverable error, or a shutdown signal arrives. `repos` is
 /// the set this process serves, used to rediscover the server if it restarts.
 /// `pending_adoption`, when given, is a background task still registering a
-/// repo the discovered server lacked; the handshake proceeds without waiting
-/// on it, but the first non-handshake line does.
+/// repo the discovered server lacked; only the first tool call waits on it.
 pub async fn run_stdio_proxy_with_shutdown(
     base_url: &str,
     repos: &[PathBuf],
@@ -482,6 +481,13 @@ fn method_of(line: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Only a tool call can need the repo being adopted. The client sends
+/// `tools/list` while connecting, and the adoption's full index pass
+/// outlasts the client's connect timeout.
+fn waits_for_adoption(line: &str) -> bool {
+    method_of(line).as_deref() == Some("tools/call")
+}
+
 #[cfg(test)]
 mod list_changed_tests {
     use super::*;
@@ -509,6 +515,21 @@ mod list_changed_tests {
         );
         assert_eq!(method_of(r#"{"jsonrpc":"2.0","id":1}"#), None);
         assert_eq!(method_of("not json"), None);
+    }
+
+    #[test]
+    fn test_only_tool_calls_wait_for_adoption() {
+        assert!(waits_for_adoption(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_symbols"}}"#
+        ));
+        for line in [
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+        ] {
+            assert!(!waits_for_adoption(line), "must not wait: {line}");
+        }
     }
 }
 
@@ -539,12 +560,7 @@ async fn proxy_loop(session: &mut ProxySession) -> Result<()> {
         // if this very request is the one that hits a restarted server.
         session.observe_handshake(trimmed);
 
-        // The handshake itself is repo-agnostic and must not wait; only the
-        // first line past it may actually need the repo this adoption covers.
-        if !matches!(
-            method_of(trimmed).as_deref(),
-            Some("initialize") | Some("notifications/initialized")
-        ) {
+        if waits_for_adoption(trimmed) {
             session.await_pending_adoption().await;
         }
 
