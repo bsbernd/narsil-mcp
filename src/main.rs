@@ -28,7 +28,7 @@ enum Transport {
 
 #[derive(ClapParser, Debug)]
 #[command(name = "narsil-mcp")]
-#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NARSIL_BUILD_ID"), ")"))]
 #[command(about = "Blazingly fast MCP server for code intelligence")]
 struct Args {
     #[command(subcommand)]
@@ -308,7 +308,11 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Starting narsil-mcp v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting narsil-mcp v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("NARSIL_BUILD_ID")
+    );
 
     apply_named_profile(&mut server_args)?;
     apply_machine_wide_defaults(&mut server_args);
